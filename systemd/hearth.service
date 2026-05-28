@@ -1,0 +1,17 @@
+[Unit]
+Description=Hearth VM management daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/hearthd
+Restart=on-failure
+RuntimeDirectory=hearth
+RuntimeDirectoryMode=0770
+StateDirectory=hearth
+LogsDirectory=hearth
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=multi-user.target

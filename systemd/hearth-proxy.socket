@@ -1,0 +1,9 @@
+[Unit]
+Description=Agent-in-charge local Hearth socket proxy
+
+[Socket]
+ListenStream=/run/hearth.sock
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
