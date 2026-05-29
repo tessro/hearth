@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=notify
+Environment=HEARTH_FIRMWARE=/var/lib/hearth/firmware/CLOUDHV.fd
+Environment=PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/hearthd
 Restart=on-failure
 RuntimeDirectory=hearth

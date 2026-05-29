@@ -46,6 +46,8 @@ enum Command {
         disk_gib: Option<u64>,
         #[arg(long)]
         ssh_key: Vec<String>,
+        #[arg(long = "authorized-keys-file")]
+        authorized_keys_file: Vec<Utf8PathBuf>,
         #[arg(long)]
         agent_in_charge: bool,
     },
@@ -117,7 +119,7 @@ enum HostCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (verb, args) = to_request(&cli.command);
+    let (verb, args) = to_request(&cli.command)?;
     let req = Request::new(Ulid::new().to_string(), verb, args);
     let responses = round_trip(&cli.socket, &req).await?;
     if cli.json {
@@ -129,8 +131,16 @@ async fn main() -> Result<()> {
     render(&cli.command, responses)
 }
 
-fn to_request(command: &Command) -> (Verb, Map<String, Value>) {
-    match command {
+fn read_authorized_keys(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
+    Ok(match command {
         Command::Ping => (Verb::Ping, empty_args()),
         Command::Version => (Verb::Version, empty_args()),
         Command::Ls => (Verb::Ls, empty_args()),
@@ -142,6 +152,7 @@ fn to_request(command: &Command) -> (Verb, Map<String, Value>) {
             memory_mib,
             disk_gib,
             ssh_key,
+            authorized_keys_file,
             agent_in_charge,
         } => {
             let mut args = args([("name", json!(name))]);
@@ -149,8 +160,14 @@ fn to_request(command: &Command) -> (Verb, Map<String, Value>) {
             insert_opt(&mut args, "cpu", cpu.map(|v| json!(v)));
             insert_opt(&mut args, "memory_mib", memory_mib.map(|v| json!(v)));
             insert_opt(&mut args, "disk_gib", disk_gib.map(|v| json!(v)));
-            if !ssh_key.is_empty() {
-                args.insert("ssh_keys".into(), json!(ssh_key));
+            let mut keys: Vec<String> = ssh_key.clone();
+            for path in authorized_keys_file {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow!("read {path}: {e}"))?;
+                keys.extend(read_authorized_keys(&text));
+            }
+            if !keys.is_empty() {
+                args.insert("ssh_keys".into(), json!(keys));
             }
             if *agent_in_charge {
                 args.insert("is_agent_in_charge".into(), json!(true));
@@ -197,7 +214,7 @@ fn to_request(command: &Command) -> (Verb, Map<String, Value>) {
         Command::Host { command } => match command {
             HostCommand::Check => (Verb::HostCheck, empty_args()),
         },
-    }
+    })
 }
 
 async fn round_trip(socket: &Utf8PathBuf, req: &Request) -> Result<Vec<Response>> {
@@ -354,7 +371,8 @@ mod tests {
     fn image_ls_maps_to_protocol_verb() {
         let (verb, args) = to_request(&Command::Image {
             command: ImageCommand::Ls,
-        });
+        })
+        .unwrap();
         assert_eq!(verb, Verb::ImageLs);
         assert!(args.is_empty());
     }
@@ -366,7 +384,8 @@ mod tests {
                 url: "https://example.invalid/debian.qcow2".to_string(),
                 name: Some("debian".to_string()),
             },
-        });
+        })
+        .unwrap();
         assert_eq!(verb, Verb::ImagePull);
         assert_eq!(
             args.get("url"),
@@ -381,7 +400,8 @@ mod tests {
             command: ImageCommand::Rm {
                 name: "debian".to_string(),
             },
-        });
+        })
+        .unwrap();
         assert_eq!(verb, Verb::ImageRm);
         assert_eq!(args.get("name"), Some(&json!("debian")));
     }
@@ -395,8 +415,10 @@ mod tests {
             memory_mib: Some(4096),
             disk_gib: Some(30),
             ssh_key: vec!["ssh-ed25519 AAAA test".to_string()],
+            authorized_keys_file: vec![],
             agent_in_charge: true,
-        });
+        })
+        .unwrap();
         assert_eq!(verb, Verb::Create);
         assert_eq!(args.get("name"), Some(&json!("web")));
         assert_eq!(args.get("image"), Some(&json!("debian")));

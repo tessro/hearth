@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::{config::Config, error::coded};
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use rand::Rng;
@@ -126,7 +126,7 @@ impl Registry {
     pub fn get(&self, name: &str) -> Result<&Service> {
         self.services
             .get(name)
-            .ok_or_else(|| anyhow!("no service named {name}"))
+            .ok_or_else(|| coded("service.not_found", format!("no service named {name}")))
     }
 
     pub async fn write_service(cfg: &Config, svc: &Service) -> Result<()> {

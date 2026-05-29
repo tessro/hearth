@@ -1,4 +1,4 @@
-use crate::{config::Config, registry::Service};
+use crate::{config::Config, error::coded, registry::Service};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use camino::Utf8Path;
@@ -37,6 +37,7 @@ pub trait Host: Send + Sync {
     ) -> Result<()>;
     async fn chv_get(&self, socket: &Utf8Path, path: &str) -> Result<Value>;
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value>;
+    async fn delete_tap(&self, tap: &str) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +49,9 @@ impl Host for RealHost {
         fs::create_dir_all(cfg.run_dir.join("vms")).await?;
         fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
         fs::create_dir_all(&cfg.log_dir).await?;
+        unlink_stale(&cfg.vm_socket(&service.name)).await?;
+        unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
+        ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
         systemd_run_chv(service, cloud_hypervisor_argv(cfg, service)).await
     }
 
@@ -60,6 +64,9 @@ impl Host for RealHost {
         fs::create_dir_all(cfg.run_dir.join("vms")).await?;
         fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
         fs::create_dir_all(&cfg.log_dir).await?;
+        unlink_stale(&cfg.vm_socket(&service.name)).await?;
+        unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
+        ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
         systemd_run_chv(
             service,
             cloud_hypervisor_restore_argv(cfg, service, snapshot_dir),
@@ -86,19 +93,22 @@ impl Host for RealHost {
         if let Some(parent) = disk.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let mut cmd = Command::new("qemu-img");
-        cmd.args([
-            "create",
+        // CHV's qcow2 reader rejects any backing chain, so copy the base image
+        // into a standalone per-VM disk and grow it to the requested size.
+        let mut convert = Command::new("qemu-img");
+        convert.args([
+            "convert",
             "-f",
             "qcow2",
-            "-F",
+            "-O",
             "qcow2",
-            "-b",
             backing.as_str(),
             disk.as_str(),
-            &format!("{disk_gib}G"),
         ]);
-        run_status(cmd, "qemu-img").await
+        run_status(convert, "qemu-img convert").await?;
+        let mut resize = Command::new("qemu-img");
+        resize.args(["resize", disk.as_str(), &format!("{disk_gib}G")]);
+        run_status(resize, "qemu-img resize").await
     }
 
     async fn cloud_localds(
@@ -121,6 +131,15 @@ impl Host for RealHost {
 
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value> {
         chv_request(socket, "PUT", path, Some(body)).await
+    }
+
+    async fn delete_tap(&self, tap: &str) -> Result<()> {
+        if !std::path::Path::new(&format!("/sys/class/net/{tap}")).exists() {
+            return Ok(());
+        }
+        let mut cmd = Command::new("ip");
+        cmd.args(["link", "del", tap]);
+        run_status(cmd, "ip link del").await
     }
 }
 
@@ -161,7 +180,7 @@ pub fn cloud_hypervisor_argv(cfg: &Config, service: &Service) -> Vec<String> {
         "--disk".to_string(),
         format!("path={},readonly=on", cfg.seed_path(&service.name)),
         "--net".to_string(),
-        format!("tap=,bridge={},mac={}", cfg.bridge, service.mac),
+        format!("tap={},mac={}", tap_name(&service.name), service.mac),
         "--vsock".to_string(),
         format!(
             "cid={},socket={}",
@@ -207,7 +226,7 @@ pub async fn wait_for_socket(path: &Utf8Path, dur: Duration) -> Result<()> {
         }
     })
     .await
-    .map_err(|_| anyhow!("timed out waiting for {path}"))?
+    .map_err(|_| coded("vm.boot_timeout", format!("timed out waiting for {path}")))?
 }
 
 pub async fn wait_for_inactive(host: &dyn Host, unit: &str, dur: Duration) -> Result<bool> {
@@ -306,6 +325,38 @@ fn parse_http_response(bytes: &[u8]) -> Result<Value> {
 
 pub fn unit_name(name: &str) -> String {
     format!("hearth-vm-{name}.service")
+}
+
+/// Tap device name for a service. Linux interface names are capped at 15 chars,
+/// so the `hrt-` prefix leaves 11 chars for the service name.
+pub fn tap_name(name: &str) -> String {
+    format!("hrt-{name}")
+}
+
+/// CHV refuses to bind a unix socket path that already exists. Remove it if a
+/// previous CHV exited without cleanup.
+async fn unlink_stale(path: &Utf8Path) -> Result<()> {
+    match fs::remove_file(path.as_str()).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create the tap (idempotent), attach it to the bridge, and bring it up.
+async fn ensure_tap(bridge: &str, tap: &str) -> Result<()> {
+    if !std::path::Path::new(&format!("/sys/class/net/{tap}")).exists() {
+        let mut cmd = Command::new("ip");
+        cmd.args(["tuntap", "add", "dev", tap, "mode", "tap"]);
+        run_status(cmd, "ip tuntap add").await?;
+    }
+    let mut cmd = Command::new("ip");
+    cmd.args(["link", "set", tap, "master", bridge]);
+    run_status(cmd, "ip link set master").await?;
+    let mut cmd = Command::new("ip");
+    cmd.args(["link", "set", tap, "up"]);
+    run_status(cmd, "ip link set up").await?;
+    Ok(())
 }
 
 pub fn sanitize_image_name(url: &str) -> String {

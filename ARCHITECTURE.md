@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Hearth manages a small fleet of KVM virtual machines on a single host. Each VM runs an autonomous agent that operates the services inside that VM (via `docker compose`). One VM — the *agent-in-charge* — is privileged to manage its peers by issuing VM-lifecycle and operational commands back to the host through a constrained channel.
+Hearth manages a small fleet of KVM virtual machines on a single host. Each VM runs an autonomous agent that operates the services inside that VM. One VM — the *agent-in-charge* — is privileged to manage its peers by issuing VM-lifecycle and operational commands back to the host through a constrained channel.
 
-The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only interface anyone (human or agent) uses to talk to hearthd. Symmetry is the design's center of gravity: agents inside VMs run `docker compose` for their service surface; the agent-in-charge runs `hearthctl` for the VM surface. Same shape at both layers.
+The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only interface anyone (human or agent) uses to talk to hearthd. Hearth is opinionated about the VM surface — lifecycle, networking, storage, snapshots — and incurious about what those VMs run. How a guest organises its own services (containers, raw processes, an init system) is the guest agent's business.
 
 ## Goals
 
@@ -45,7 +45,7 @@ The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only inte
 |  │ VM: agent-in-charge  │   │ VM: mail (peer)      │  │                               |
 |  │                      │   │                      │  │                               |
 |  │ hearthctl ─unix──▶ socat ─vsock──────────────────┘                                 |
-|  │ docker compose ...   │   │ docker compose ...   │                                  |
+|  │ (guest agent)        │   │ (guest agent)        │                                  |
 |  +----------------------+   +----------------------+                                  |
 +---------------------------------------------------------------------------------------+
 ```
@@ -181,7 +181,7 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 ### Boot (start)
 
 1. Read service config.
-2. `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /usr/share/hypervisor-fw/CLOUDHV.fd --disk path=<disk>.qcow2 --disk path=<seed>.iso,readonly=on --net tap=,bridge=br0,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M`.
+2. Pre-create the per-VM tap (`ip tuntap add dev hrt-<name> mode tap`, then attach to `hearth0` and set up), then `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /var/lib/hearth/firmware/CLOUDHV.fd --disk path=<disk>.qcow2 --disk path=<seed>.iso,readonly=on --net tap=hrt-<name>,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M`.
 3. Wait for CHV API socket to be ready (poll with timeout).
 4. Mark `enabled = true` in registry (so reboot survives host restart).
 5. Return current status.
@@ -214,11 +214,11 @@ CHV's `vm.snapshot` produces a directory with memory state + disk metadata. Hear
 
 ## Networking
 
-One host bridge `br0` carries all VM traffic. Hearth does not manage the bridge — it expects it to exist on the host (declared in the NixOS module that ships with hearth).
+One host bridge `hearth0` carries all VM traffic. Hearth does not manage the bridge — it expects it to exist on the host, declared in the NixOS module that ships alongside hearth (which also stands up dnsmasq for DHCP + DNS and the nftables rules for NAT to upstream).
 
-Each VM gets a tap device created by `cloud-hypervisor --net tap=,bridge=br0,...`. The tap is named by CHV.
+Each VM gets a persistent tap named `hrt-<service>`, created by hearthd at start time and attached to `hearth0`. The tap is named explicitly rather than letting CHV pick — CHV's `--net` doesn't accept `bridge=`, so the bridge attachment happens outside CHV before launch.
 
-Guest network configuration is the guest's problem: cloud-init sets DHCP by default. The host (or an upstream router) runs the DHCP server. Hearth does not run dnsmasq, does not assign IPs, does not manage DNS.
+Guest network configuration is the guest's problem: cloud-init sets DHCP by default. The dnsmasq instance on `hearth0` answers; Hearth itself does not run dnsmasq, does not assign IPs, does not manage DNS.
 
 ## Storage
 
@@ -299,4 +299,4 @@ This is the only systemd config that lives on disk for hearth-related VM managem
 - **`hearthctl exec`**: a verb for running commands inside guests was deferred. Likely belongs in a per-guest agent, not hearthd.
 - **Resource limits beyond CHV's**: should hearth set systemd `MemoryMax`/`CPUQuota` on the transient unit as a belt-and-suspenders bound? Probably yes for `MemoryMax`.
 - **Host package surface**: keep libvirt/qemu/virt-manager installed as a debugging escape hatch, or strip to just cloud-hypervisor + virtiofsd? Default to keep for now; revisit after hearth is solid.
-- **Bridge management**: hearth currently *expects* `br0` to exist, declared in NixOS. Should hearth provide a helper (`hearthctl host check`) that verifies the host is correctly provisioned? Probably yes.
+- **Bridge management**: hearth currently *expects* `hearth0` to exist, declared in NixOS alongside dnsmasq + NAT. `hearthctl host check` validates its presence.

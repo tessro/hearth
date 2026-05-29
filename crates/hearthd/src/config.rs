@@ -51,7 +51,7 @@ pub struct Config {
         default_value = "/usr/share/hypervisor-fw/CLOUDHV.fd"
     )]
     pub firmware: Utf8PathBuf,
-    #[arg(long, env = "HEARTH_BRIDGE", default_value = "br0")]
+    #[arg(long, env = "HEARTH_BRIDGE", default_value = "hearth0")]
     pub bridge: String,
     #[arg(long, env = "HEARTH_VSOCK_PORT", default_value_t = 1024)]
     pub vsock_port: u32,

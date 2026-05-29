@@ -1,5 +1,6 @@
 pub mod cloud_init;
 pub mod config;
+pub mod error;
 pub mod host;
 pub mod notify;
 pub mod registry;
@@ -7,6 +8,7 @@ pub mod vsock;
 
 use crate::{
     config::Config,
+    error::{code_of, coded},
     host::{sanitize_image_name, unit_name, wait_for_inactive, Host},
     registry::{validate_name, Allocations, CloudInit, Registry, RestartPolicy, Service},
 };
@@ -282,7 +284,7 @@ impl<H: Host + 'static> Daemon<H> {
         let _registry_guard = self.registry_lock.lock().await;
         let mut reg = self.registry().await?;
         if reg.services.contains_key(name) {
-            return Err(anyhow!("service {name} already exists"));
+            return Err(coded("service.exists", format!("service {name} already exists")));
         }
         let image = optional_str(&args, "image")
             .unwrap_or("debian-12-cloud-amd64")
@@ -296,12 +298,16 @@ impl<H: Host + 'static> Daemon<H> {
             .unwrap_or(20);
         let image_path = self.cfg.image_path(&image);
         if !image_path.exists() {
-            return Err(anyhow!("base image not found: {image_path}"));
+            return Err(coded(
+                "image.not_found",
+                format!("base image not found: {image_path}"),
+            ));
         }
         let is_agent_in_charge = optional_bool(&args, "is_agent_in_charge").unwrap_or(false);
         if is_agent_in_charge && reg.services.values().any(|svc| svc.is_agent_in_charge) {
-            return Err(anyhow!(
-                "at most one service may set is_agent_in_charge = true"
+            return Err(coded(
+                "service.duplicate_agent_in_charge",
+                "at most one service may set is_agent_in_charge = true",
             ));
         }
         let (vsock_cid, mac) = reg.allocate(name);
@@ -393,17 +399,40 @@ impl<H: Host + 'static> Daemon<H> {
         let mut svc = reg.get(name)?.clone();
         if self.is_running(name).await {
             let socket = self.cfg.vm_socket(name);
-            let _ = self
+            let unit = unit_name(name);
+            let graceful_timeout = Duration::from_secs(30);
+            let started = Instant::now();
+            info!(service = %name, "sending vm.shutdown (ACPI)");
+            if let Err(err) = self
                 .host
                 .chv_put(&socket, "/api/v1/vm.shutdown", json!({}))
-                .await;
-            let unit = unit_name(name);
-            if !wait_for_inactive(self.host.as_ref(), &unit, Duration::from_secs(30)).await? {
-                let _ = self
+                .await
+            {
+                warn!(service = %name, error = %err, "vm.shutdown request failed; waiting for unit to exit anyway");
+            }
+            if wait_for_inactive(self.host.as_ref(), &unit, graceful_timeout).await? {
+                info!(
+                    service = %name,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "vm stopped gracefully"
+                );
+            } else {
+                warn!(
+                    service = %name,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    timeout_s = graceful_timeout.as_secs(),
+                    "graceful shutdown timed out; escalating to vm.power-off"
+                );
+                if let Err(err) = self
                     .host
                     .chv_put(&socket, "/api/v1/vm.power-off", json!({}))
-                    .await;
-                let _ = self.host.systemctl(&["stop", &unit]).await;
+                    .await
+                {
+                    warn!(service = %name, error = %err, "vm.power-off request failed");
+                }
+                if let Err(err) = self.host.systemctl(&["stop", &unit]).await {
+                    warn!(service = %name, error = %err, "systemctl stop failed");
+                }
             }
         }
         svc.enabled = false;
@@ -431,6 +460,7 @@ impl<H: Host + 'static> Daemon<H> {
         remove_path_file(self.cfg.seed_path(name)).await?;
         remove_path_file(self.cfg.console_path(name)).await?;
         remove_path_dir(self.cfg.snapshots_dir.join(name)).await?;
+        self.host.delete_tap(&host::tap_name(name)).await?;
         Registry::remove_service(&self.cfg, name).await?;
         reg.free(name);
         Registry::write_allocations(&self.cfg, &reg.allocations).await?;
@@ -462,7 +492,7 @@ impl<H: Host + 'static> Daemon<H> {
         let tag = required_str(&args, "tag")?;
         let src = self.cfg.snapshot_dir(name, tag);
         if !src.exists() {
-            return Err(anyhow!("snapshot not found: {src}"));
+            return Err(coded("snapshot.not_found", format!("snapshot not found: {src}")));
         }
         let _ = self.stop_unlocked(name).await;
         let reg = self.registry().await?;
@@ -559,17 +589,29 @@ impl<H: Host + 'static> Daemon<H> {
         fs::create_dir_all(&self.cfg.images_dir).await?;
         let dest = self.cfg.image_path(&name);
         if dest.exists() {
-            return Err(anyhow!("image {name} already exists"));
+            return Err(coded("image.exists", format!("image {name} already exists")));
         }
-        let bytes = reqwest::get(url).await?.error_for_status()?.bytes().await?;
         let tmp = self
             .cfg
             .images_dir
             .join(format!(".{name}.tmp-{}", std::process::id()));
-        fs::write(&tmp, &bytes).await?;
-        fs::rename(&tmp, &dest).await?;
-        let sha256 = hex::encode(Sha256::digest(&bytes));
-        Ok(json!({ "name": name, "path": dest, "bytes": bytes.len(), "sha256": sha256 }))
+        let mut response = reqwest::get(url).await?.error_for_status()?;
+        let mut file = fs::File::create(&tmp).await?;
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        while let Some(chunk) = response.chunk().await? {
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+            total += chunk.len() as u64;
+        }
+        file.flush().await?;
+        drop(file);
+        if let Err(err) = fs::rename(&tmp, &dest).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(err.into());
+        }
+        let sha256 = hex::encode(hasher.finalize());
+        Ok(json!({ "name": name, "path": dest, "bytes": total, "sha256": sha256 }))
     }
 
     async fn image_rm(&self, name: &str) -> Result<Value> {
@@ -580,14 +622,14 @@ impl<H: Host + 'static> Daemon<H> {
             .values()
             .find(|svc| images_match(&svc.image, name))
         {
-            return Err(anyhow!(
-                "image {name} is still used by service {}",
-                svc.name
+            return Err(coded(
+                "image.in_use",
+                format!("image {name} is still used by service {}", svc.name),
             ));
         }
         let path = self.cfg.image_path(name);
         if !path.exists() {
-            return Err(anyhow!("image not found: {path}"));
+            return Err(coded("image.not_found", format!("image not found: {path}")));
         }
         fs::remove_file(path).await?;
         Ok(json!({ "removed": name }))
@@ -702,9 +744,12 @@ fn service_summary(svc: &Service, running: bool) -> Value {
 }
 
 fn required_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing string argument {key}"))
+    args.get(key).and_then(Value::as_str).ok_or_else(|| {
+        coded(
+            "request.invalid",
+            format!("missing string argument {key}"),
+        )
+    })
 }
 
 fn optional_str<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -745,18 +790,7 @@ fn images_match(left: &str, right: &str) -> bool {
 }
 
 fn error_code(err: &anyhow::Error) -> &'static str {
-    let text = err.to_string();
-    if text.contains("no service named") {
-        "service.not_found"
-    } else if text.contains("already exists") {
-        "service.exists"
-    } else if text.contains("missing") {
-        "request.invalid"
-    } else if text.contains("image") {
-        "image.error"
-    } else {
-        "internal.error"
-    }
+    code_of(err)
 }
 
 async fn remove_path_file(path: Utf8PathBuf) -> Result<()> {
@@ -976,6 +1010,9 @@ mod tests {
         assert!(argv.contains("--vsock cid=100,socket=/run/hearth/vsock/mail.sock"));
         assert!(argv.contains("--cpus boot=2"));
         assert!(argv.contains("--memory size=2048M"));
+        // CHV does not accept `bridge=...`; we pre-create the tap and pass it by name.
+        assert!(argv.contains("--net tap=hrt-mail,mac=52:54:00:12:34:56"));
+        assert!(!argv.contains("bridge="));
     }
 
     #[test]
@@ -1646,6 +1683,15 @@ backoff_sec = 10
                 state.running = false;
             }
             Ok(json!({}))
+        }
+
+        async fn delete_tap(&self, tap: &str) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(format!("delete-tap {tap}"));
+            Ok(())
         }
     }
 }
