@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use serde_json::{json, Value};
 use std::{
     env, fs, io,
     os::unix::fs::FileTypeExt,
@@ -7,7 +8,12 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::{process::Command, time::sleep};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream,
+    process::Command,
+    time::sleep,
+};
 
 const DEFAULT_DATA_DIR: &str = ".local/share/hearth";
 const INITRAMFS_NAME: &str = "initramfs.cpio.gz";
@@ -30,6 +36,7 @@ struct RunPaths {
     initramfs_image: Utf8PathBuf,
     runtime_dir: Utf8PathBuf,
     virtiofs_socket: Utf8PathBuf,
+    chv_api_socket: Utf8PathBuf,
 }
 
 pub async fn run(opts: RunOptions) -> Result<()> {
@@ -131,6 +138,7 @@ impl RunPaths {
             bundle,
             initramfs_image: data_dir.join(INITRAMFS_NAME),
             virtiofs_socket: runtime_dir.join("rootfs.sock"),
+            chv_api_socket: runtime_dir.join("chv.sock"),
             runtime_dir,
         }
     }
@@ -202,6 +210,8 @@ fn umoci_unpack_args(image_layout: &Utf8Path, bundle: &Utf8Path) -> Vec<String> 
 
 fn cloud_hypervisor_args(opts: &RunOptions, paths: &RunPaths, kernel: &Utf8Path) -> Vec<String> {
     vec![
+        "--api-socket".to_string(),
+        format!("path={}", paths.chv_api_socket),
         "--kernel".to_string(),
         kernel.to_string(),
         "--initramfs".to_string(),
@@ -294,12 +304,22 @@ async fn run_cloud_hypervisor(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().context("spawn cloud-hypervisor")?;
+    let api_ready = wait_for_chv_api(
+        &paths.chv_api_socket,
+        &mut child,
+        Duration::from_secs(5),
+    )
+    .await;
+    if let Err(err) = api_ready {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(err);
+    }
     let status = tokio::select! {
         status = child.wait() => status.context("wait for cloud-hypervisor")?,
         signal = tokio::signal::ctrl_c() => {
             signal.context("wait for Ctrl-C")?;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            shutdown_cloud_hypervisor(&paths.chv_api_socket, &mut child).await;
             bail!("interrupted");
         }
     };
@@ -307,6 +327,89 @@ async fn run_cloud_hypervisor(
         Ok(())
     } else {
         Err(anyhow!("cloud-hypervisor exited with {status}"))
+    }
+}
+
+async fn wait_for_chv_api(
+    path: &Utf8Path,
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            bail!("cloud-hypervisor exited before opening API socket {path}: {status}");
+        }
+        if UnixStream::connect(path.as_str()).await.is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for cloud-hypervisor API socket {path}");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn shutdown_cloud_hypervisor(socket: &Utf8Path, child: &mut tokio::process::Child) {
+    if let Err(err) = chv_request(socket, "PUT", "/api/v1/vm.power-off", Some(json!({}))).await {
+        eprintln!("hearthctl: vm.power-off failed: {err:#}; sending SIGKILL");
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return;
+    }
+    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            eprintln!("hearthctl: waiting on cloud-hypervisor failed: {err:#}");
+        }
+        Err(_) => {
+            eprintln!("hearthctl: cloud-hypervisor did not exit after vm.power-off; sending SIGKILL");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+}
+
+async fn chv_request(
+    socket: &Utf8Path,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value> {
+    let mut stream = UnixStream::connect(socket.as_str())
+        .await
+        .with_context(|| format!("connect CHV API socket {socket}"))?;
+    let body_text = body.map(|v| v.to_string()).unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_text.len(),
+        body_text
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.shutdown().await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    parse_http_response(&buf)
+}
+
+fn parse_http_response(bytes: &[u8]) -> Result<Value> {
+    let text = String::from_utf8_lossy(bytes);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow!("malformed HTTP response from CHV"))?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("malformed HTTP status from CHV"))?;
+    if !(200..300).contains(&status) {
+        return Err(anyhow!("CHV API returned HTTP {status}: {body}"));
+    }
+    if body.trim().is_empty() {
+        Ok(json!({}))
+    } else {
+        serde_json::from_str(body).context("parse CHV JSON response")
     }
 }
 
@@ -450,6 +553,8 @@ mod tests {
         assert_eq!(
             cloud_hypervisor_args(&opts, &paths(), Utf8Path::new("/run/current-system/kernel")),
             vec![
+                "--api-socket",
+                "path=/tmp/hearth-test-run/chv.sock",
                 "--kernel",
                 "/run/current-system/kernel",
                 "--initramfs",
