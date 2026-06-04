@@ -10,6 +10,8 @@ use tokio::{
 };
 use ulid::Ulid;
 
+mod docker_run;
+
 #[derive(Debug, Parser)]
 #[command(name = "hearthctl", version, about = "Operate hearthd")]
 struct Cli {
@@ -76,6 +78,18 @@ enum Command {
         #[arg(long)]
         tag: String,
     },
+    Run {
+        #[arg(long)]
+        dockerfile: Utf8PathBuf,
+        #[arg(long, default_value = ".")]
+        context: Utf8PathBuf,
+        #[arg(long, default_value = "hearth-test")]
+        name: String,
+        #[arg(long = "mem", default_value = "512M")]
+        memory: String,
+        #[arg(long, default_value_t = 1)]
+        cpus: u32,
+    },
     Resize {
         name: String,
         #[arg(long)]
@@ -119,6 +133,24 @@ enum HostCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Run {
+        dockerfile,
+        context,
+        name,
+        memory,
+        cpus,
+    } = &cli.command
+    {
+        return docker_run::run(docker_run::RunOptions {
+            dockerfile: dockerfile.clone(),
+            context: context.clone(),
+            name: name.clone(),
+            memory: memory.clone(),
+            cpus: *cpus,
+        })
+        .await;
+    }
+
     let (verb, args) = to_request(&cli.command)?;
     let req = Request::new(Ulid::new().to_string(), verb, args);
     let responses = round_trip(&cli.socket, &req).await?;
@@ -162,8 +194,8 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             insert_opt(&mut args, "disk_gib", disk_gib.map(|v| json!(v)));
             let mut keys: Vec<String> = ssh_key.clone();
             for path in authorized_keys_file {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|e| anyhow!("read {path}: {e}"))?;
+                let text =
+                    std::fs::read_to_string(path).map_err(|e| anyhow!("read {path}: {e}"))?;
                 keys.extend(read_authorized_keys(&text));
             }
             if !keys.is_empty() {
@@ -188,6 +220,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             Verb::Restore,
             args([("name", json!(name)), ("tag", json!(tag))]),
         ),
+        Command::Run { .. } => return Err(anyhow!("run is handled locally")),
         Command::Resize {
             name,
             cpu,
@@ -430,5 +463,27 @@ mod tests {
             Some(&json!(["ssh-ed25519 AAAA test"]))
         );
         assert_eq!(args.get("is_agent_in_charge"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn run_subcommand_parses_dockerfile() {
+        let cli =
+            Cli::try_parse_from(["hearthctl", "run", "--dockerfile", "./Dockerfile"]).unwrap();
+        match cli.command {
+            Command::Run {
+                dockerfile,
+                context,
+                name,
+                memory,
+                cpus,
+            } => {
+                assert_eq!(dockerfile, Utf8PathBuf::from("./Dockerfile"));
+                assert_eq!(context, Utf8PathBuf::from("."));
+                assert_eq!(name, "hearth-test");
+                assert_eq!(memory, "512M");
+                assert_eq!(cpus, 1);
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
     }
 }
