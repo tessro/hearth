@@ -2,6 +2,7 @@
 members = [
   "crates/hearth-proto",
   "crates/hearthd",
+  "crates/hearth-runner",
   "crates/hearthctl",
 ]
 resolver = "2"

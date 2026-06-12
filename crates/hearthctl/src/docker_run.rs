@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     env, fs, io,
@@ -17,7 +18,7 @@ use tokio::{
 
 const DEFAULT_DATA_DIR: &str = ".local/share/hearth";
 const INITRAMFS_NAME: &str = "initramfs.cpio.gz";
-const KERNEL_PATH: &str = "/run/current-system/kernel";
+const KERNEL_PATH: &str = "/run/booted-system/kernel";
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -37,6 +38,27 @@ struct RunPaths {
     runtime_dir: Utf8PathBuf,
     virtiofs_socket: Utf8PathBuf,
     chv_api_socket: Utf8PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciConfig {
+    process: OciProcess,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciProcess {
+    args: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default = "default_cwd")]
+    cwd: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RunManifest {
+    args: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
 }
 
 pub async fn run(opts: RunOptions) -> Result<()> {
@@ -90,7 +112,7 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         "umoci unpack",
     )
     .await?;
-    ensure_guest_init(&paths.rootfs)?;
+    prepare_oci_runtime(&paths)?;
 
     ensure_initramfs_exists(&paths.initramfs_image)?;
     let kernel = resolve_kernel()?;
@@ -116,11 +138,18 @@ pub async fn run(opts: RunOptions) -> Result<()> {
     }
 
     let chv_status = run_cloud_hypervisor(&opts, &paths, &kernel).await;
+    let guest_status = read_guest_exit_status(&paths.rootfs);
     let virtiofsd_status = stop_child(&mut virtiofsd).await;
     let cleanup_status = cleanup_runtime_dir(&paths.runtime_dir);
     virtiofsd_status?;
     cleanup_status?;
-    chv_status
+    chv_status?;
+    if let Some(status) = guest_status? {
+        if status != 0 {
+            bail!("guest process exited with status {status}");
+        }
+    }
+    Ok(())
 }
 
 impl RunPaths {
@@ -238,26 +267,74 @@ fn virtiofsd_args(paths: &RunPaths) -> Vec<String> {
     ]
 }
 
-fn ensure_guest_init(rootfs: &Utf8Path) -> Result<()> {
-    let init = rootfs.join("init");
-    let meta = fs::metadata(&init)
-        .with_context(|| format!("OCI rootfs must contain /init for this milestone: {init}"))?;
-    if !is_executable(&meta) {
-        bail!("OCI rootfs /init is not executable: {init}");
+fn default_cwd() -> String {
+    "/".to_string()
+}
+
+fn prepare_oci_runtime(paths: &RunPaths) -> Result<()> {
+    let process = read_oci_process(&paths.bundle)?;
+    let meta_dir = paths.rootfs.join(".hearth");
+    fs::create_dir_all(&meta_dir)?;
+    let manifest = RunManifest {
+        args: process.args,
+        env: process.env,
+        cwd: process.cwd,
+    };
+    fs::write(
+        meta_dir.join("run.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    match fs::remove_file(meta_dir.join("exit-status")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn is_executable(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    meta.permissions().mode() & 0o111 != 0
+fn read_oci_process(bundle: &Utf8Path) -> Result<OciProcess> {
+    let config_path = bundle.join("config.json");
+    let text = fs::read_to_string(&config_path).with_context(|| format!("read {config_path}"))?;
+    let config: OciConfig =
+        serde_json::from_str(&text).with_context(|| format!("parse {config_path}"))?;
+    validate_oci_process(config.process)
 }
 
-#[cfg(not(unix))]
-fn is_executable(_meta: &fs::Metadata) -> bool {
-    true
+fn validate_oci_process(mut process: OciProcess) -> Result<OciProcess> {
+    if process.args.is_empty() || process.args[0].is_empty() {
+        bail!("OCI config process.args must contain an executable");
+    }
+    if process.cwd.is_empty() {
+        process.cwd = default_cwd();
+    }
+    if !process.cwd.starts_with('/') {
+        bail!("OCI config process.cwd must be absolute: {}", process.cwd);
+    }
+    for env in &process.env {
+        if env.as_bytes().contains(&0) {
+            bail!("OCI config process.env contains a NUL byte");
+        }
+    }
+    for arg in &process.args {
+        if arg.as_bytes().contains(&0) {
+            bail!("OCI config process.args contains a NUL byte");
+        }
+    }
+    Ok(process)
+}
+
+fn read_guest_exit_status(rootfs: &Utf8Path) -> Result<Option<i32>> {
+    let path = rootfs.join(".hearth").join("exit-status");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let status = text
+        .trim()
+        .parse::<i32>()
+        .with_context(|| format!("parse {path}"))?;
+    Ok(Some(status))
 }
 
 fn command(program: &str, args: Vec<String>) -> Command {
@@ -304,12 +381,8 @@ async fn run_cloud_hypervisor(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mut child = cmd.spawn().context("spawn cloud-hypervisor")?;
-    let api_ready = wait_for_chv_api(
-        &paths.chv_api_socket,
-        &mut child,
-        Duration::from_secs(5),
-    )
-    .await;
+    let api_ready =
+        wait_for_chv_api(&paths.chv_api_socket, &mut child, Duration::from_secs(5)).await;
     if let Err(err) = api_ready {
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -363,7 +436,9 @@ async fn shutdown_cloud_hypervisor(socket: &Utf8Path, child: &mut tokio::process
             eprintln!("hearthctl: waiting on cloud-hypervisor failed: {err:#}");
         }
         Err(_) => {
-            eprintln!("hearthctl: cloud-hypervisor did not exit after vm.power-off; sending SIGKILL");
+            eprintln!(
+                "hearthctl: cloud-hypervisor did not exit after vm.power-off; sending SIGKILL"
+            );
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -551,12 +626,12 @@ mod tests {
             cpus: 1,
         };
         assert_eq!(
-            cloud_hypervisor_args(&opts, &paths(), Utf8Path::new("/run/current-system/kernel")),
+            cloud_hypervisor_args(&opts, &paths(), Utf8Path::new("/run/booted-system/kernel")),
             vec![
                 "--api-socket",
                 "path=/tmp/hearth-test-run/chv.sock",
                 "--kernel",
-                "/run/current-system/kernel",
+                "/run/booted-system/kernel",
                 "--initramfs",
                 "/home/tess/.local/share/hearth/initramfs.cpio.gz",
                 "--cmdline",
@@ -580,5 +655,65 @@ mod tests {
         assert!(validate_name("hearth-test").is_ok());
         assert!(validate_name("../bad").is_err());
         assert!(validate_name("").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_oci_process_args() {
+        let err = validate_oci_process(OciProcess {
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: "/".to_string(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("process.args"));
+    }
+
+    #[test]
+    fn rejects_relative_oci_cwd() {
+        let err = validate_oci_process(OciProcess {
+            args: vec!["python3".to_string()],
+            env: Vec::new(),
+            cwd: "srv".to_string(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("process.cwd"));
+    }
+
+    #[test]
+    fn prepares_runner_manifest_from_oci_config() {
+        let root = Utf8PathBuf::from(format!(
+            "/tmp/hearth-oci-runtime-test-{}",
+            std::process::id()
+        ));
+        let bundle = root.join("bundle");
+        let rootfs = bundle.join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::write(
+            bundle.join("config.json"),
+            r#"{
+              "process": {
+                "args": ["python3", "-m", "http.server"],
+                "env": ["PATH=/usr/local/bin:/usr/bin:/bin"],
+                "cwd": "/srv/public"
+              }
+            }"#,
+        )
+        .unwrap();
+        let paths = RunPaths {
+            image_layout: root.join("image"),
+            bundle: bundle.clone(),
+            rootfs: rootfs.clone(),
+            initramfs_image: root.join("initramfs.cpio.gz"),
+            runtime_dir: root.join("run"),
+            virtiofs_socket: root.join("run/rootfs.sock"),
+            chv_api_socket: root.join("run/chv.sock"),
+        };
+
+        prepare_oci_runtime(&paths).unwrap();
+        let manifest = std::fs::read_to_string(rootfs.join(".hearth/run.json")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(manifest.contains(r#""python3""#));
+        assert!(manifest.contains(r#""cwd": "/srv/public""#));
     }
 }

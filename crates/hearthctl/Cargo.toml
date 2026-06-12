@@ -11,6 +11,7 @@ camino.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
 hearth-proto = { path = "../hearth-proto" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio.workspace = true
 ulid.workspace = true

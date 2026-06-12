@@ -475,6 +475,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hearth-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hearthctl"
 version = "0.1.0"
 dependencies = [
@@ -483,6 +493,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "hearth-proto",
+ "serde",
  "serde_json",
  "tokio",
  "ulid",

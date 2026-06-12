@@ -14,6 +14,7 @@
     rustc
     rustfmt
     rust-analyzer
+    pkgsStatic.busybox
   ];
 
   # https://devenv.sh/languages/
@@ -28,6 +29,18 @@
   # https://devenv.sh/scripts/
   scripts.hello.exec = ''
     echo hello from $GREET
+  '';
+
+  scripts.build-hearth-runner.exec = ''
+    LIBRARY_PATH="${pkgs.glibc.static}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}" \
+      cargo rustc -p hearth-runner --release -- -C target-feature=+crt-static
+  '';
+
+  scripts.build-hearth-initramfs.exec = ''
+    scripts/build-initramfs.sh \
+      --busybox ${pkgs.pkgsStatic.busybox}/bin/busybox \
+      --runner target/release/hearth-runner \
+      "$@"
   '';
 
   # https://devenv.sh/basics/

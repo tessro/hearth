@@ -6,6 +6,7 @@ STAGING_DIR="${HEARTH_INITRAMFS_DIR:-"$DATA_DIR/initramfs"}"
 OUTPUT="${HEARTH_INITRAMFS:-"$DATA_DIR/initramfs.cpio.gz"}"
 BUSYBOX="${HEARTH_BUSYBOX:-}"
 MODULES_DIR="${HEARTH_MODULES_DIR:-}"
+RUNNER="${HEARTH_RUNNER:-}"
 
 usage() {
     cat <<'EOF'
@@ -13,6 +14,7 @@ usage: scripts/build-initramfs.sh [options]
 
 Options:
   --busybox PATH       busybox binary to copy into the initramfs
+  --runner PATH        hearth-runner binary to copy into the initramfs
   --modules-dir DIR    module source dir; accepts flat or kernel-tree layout
   --data-dir DIR       Hearth data dir (default: $HOME/.local/share/hearth)
   --staging-dir DIR    unpacked initramfs staging dir
@@ -20,7 +22,7 @@ Options:
   -h, --help           show this help
 
 Environment:
-  HEARTH_BUSYBOX, HEARTH_MODULES_DIR, HEARTH_DATA_DIR,
+  HEARTH_BUSYBOX, HEARTH_RUNNER, HEARTH_MODULES_DIR, HEARTH_DATA_DIR,
   HEARTH_INITRAMFS_DIR, HEARTH_INITRAMFS
 EOF
 }
@@ -35,6 +37,11 @@ while [ "$#" -gt 0 ]; do
         --busybox)
             [ "$#" -ge 2 ] || die "--busybox requires a path"
             BUSYBOX="$2"
+            shift 2
+            ;;
+        --runner)
+            [ "$#" -ge 2 ] || die "--runner requires a path"
+            RUNNER="$2"
             shift 2
             ;;
         --modules-dir)
@@ -77,6 +84,23 @@ if [ -z "$BUSYBOX" ]; then
     fi
 fi
 [ -f "$BUSYBOX" ] || die "busybox is not a file: $BUSYBOX"
+if command -v file >/dev/null 2>&1 && file "$BUSYBOX" | grep -q "dynamically linked"; then
+    die "busybox must be statically linked for the initramfs: $BUSYBOX"
+fi
+
+if [ -z "$RUNNER" ]; then
+    if [ -f target/x86_64-unknown-linux-musl/release/hearth-runner ]; then
+        RUNNER="target/x86_64-unknown-linux-musl/release/hearth-runner"
+    elif [ -f target/release/hearth-runner ]; then
+        RUNNER="target/release/hearth-runner"
+    else
+        die "hearth-runner not found; build it first with 'devenv shell build-hearth-runner', then pass --runner PATH or set HEARTH_RUNNER"
+    fi
+fi
+[ -f "$RUNNER" ] || die "hearth-runner is not a file: $RUNNER"
+if command -v file >/dev/null 2>&1 && file "$RUNNER" | grep -q "dynamically linked"; then
+    die "hearth-runner must be statically linked for the initramfs: $RUNNER"
+fi
 
 if [ -z "$MODULES_DIR" ]; then
     release="$(uname -r)"
@@ -104,7 +128,9 @@ mkdir -p \
 
 cp "$BUSYBOX" "$WORK_DIR/bin/busybox"
 chmod 0755 "$WORK_DIR/bin/busybox"
-for applet in sh mount mkdir switch_root insmod; do
+cp "$RUNNER" "$WORK_DIR/hearth-runner"
+chmod 0755 "$WORK_DIR/hearth-runner"
+for applet in sh mount mkdir insmod chroot poweroff reboot; do
     ln -s busybox "$WORK_DIR/bin/$applet"
 done
 
@@ -147,8 +173,22 @@ insmod /lib/modules/virtiofs.ko.xz
 echo "hearth initramfs: mounting virtiofs root"
 mount -t virtiofs root /newroot || exec sh
 
-echo "hearth initramfs: switching root"
-exec switch_root /newroot /init
+mkdir -p /newroot/proc /newroot/sys /newroot/dev
+mount -t proc proc /newroot/proc 2>/dev/null || true
+mount -t sysfs sysfs /newroot/sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /newroot/dev 2>/dev/null || true
+
+echo "hearth initramfs: running OCI process"
+/hearth-runner /newroot /newroot/.hearth/run.json
+status="$?"
+if [ ! -f /newroot/.hearth/exit-status ]; then
+    echo "$status" > /newroot/.hearth/exit-status
+fi
+
+echo "hearth initramfs: OCI process exited with status $status; powering off"
+poweroff -f || reboot -f || echo o > /proc/sysrq-trigger
+
+exec sh
 EOF
 chmod 0755 "$WORK_DIR/init"
 
