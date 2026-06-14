@@ -24,6 +24,8 @@ pub enum Verb {
     ImageLs,
     ImagePull,
     ImageRm,
+    NetSetup,
+    NetTeardown,
     HostCheck,
 }
 
@@ -47,6 +49,8 @@ impl Verb {
             Self::ImageLs => "image-ls",
             Self::ImagePull => "image-pull",
             Self::ImageRm => "image-rm",
+            Self::NetSetup => "net-setup",
+            Self::NetTeardown => "net-teardown",
             Self::HostCheck => "host-check",
         }
     }

@@ -2,6 +2,8 @@ FROM python:3-alpine
 
 WORKDIR /srv/public
 COPY public/ /srv/public/
+COPY serve-http.sh /usr/local/bin/serve-http
+RUN chmod 0755 /usr/local/bin/serve-http
 
 EXPOSE 8000
-CMD ["python3", "-m", "http.server", "8000", "--bind", "0.0.0.0"]
+CMD ["serve-http"]

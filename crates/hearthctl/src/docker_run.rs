@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use clap::ValueEnum;
+use hearth_proto::{Request, Response, Verb};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{
     env, fs, io,
     os::unix::fs::FileTypeExt,
@@ -10,11 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::Command,
     time::sleep,
 };
+use ulid::Ulid;
 
 const DEFAULT_DATA_DIR: &str = ".local/share/hearth";
 const INITRAMFS_NAME: &str = "initramfs.cpio.gz";
@@ -27,6 +30,18 @@ pub struct RunOptions {
     pub name: String,
     pub memory: String,
     pub cpus: u32,
+    pub network: NetworkMode,
+    pub bridge: String,
+    pub tap: Option<String>,
+    pub mac: Option<String>,
+    pub tap_setup: bool,
+    pub socket: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NetworkMode {
+    None,
+    Bridge,
 }
 
 #[derive(Debug, Clone)]
@@ -61,9 +76,24 @@ struct RunManifest {
     cwd: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkConfig {
+    bridge: String,
+    tap: String,
+    mac: String,
+    setup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TapLease {
+    name: String,
+    created: bool,
+}
+
 pub async fn run(opts: RunOptions) -> Result<()> {
     validate_name(&opts.name)?;
     validate_memory(&opts.memory)?;
+    let network = resolve_network(&opts)?;
     if opts.cpus == 0 {
         bail!("--cpus must be at least 1");
     }
@@ -137,11 +167,21 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         return Err(err);
     }
 
-    let chv_status = run_cloud_hypervisor(&opts, &paths, &kernel).await;
+    let tap = match setup_network(&opts.socket, network.as_ref()).await {
+        Ok(tap) => tap,
+        Err(err) => {
+            let _ = stop_child(&mut virtiofsd).await;
+            let _ = cleanup_runtime_dir(&paths.runtime_dir);
+            return Err(err);
+        }
+    };
+    let chv_status = run_cloud_hypervisor(&opts, &paths, &kernel, network.as_ref()).await;
     let guest_status = read_guest_exit_status(&paths.rootfs);
     let virtiofsd_status = stop_child(&mut virtiofsd).await;
+    let tap_status = teardown_network(&opts.socket, tap.as_ref()).await;
     let cleanup_status = cleanup_runtime_dir(&paths.runtime_dir);
     virtiofsd_status?;
+    tap_status?;
     cleanup_status?;
     chv_status?;
     if let Some(status) = guest_status? {
@@ -196,6 +236,19 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_ifname(label: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 15 {
+        bail!("{label} must be 1-15 bytes");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("{label} may only contain ASCII letters, digits, '.', '_', and '-'");
+    }
+    Ok(())
+}
+
 fn validate_memory(memory: &str) -> Result<()> {
     if memory.is_empty()
         || !memory.ends_with('M')
@@ -206,6 +259,77 @@ fn validate_memory(memory: &str) -> Result<()> {
         bail!("--mem must use Cloud Hypervisor's MiB form, for example 512M");
     }
     Ok(())
+}
+
+fn validate_mac(mac: &str) -> Result<()> {
+    let parts: Vec<_> = mac.split(':').collect();
+    if parts.len() != 6 {
+        bail!("--mac must be six hex octets, for example 52:54:00:12:34:56");
+    }
+    for part in parts {
+        if part.len() != 2 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("--mac must be six hex octets, for example 52:54:00:12:34:56");
+        }
+    }
+    Ok(())
+}
+
+fn resolve_network(opts: &RunOptions) -> Result<Option<NetworkConfig>> {
+    match opts.network {
+        NetworkMode::None => {
+            if opts.tap.is_some() || opts.mac.is_some() {
+                bail!("--tap and --mac require --network bridge");
+            }
+            Ok(None)
+        }
+        NetworkMode::Bridge => {
+            validate_ifname("--bridge", &opts.bridge)?;
+            let tap = opts
+                .tap
+                .clone()
+                .unwrap_or_else(|| default_tap_name(&opts.name));
+            validate_ifname("--tap", &tap)?;
+            let mac = opts.mac.clone().unwrap_or_else(|| default_mac(&opts.name));
+            validate_mac(&mac)?;
+            Ok(Some(NetworkConfig {
+                bridge: opts.bridge.clone(),
+                tap,
+                mac: mac.to_ascii_lowercase(),
+                setup: opts.tap_setup,
+            }))
+        }
+    }
+}
+
+fn default_tap_name(name: &str) -> String {
+    let simple = format!("hrt-{name}");
+    if simple.len() <= 15 {
+        return simple;
+    }
+    let prefix: String = name.chars().take(4).collect();
+    format!(
+        "hrt-{prefix}-{:06x}",
+        fnv1a32(name.as_bytes()) & 0x00ff_ffff
+    )
+}
+
+fn default_mac(name: &str) -> String {
+    let hash = fnv1a32(name.as_bytes());
+    format!(
+        "02:00:00:{:02x}:{:02x}:{:02x}",
+        (hash >> 16) & 0xff,
+        (hash >> 8) & 0xff,
+        hash & 0xff
+    )
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
 }
 
 fn buildah_bud_args(name: &str, dockerfile: &Utf8Path, context: &Utf8Path) -> Vec<String> {
@@ -237,8 +361,13 @@ fn umoci_unpack_args(image_layout: &Utf8Path, bundle: &Utf8Path) -> Vec<String> 
     ]
 }
 
-fn cloud_hypervisor_args(opts: &RunOptions, paths: &RunPaths, kernel: &Utf8Path) -> Vec<String> {
-    vec![
+fn cloud_hypervisor_args(
+    opts: &RunOptions,
+    paths: &RunPaths,
+    kernel: &Utf8Path,
+    network: Option<&NetworkConfig>,
+) -> Vec<String> {
+    let mut args = vec![
         "--api-socket".to_string(),
         format!("path={}", paths.chv_api_socket),
         "--kernel".to_string(),
@@ -257,7 +386,12 @@ fn cloud_hypervisor_args(opts: &RunOptions, paths: &RunPaths, kernel: &Utf8Path)
         "off".to_string(),
         "--serial".to_string(),
         "tty".to_string(),
-    ]
+    ];
+    if let Some(network) = network {
+        args.push("--net".to_string());
+        args.push(format!("tap={},mac={}", network.tap, network.mac));
+    }
+    args
 }
 
 fn virtiofsd_args(paths: &RunPaths) -> Vec<String> {
@@ -369,14 +503,68 @@ async fn spawn_virtiofsd(paths: &RunPaths) -> Result<tokio::process::Child> {
     cmd.spawn().context("spawn virtiofsd")
 }
 
+async fn setup_network(
+    socket: &Utf8Path,
+    network: Option<&NetworkConfig>,
+) -> Result<Option<TapLease>> {
+    let Some(network) = network else {
+        return Ok(None);
+    };
+    eprintln!(
+        "hearthctl: network bridge={} tap={} mac={} setup={}",
+        network.bridge, network.tap, network.mac, network.setup
+    );
+    if !network.setup {
+        return Ok(Some(TapLease {
+            name: network.tap.clone(),
+            created: false,
+        }));
+    }
+    let value = hearth_request(
+        socket,
+        Verb::NetSetup,
+        Map::from_iter([
+            ("bridge".to_string(), json!(network.bridge)),
+            ("tap".to_string(), json!(network.tap)),
+        ]),
+    )
+    .await
+    .context("ask hearthd to set up bridge networking")?;
+    let created = value
+        .get("created")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(Some(TapLease {
+        name: network.tap.clone(),
+        created,
+    }))
+}
+
+async fn teardown_network(socket: &Utf8Path, tap: Option<&TapLease>) -> Result<()> {
+    let Some(tap) = tap else {
+        return Ok(());
+    };
+    if tap.created {
+        hearth_request(
+            socket,
+            Verb::NetTeardown,
+            Map::from_iter([("tap".to_string(), json!(tap.name))]),
+        )
+        .await
+        .context("ask hearthd to tear down bridge networking")?;
+    }
+    Ok(())
+}
+
 async fn run_cloud_hypervisor(
     opts: &RunOptions,
     paths: &RunPaths,
     kernel: &Utf8Path,
+    network: Option<&NetworkConfig>,
 ) -> Result<()> {
     eprintln!("hearthctl: cloud-hypervisor");
     let mut cmd = Command::new("cloud-hypervisor");
-    cmd.args(cloud_hypervisor_args(opts, paths, kernel))
+    cmd.args(cloud_hypervisor_args(opts, paths, kernel, network))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -400,6 +588,34 @@ async fn run_cloud_hypervisor(
         Ok(())
     } else {
         Err(anyhow!("cloud-hypervisor exited with {status}"))
+    }
+}
+
+async fn hearth_request(socket: &Utf8Path, verb: Verb, args: Map<String, Value>) -> Result<Value> {
+    let req = Request::new(Ulid::new().to_string(), verb, args);
+    let stream = UnixStream::connect(socket.as_str())
+        .await
+        .with_context(|| format!("connect hearthd socket {socket}"))?;
+    let (read, mut write) = stream.into_split();
+    write
+        .write_all(serde_json::to_string(&req)?.as_bytes())
+        .await?;
+    write.write_all(b"\n").await?;
+    write.shutdown().await?;
+    let mut lines = BufReader::new(read).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("hearthd closed connection without a response"))?;
+    let response: Response = serde_json::from_str(&line)?;
+    if response.ok {
+        Ok(response.result.unwrap_or_else(|| json!({})))
+    } else {
+        let message = response
+            .error
+            .map(|err| format!("{}: {}", err.code, err.message))
+            .unwrap_or_else(|| "unknown hearthd error".to_string());
+        Err(anyhow!(message))
     }
 }
 
@@ -624,9 +840,20 @@ mod tests {
             name: "hearth-test".to_string(),
             memory: "512M".to_string(),
             cpus: 1,
+            network: NetworkMode::None,
+            bridge: "hearth0".to_string(),
+            tap: None,
+            mac: None,
+            tap_setup: true,
+            socket: Utf8PathBuf::from("/run/hearth.sock"),
         };
         assert_eq!(
-            cloud_hypervisor_args(&opts, &paths(), Utf8Path::new("/run/booted-system/kernel")),
+            cloud_hypervisor_args(
+                &opts,
+                &paths(),
+                Utf8Path::new("/run/booted-system/kernel"),
+                None
+            ),
             vec![
                 "--api-socket",
                 "path=/tmp/hearth-test-run/chv.sock",
@@ -648,6 +875,86 @@ mod tests {
                 "tty",
             ]
         );
+    }
+
+    #[test]
+    fn bridge_network_adds_chv_net_arg() {
+        let opts = RunOptions {
+            dockerfile: Utf8PathBuf::from("./Dockerfile"),
+            context: Utf8PathBuf::from("."),
+            name: "hearth-test".to_string(),
+            memory: "512M".to_string(),
+            cpus: 1,
+            network: NetworkMode::Bridge,
+            bridge: "hearth0".to_string(),
+            tap: None,
+            mac: None,
+            tap_setup: true,
+            socket: Utf8PathBuf::from("/run/hearth.sock"),
+        };
+        let network = resolve_network(&opts).unwrap().unwrap();
+        let args = cloud_hypervisor_args(
+            &opts,
+            &paths(),
+            Utf8Path::new("/run/booted-system/kernel"),
+            Some(&network),
+        );
+        let expected = format!("tap=hrt-hearth-test,mac={}", default_mac("hearth-test"));
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--net" && pair[1] == expected));
+    }
+
+    #[test]
+    fn generated_tap_names_fit_linux_ifname_limit() {
+        let tap = default_tap_name("hearth-test-with-a-long-name");
+        assert!(tap.len() <= 15);
+        assert!(validate_ifname("--tap", &tap).is_ok());
+    }
+
+    #[test]
+    fn bridge_network_can_use_preconfigured_tap() {
+        let opts = RunOptions {
+            dockerfile: Utf8PathBuf::from("./Dockerfile"),
+            context: Utf8PathBuf::from("."),
+            name: "hearth-test".to_string(),
+            memory: "512M".to_string(),
+            cpus: 1,
+            network: NetworkMode::Bridge,
+            bridge: "hearth0".to_string(),
+            tap: Some("hrt-test".to_string()),
+            mac: Some("02:00:00:12:34:56".to_string()),
+            tap_setup: false,
+            socket: Utf8PathBuf::from("/run/hearth.sock"),
+        };
+        let network = resolve_network(&opts).unwrap().unwrap();
+
+        assert_eq!(network.tap, "hrt-test");
+        assert_eq!(network.mac, "02:00:00:12:34:56");
+        assert!(!network.setup);
+    }
+
+    #[test]
+    fn tap_and_mac_require_bridge_network() {
+        let opts = RunOptions {
+            dockerfile: Utf8PathBuf::from("./Dockerfile"),
+            context: Utf8PathBuf::from("."),
+            name: "hearth-test".to_string(),
+            memory: "512M".to_string(),
+            cpus: 1,
+            network: NetworkMode::None,
+            bridge: "hearth0".to_string(),
+            tap: Some("hrt-test".to_string()),
+            mac: None,
+            tap_setup: true,
+            socket: Utf8PathBuf::from("/run/hearth.sock"),
+        };
+
+        assert!(resolve_network(&opts)
+            .unwrap_err()
+            .to_string()
+            .contains("--network bridge"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub trait Host: Send + Sync {
     ) -> Result<()>;
     async fn chv_get(&self, socket: &Utf8Path, path: &str) -> Result<Value>;
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value>;
+    async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool>;
     async fn delete_tap(&self, tap: &str) -> Result<()>;
 }
 
@@ -51,7 +52,7 @@ impl Host for RealHost {
         fs::create_dir_all(&cfg.log_dir).await?;
         unlink_stale(&cfg.vm_socket(&service.name)).await?;
         unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
-        ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
+        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
         systemd_run_chv(service, cloud_hypervisor_argv(cfg, service)).await
     }
 
@@ -66,7 +67,7 @@ impl Host for RealHost {
         fs::create_dir_all(&cfg.log_dir).await?;
         unlink_stale(&cfg.vm_socket(&service.name)).await?;
         unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
-        ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
+        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
         systemd_run_chv(
             service,
             cloud_hypervisor_restore_argv(cfg, service, snapshot_dir),
@@ -133,13 +134,12 @@ impl Host for RealHost {
         chv_request(socket, "PUT", path, Some(body)).await
     }
 
+    async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {
+        ensure_tap(bridge, tap).await
+    }
+
     async fn delete_tap(&self, tap: &str) -> Result<()> {
-        if !std::path::Path::new(&format!("/sys/class/net/{tap}")).exists() {
-            return Ok(());
-        }
-        let mut cmd = Command::new("ip");
-        cmd.args(["link", "del", tap]);
-        run_status(cmd, "ip link del").await
+        delete_tap_device(tap).await
     }
 }
 
@@ -327,10 +327,26 @@ pub fn unit_name(name: &str) -> String {
     format!("hearth-vm-{name}.service")
 }
 
-/// Tap device name for a service. Linux interface names are capped at 15 chars,
-/// so the `hrt-` prefix leaves 11 chars for the service name.
+/// Tap device name for a service. Linux interface names are capped at 15 bytes.
 pub fn tap_name(name: &str) -> String {
-    format!("hrt-{name}")
+    let simple = format!("hrt-{name}");
+    if simple.len() <= 15 {
+        return simple;
+    }
+    let prefix: String = name.chars().take(4).collect();
+    format!(
+        "hrt-{prefix}-{:06x}",
+        fnv1a32(name.as_bytes()) & 0x00ff_ffff
+    )
+}
+
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
 }
 
 /// CHV refuses to bind a unix socket path that already exists. Remove it if a
@@ -344,22 +360,61 @@ async fn unlink_stale(path: &Utf8Path) -> Result<()> {
 }
 
 /// Create the tap (idempotent), attach it to the bridge, and bring it up.
-async fn ensure_tap(bridge: &str, tap: &str) -> Result<()> {
+async fn ensure_tap(bridge: &str, tap: &str) -> Result<bool> {
+    let mut created = false;
     if !std::path::Path::new(&format!("/sys/class/net/{tap}")).exists() {
         let mut cmd = Command::new("ip");
         cmd.args(["tuntap", "add", "dev", tap, "mode", "tap"]);
         run_status(cmd, "ip tuntap add").await?;
+        created = true;
     }
     let mut cmd = Command::new("ip");
     cmd.args(["link", "set", tap, "master", bridge]);
-    run_status(cmd, "ip link set master").await?;
+    if let Err(err) = run_status(cmd, "ip link set master").await {
+        if created {
+            let _ = delete_tap_device(tap).await;
+        }
+        return Err(err);
+    }
     let mut cmd = Command::new("ip");
     cmd.args(["link", "set", tap, "up"]);
-    run_status(cmd, "ip link set up").await?;
-    Ok(())
+    if let Err(err) = run_status(cmd, "ip link set up").await {
+        if created {
+            let _ = delete_tap_device(tap).await;
+        }
+        return Err(err);
+    }
+    Ok(created)
+}
+
+async fn delete_tap_device(tap: &str) -> Result<()> {
+    if !std::path::Path::new(&format!("/sys/class/net/{tap}")).exists() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("ip");
+    cmd.args(["link", "del", tap]);
+    run_status(cmd, "ip link del").await
 }
 
 pub fn sanitize_image_name(url: &str) -> String {
     let tail = url.rsplit('/').next().unwrap_or("image.qcow2");
     tail.strip_suffix(".qcow2").unwrap_or(tail).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_tap_names_keep_service_name() {
+        assert_eq!(tap_name("web"), "hrt-web");
+    }
+
+    #[test]
+    fn long_tap_names_fit_linux_ifname_limit() {
+        let tap = tap_name("http-server-with-long-name");
+
+        assert!(tap.len() <= 15);
+        assert!(tap.starts_with("hrt-http-"));
+    }
 }

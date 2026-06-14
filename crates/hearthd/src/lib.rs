@@ -12,7 +12,7 @@ use crate::{
     host::{sanitize_image_name, unit_name, wait_for_inactive, Host},
     registry::{validate_name, Allocations, CloudInit, Registry, RestartPolicy, Service},
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use chrono::Utc;
 use hearth_proto::{version_result, Request, Response, Verb};
@@ -229,6 +229,8 @@ impl<H: Host + 'static> Daemon<H> {
                 .image_rm(required_str(&req.args, "name")?)
                 .await
                 .map(Dispatch::One),
+            Verb::NetSetup => self.net_setup(req.args).await.map(Dispatch::One),
+            Verb::NetTeardown => self.net_teardown(req.args).await.map(Dispatch::One),
             Verb::HostCheck => self.host_check().await.map(Dispatch::One),
         }
     }
@@ -284,7 +286,10 @@ impl<H: Host + 'static> Daemon<H> {
         let _registry_guard = self.registry_lock.lock().await;
         let mut reg = self.registry().await?;
         if reg.services.contains_key(name) {
-            return Err(coded("service.exists", format!("service {name} already exists")));
+            return Err(coded(
+                "service.exists",
+                format!("service {name} already exists"),
+            ));
         }
         let image = optional_str(&args, "image")
             .unwrap_or("debian-12-cloud-amd64")
@@ -492,7 +497,10 @@ impl<H: Host + 'static> Daemon<H> {
         let tag = required_str(&args, "tag")?;
         let src = self.cfg.snapshot_dir(name, tag);
         if !src.exists() {
-            return Err(coded("snapshot.not_found", format!("snapshot not found: {src}")));
+            return Err(coded(
+                "snapshot.not_found",
+                format!("snapshot not found: {src}"),
+            ));
         }
         let _ = self.stop_unlocked(name).await;
         let reg = self.registry().await?;
@@ -589,7 +597,10 @@ impl<H: Host + 'static> Daemon<H> {
         fs::create_dir_all(&self.cfg.images_dir).await?;
         let dest = self.cfg.image_path(&name);
         if dest.exists() {
-            return Err(coded("image.exists", format!("image {name} already exists")));
+            return Err(coded(
+                "image.exists",
+                format!("image {name} already exists"),
+            ));
         }
         let tmp = self
             .cfg
@@ -633,6 +644,22 @@ impl<H: Host + 'static> Daemon<H> {
         }
         fs::remove_file(path).await?;
         Ok(json!({ "removed": name }))
+    }
+
+    async fn net_setup(&self, args: Map<String, Value>) -> Result<Value> {
+        let tap = required_str(&args, "tap")?;
+        validate_ifname("--tap", tap)?;
+        let bridge = optional_str(&args, "bridge").unwrap_or(&self.cfg.bridge);
+        validate_ifname("--bridge", bridge)?;
+        let created = self.host.setup_tap(bridge, tap).await?;
+        Ok(json!({ "bridge": bridge, "tap": tap, "created": created }))
+    }
+
+    async fn net_teardown(&self, args: Map<String, Value>) -> Result<Value> {
+        let tap = required_str(&args, "tap")?;
+        validate_ifname("--tap", tap)?;
+        self.host.delete_tap(tap).await?;
+        Ok(json!({ "tap": tap, "deleted": true }))
     }
 
     async fn host_check(&self) -> Result<Value> {
@@ -744,16 +771,26 @@ fn service_summary(svc: &Service, running: bool) -> Value {
 }
 
 fn required_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
-    args.get(key).and_then(Value::as_str).ok_or_else(|| {
-        coded(
-            "request.invalid",
-            format!("missing string argument {key}"),
-        )
-    })
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| coded("request.invalid", format!("missing string argument {key}")))
 }
 
 fn optional_str<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+
+fn validate_ifname(label: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 15 {
+        bail!("{label} must be 1-15 bytes");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("{label} may only contain ASCII letters, digits, '.', '_', and '-'");
+    }
+    Ok(())
 }
 
 fn optional_u64(args: &Map<String, Value>, key: &str) -> Option<u64> {
@@ -1422,6 +1459,53 @@ backoff_sec = 10
     }
 
     #[tokio::test]
+    async fn net_setup_calls_host_tap_setup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+        let req = Request::new(
+            "1",
+            Verb::NetSetup,
+            Map::from_iter([
+                ("bridge".into(), json!("hearth0")),
+                ("tap".into(), json!("hrt-test")),
+            ]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(responses[0].ok);
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls
+            .iter()
+            .any(|call| call == "setup-tap hearth0 hrt-test"));
+    }
+
+    #[tokio::test]
+    async fn net_teardown_calls_host_tap_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+        let req = Request::new(
+            "1",
+            Verb::NetTeardown,
+            Map::from_iter([("tap".into(), json!("hrt-test"))]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(responses[0].ok);
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls.iter().any(|call| call == "delete-tap hrt-test"));
+    }
+
+    #[tokio::test]
     async fn image_ls_returns_only_qcow2_images_sorted_with_hashes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
@@ -1683,6 +1767,15 @@ backoff_sec = 10
                 state.running = false;
             }
             Ok(json!({}))
+        }
+
+        async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(format!("setup-tap {bridge} {tap}"));
+            Ok(true)
         }
 
         async fn delete_tap(&self, tap: &str) -> Result<()> {

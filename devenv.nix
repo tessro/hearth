@@ -3,6 +3,7 @@
 {
   # https://devenv.sh/basics/
   env.GREET = "devenv";
+  env.HEARTH_BUSYBOX = "${pkgs.pkgsStatic.busybox}/bin/busybox";
 
   # https://devenv.sh/packages/
   packages = with pkgs; [
@@ -14,7 +15,6 @@
     rustc
     rustfmt
     rust-analyzer
-    pkgsStatic.busybox
   ];
 
   # https://devenv.sh/languages/

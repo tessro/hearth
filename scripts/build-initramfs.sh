@@ -137,23 +137,48 @@ done
 copy_module() {
     rel="$1"
     dest="$2"
-    if [ -f "$MODULES_DIR/$dest" ]; then
-        src="$MODULES_DIR/$dest"
-    elif [ -f "$MODULES_DIR/$rel" ]; then
+    if [ -f "$MODULES_DIR/$rel" ]; then
         src="$MODULES_DIR/$rel"
+    elif [ -f "$MODULES_DIR/$rel.xz" ]; then
+        src="$MODULES_DIR/$rel.xz"
+    elif [ -f "$MODULES_DIR/$rel.zst" ]; then
+        src="$MODULES_DIR/$rel.zst"
+    elif [ -f "$MODULES_DIR/$dest" ]; then
+        src="$MODULES_DIR/$dest"
+    elif [ -f "$MODULES_DIR/$dest.xz" ]; then
+        src="$MODULES_DIR/$dest.xz"
+    elif [ -f "$MODULES_DIR/$dest.zst" ]; then
+        src="$MODULES_DIR/$dest.zst"
     else
-        die "missing module $dest; looked for $MODULES_DIR/$dest and $MODULES_DIR/$rel"
+        die "missing module $dest; looked for $rel, $rel.xz, $rel.zst, $dest, $dest.xz, and $dest.zst under $MODULES_DIR"
     fi
-    cp "$src" "$WORK_DIR/lib/modules/$dest"
+
+    case "$src" in
+        *.xz)
+            command -v xz >/dev/null 2>&1 || die "xz is required to unpack module $src"
+            xz -dc "$src" > "$WORK_DIR/lib/modules/$dest"
+            ;;
+        *.zst)
+            command -v zstd >/dev/null 2>&1 || die "zstd is required to unpack module $src"
+            zstd -dc "$src" > "$WORK_DIR/lib/modules/$dest"
+            ;;
+        *)
+            cp "$src" "$WORK_DIR/lib/modules/$dest"
+            ;;
+    esac
 }
 
-copy_module kernel/drivers/virtio/virtio_ring.ko.xz virtio_ring.ko.xz
-copy_module kernel/drivers/virtio/virtio.ko.xz virtio.ko.xz
-copy_module kernel/drivers/virtio/virtio_pci_modern_dev.ko.xz virtio_pci_modern_dev.ko.xz
-copy_module kernel/drivers/virtio/virtio_pci_legacy_dev.ko.xz virtio_pci_legacy_dev.ko.xz
-copy_module kernel/drivers/virtio/virtio_pci.ko.xz virtio_pci.ko.xz
-copy_module kernel/fs/fuse/fuse.ko.xz fuse.ko.xz
-copy_module kernel/fs/fuse/virtiofs.ko.xz virtiofs.ko.xz
+copy_module kernel/drivers/virtio/virtio_ring.ko virtio_ring.ko
+copy_module kernel/drivers/virtio/virtio.ko virtio.ko
+copy_module kernel/drivers/virtio/virtio_pci_modern_dev.ko virtio_pci_modern_dev.ko
+copy_module kernel/drivers/virtio/virtio_pci_legacy_dev.ko virtio_pci_legacy_dev.ko
+copy_module kernel/drivers/virtio/virtio_pci.ko virtio_pci.ko
+copy_module kernel/fs/fuse/fuse.ko fuse.ko
+copy_module kernel/fs/fuse/virtiofs.ko virtiofs.ko
+copy_module kernel/net/core/failover.ko failover.ko
+copy_module kernel/drivers/net/net_failover.ko net_failover.ko
+copy_module kernel/drivers/net/virtio_net.ko virtio_net.ko
+copy_module kernel/net/packet/af_packet.ko af_packet.ko
 
 cat > "$WORK_DIR/init" <<'EOF'
 #!/bin/sh
@@ -162,13 +187,17 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev || true
 
 echo "hearth initramfs: loading modules"
-insmod /lib/modules/virtio_ring.ko.xz
-insmod /lib/modules/virtio.ko.xz
-insmod /lib/modules/virtio_pci_modern_dev.ko.xz 2>/dev/null || true
-insmod /lib/modules/virtio_pci_legacy_dev.ko.xz 2>/dev/null || true
-insmod /lib/modules/virtio_pci.ko.xz
-insmod /lib/modules/fuse.ko.xz
-insmod /lib/modules/virtiofs.ko.xz
+insmod /lib/modules/virtio_ring.ko
+insmod /lib/modules/virtio.ko
+insmod /lib/modules/virtio_pci_modern_dev.ko 2>/dev/null || true
+insmod /lib/modules/virtio_pci_legacy_dev.ko 2>/dev/null || true
+insmod /lib/modules/virtio_pci.ko
+insmod /lib/modules/fuse.ko
+insmod /lib/modules/virtiofs.ko
+insmod /lib/modules/failover.ko
+insmod /lib/modules/net_failover.ko
+insmod /lib/modules/virtio_net.ko
+insmod /lib/modules/af_packet.ko
 
 echo "hearth initramfs: mounting virtiofs root"
 mount -t virtiofs root /newroot || exec sh

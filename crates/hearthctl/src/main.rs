@@ -89,6 +89,16 @@ enum Command {
         memory: String,
         #[arg(long, default_value_t = 1)]
         cpus: u32,
+        #[arg(long, value_enum, default_value = "none")]
+        network: docker_run::NetworkMode,
+        #[arg(long, default_value = "hearth0")]
+        bridge: String,
+        #[arg(long)]
+        tap: Option<String>,
+        #[arg(long)]
+        mac: Option<String>,
+        #[arg(long)]
+        no_tap_setup: bool,
     },
     Resize {
         name: String,
@@ -139,6 +149,11 @@ async fn main() -> Result<()> {
         name,
         memory,
         cpus,
+        network,
+        bridge,
+        tap,
+        mac,
+        no_tap_setup,
     } = &cli.command
     {
         return docker_run::run(docker_run::RunOptions {
@@ -147,6 +162,12 @@ async fn main() -> Result<()> {
             name: name.clone(),
             memory: memory.clone(),
             cpus: *cpus,
+            network: *network,
+            bridge: bridge.clone(),
+            tap: tap.clone(),
+            mac: mac.clone(),
+            tap_setup: !*no_tap_setup,
+            socket: cli.socket.clone(),
         })
         .await;
     }
@@ -476,12 +497,22 @@ mod tests {
                 name,
                 memory,
                 cpus,
+                network,
+                bridge,
+                tap,
+                mac,
+                no_tap_setup,
             } => {
                 assert_eq!(dockerfile, Utf8PathBuf::from("./Dockerfile"));
                 assert_eq!(context, Utf8PathBuf::from("."));
                 assert_eq!(name, "hearth-test");
                 assert_eq!(memory, "512M");
                 assert_eq!(cpus, 1);
+                assert_eq!(network, docker_run::NetworkMode::None);
+                assert_eq!(bridge, "hearth0");
+                assert_eq!(tap, None);
+                assert_eq!(mac, None);
+                assert!(!no_tap_setup);
             }
             other => panic!("expected run command, got {other:?}"),
         }
