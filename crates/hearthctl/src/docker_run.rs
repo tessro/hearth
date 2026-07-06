@@ -1,25 +1,29 @@
+use crate::{
+    client::hearth_request,
+    oci::{
+        buildah_bud_args, buildah_push_args, command, data_dir, parent, read_oci_process,
+        remove_dir_if_exists, run_status, umoci_unpack_args, validate_oci_process,
+    },
+};
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::ValueEnum;
-use hearth_proto::{Request, Response, Verb};
-use serde::{Deserialize, Serialize};
+use hearth_proto::{OciProcess, Verb};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::{
     env, fs, io,
     os::unix::fs::FileTypeExt,
-    path::PathBuf,
     process::Stdio,
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
     process::Command,
     time::sleep,
 };
-use ulid::Ulid;
 
-const DEFAULT_DATA_DIR: &str = ".local/share/hearth";
 const INITRAMFS_NAME: &str = "initramfs.cpio.gz";
 const KERNEL_PATH: &str = "/run/booted-system/kernel";
 
@@ -53,20 +57,6 @@ struct RunPaths {
     runtime_dir: Utf8PathBuf,
     virtiofs_socket: Utf8PathBuf,
     chv_api_socket: Utf8PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciConfig {
-    process: OciProcess,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciProcess {
-    args: Vec<String>,
-    #[serde(default)]
-    env: Vec<String>,
-    #[serde(default = "default_cwd")]
-    cwd: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,16 +203,6 @@ impl RunPaths {
     }
 }
 
-fn data_dir() -> Result<Utf8PathBuf> {
-    if let Some(value) = env::var_os("HEARTH_DATA_DIR") {
-        return Utf8PathBuf::from_path_buf(PathBuf::from(value))
-            .map_err(|path| anyhow!("HEARTH_DATA_DIR is not valid UTF-8: {}", path.display()));
-    }
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Utf8PathBuf::from_path_buf(PathBuf::from(home).join(DEFAULT_DATA_DIR))
-        .map_err(|path| anyhow!("HOME is not valid UTF-8: {}", path.display()))
-}
-
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name == "." || name == ".." {
         bail!("--name must not be empty, '.', or '..'");
@@ -332,35 +312,6 @@ fn fnv1a32(bytes: &[u8]) -> u32 {
     hash
 }
 
-fn buildah_bud_args(name: &str, dockerfile: &Utf8Path, context: &Utf8Path) -> Vec<String> {
-    vec![
-        "bud".to_string(),
-        "-t".to_string(),
-        name.to_string(),
-        "-f".to_string(),
-        dockerfile.to_string(),
-        context.to_string(),
-    ]
-}
-
-fn buildah_push_args(name: &str, image_layout: &Utf8Path) -> Vec<String> {
-    vec![
-        "push".to_string(),
-        name.to_string(),
-        format!("oci:{image_layout}:latest"),
-    ]
-}
-
-fn umoci_unpack_args(image_layout: &Utf8Path, bundle: &Utf8Path) -> Vec<String> {
-    vec![
-        "unpack".to_string(),
-        "--rootless".to_string(),
-        "--image".to_string(),
-        format!("{image_layout}:latest"),
-        bundle.to_string(),
-    ]
-}
-
 fn cloud_hypervisor_args(
     opts: &RunOptions,
     paths: &RunPaths,
@@ -401,10 +352,6 @@ fn virtiofsd_args(paths: &RunPaths) -> Vec<String> {
     ]
 }
 
-fn default_cwd() -> String {
-    "/".to_string()
-}
-
 fn prepare_oci_runtime(paths: &RunPaths) -> Result<()> {
     let process = read_oci_process(&paths.bundle)?;
     let meta_dir = paths.rootfs.join(".hearth");
@@ -426,37 +373,6 @@ fn prepare_oci_runtime(paths: &RunPaths) -> Result<()> {
     Ok(())
 }
 
-fn read_oci_process(bundle: &Utf8Path) -> Result<OciProcess> {
-    let config_path = bundle.join("config.json");
-    let text = fs::read_to_string(&config_path).with_context(|| format!("read {config_path}"))?;
-    let config: OciConfig =
-        serde_json::from_str(&text).with_context(|| format!("parse {config_path}"))?;
-    validate_oci_process(config.process)
-}
-
-fn validate_oci_process(mut process: OciProcess) -> Result<OciProcess> {
-    if process.args.is_empty() || process.args[0].is_empty() {
-        bail!("OCI config process.args must contain an executable");
-    }
-    if process.cwd.is_empty() {
-        process.cwd = default_cwd();
-    }
-    if !process.cwd.starts_with('/') {
-        bail!("OCI config process.cwd must be absolute: {}", process.cwd);
-    }
-    for env in &process.env {
-        if env.as_bytes().contains(&0) {
-            bail!("OCI config process.env contains a NUL byte");
-        }
-    }
-    for arg in &process.args {
-        if arg.as_bytes().contains(&0) {
-            bail!("OCI config process.args contains a NUL byte");
-        }
-    }
-    Ok(process)
-}
-
 fn read_guest_exit_status(rootfs: &Utf8Path) -> Result<Option<i32>> {
     let path = rootfs.join(".hearth").join("exit-status");
     let text = match fs::read_to_string(&path) {
@@ -469,28 +385,6 @@ fn read_guest_exit_status(rootfs: &Utf8Path) -> Result<Option<i32>> {
         .parse::<i32>()
         .with_context(|| format!("parse {path}"))?;
     Ok(Some(status))
-}
-
-fn command(program: &str, args: Vec<String>) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    cmd
-}
-
-async fn run_status(mut cmd: Command, label: &str) -> Result<()> {
-    eprintln!("hearthctl: {label}");
-    let status = cmd
-        .status()
-        .await
-        .with_context(|| format!("spawn {label}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("{label} exited with {status}"))
-    }
 }
 
 async fn spawn_virtiofsd(paths: &RunPaths) -> Result<tokio::process::Child> {
@@ -588,34 +482,6 @@ async fn run_cloud_hypervisor(
         Ok(())
     } else {
         Err(anyhow!("cloud-hypervisor exited with {status}"))
-    }
-}
-
-async fn hearth_request(socket: &Utf8Path, verb: Verb, args: Map<String, Value>) -> Result<Value> {
-    let req = Request::new(Ulid::new().to_string(), verb, args);
-    let stream = UnixStream::connect(socket.as_str())
-        .await
-        .with_context(|| format!("connect hearthd socket {socket}"))?;
-    let (read, mut write) = stream.into_split();
-    write
-        .write_all(serde_json::to_string(&req)?.as_bytes())
-        .await?;
-    write.write_all(b"\n").await?;
-    write.shutdown().await?;
-    let mut lines = BufReader::new(read).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow!("hearthd closed connection without a response"))?;
-    let response: Response = serde_json::from_str(&line)?;
-    if response.ok {
-        Ok(response.result.unwrap_or_else(|| json!({})))
-    } else {
-        let message = response
-            .error
-            .map(|err| format!("{}: {}", err.code, err.message))
-            .unwrap_or_else(|| "unknown hearthd error".to_string());
-        Err(anyhow!(message))
     }
 }
 
@@ -761,19 +627,6 @@ fn resolve_kernel() -> Result<Utf8PathBuf> {
     let path = fs::canonicalize(KERNEL_PATH).with_context(|| format!("resolve {KERNEL_PATH}"))?;
     Utf8PathBuf::from_path_buf(path)
         .map_err(|path| anyhow!("kernel path is not valid UTF-8: {}", path.display()))
-}
-
-fn parent(path: &Utf8Path) -> Result<&Utf8Path> {
-    path.parent()
-        .ok_or_else(|| anyhow!("path has no parent: {path}"))
-}
-
-fn remove_dir_if_exists(path: &Utf8Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[cfg(test)]

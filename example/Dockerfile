@@ -6,4 +6,4 @@ RUN printf '%s\n' '#!/bin/sh' \
     'echo hello from OCI rootfs' \
     'uname -a' \
     'exec /bin/sh' > /init && chmod +x /init
-CMD ["/bin/sh"]
+CMD ["/init"]

@@ -16,6 +16,28 @@ cargo test
 cargo build
 ```
 
+Dockerfile VM images:
+
+```sh
+hearthctl image build --name exeuntu --dockerfile ./Dockerfile --context . --disk 40
+hearthctl create dev --from exeuntu --disk 80 --mem 4096 --cpu 4
+hearthctl start dev
+```
+
+Dockerfile images are VM root filesystem recipes: the resolved OCI
+`ENTRYPOINT + CMD` must be an init-like absolute path and becomes guest PID 1.
+See `docs/dockerfile-images.md`.
+
+Agent VM acceptance test:
+
+```sh
+devenv shell cargo build
+sudo -E scripts/test-agent-vm.sh
+```
+
+This builds `example/agent-vm`, boots it through Hearth, waits for the guest
+probe on the serial log, then stop/starts it to verify root-disk persistence.
+
 Local smoke test without touching `/etc` or `/var`:
 
 ```sh

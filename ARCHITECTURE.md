@@ -20,7 +20,9 @@ The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only inte
 - Libvirt-equivalent abstractions: virtual networks with NAT/DHCP, storage pools, MAC-address management.
 - A web UI, REST API, or anything beyond the unix-socket JSON protocol.
 - Per-caller capability models. Day 1 is "the privileged channel can do everything; nobody else has the channel."
-- Image-building pipelines. Hearth consumes cloud images; it doesn't produce them.
+- General image-building pipelines. Hearth can build a narrow Dockerfile VM
+  rootfs format, but arbitrary application Dockerfiles remain a container runtime
+  concern.
 
 ## Topology
 
@@ -88,6 +90,7 @@ hearthctl restore <name> [--tag t]        # restore from snapshot
 hearthctl resize <name> [--cpu N] [--mem M]  # live resize via CHV API
 hearthctl logs <name> [--follow]          # serial-console output
 hearthctl image ls                        # list base images
+hearthctl image build --name n --dockerfile ./Dockerfile --context . --disk 40
 hearthctl image pull <url>                # download base image
 hearthctl image rm <name>                 # remove base image
 ```
@@ -99,9 +102,11 @@ One `cloud-hypervisor` process per VM, supervised by systemd as a transient unit
 - An API socket at `/run/hearth/vms/<name>.sock`.
 - A vsock CID assigned by hearth.
 - A disk (qcow2 with a base-image backing file, by default).
-- A cloud-init seed ISO at `/var/lib/hearth/seeds/<name>.iso`.
+- For cloud images, a cloud-init seed ISO at `/var/lib/hearth/seeds/<name>.iso`.
 - Serial console redirected to a file at `/var/log/hearth/<name>.console` (this is what `hearthctl logs` tails).
-- Boot mode: `rust-hypervisor-firmware`, which loads stock Debian Cloud images directly without kernel extraction.
+- Boot mode depends on image kind:
+  - Cloud qcow2 images use `rust-hypervisor-firmware`, which loads stock Debian Cloud images directly without kernel extraction.
+  - Dockerfile rootfs images use direct-kernel boot with `root=/dev/vda` and `init=<resolved OCI command>`.
 
 ### Agent-in-charge vsock proxy
 
@@ -173,8 +178,8 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 
 1. Validate name (kebab-case, not already in registry).
 2. Allocate vsock CID (next free integer ≥ 100) and MAC (locally administered range).
-3. Allocate disk: `qemu-img create -f qcow2 -F qcow2 -b /var/lib/hearth/images/<image>.qcow2 /var/lib/hearth/disks/<name>.qcow2 <disk_gib>G`.
-4. Generate cloud-init seed: `cloud-localds /var/lib/hearth/seeds/<name>.iso user-data meta-data`.
+3. Allocate disk by copying `/var/lib/hearth/images/<image>.qcow2` into `/var/lib/hearth/disks/<name>.qcow2` and resizing it to `<disk_gib>G`.
+4. For cloud images, generate cloud-init seed: `cloud-localds /var/lib/hearth/seeds/<name>.iso user-data meta-data`. Dockerfile rootfs images boot exactly as built and skip this step.
 5. Write `/etc/hearth/services/<name>.toml` with `enabled = false`.
 6. Return; do not boot. `hearthctl start <name>` is a separate step.
 

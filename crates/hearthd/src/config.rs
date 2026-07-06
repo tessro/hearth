@@ -51,6 +51,14 @@ pub struct Config {
         default_value = "/usr/share/hypervisor-fw/CLOUDHV.fd"
     )]
     pub firmware: Utf8PathBuf,
+    #[arg(
+        long,
+        env = "HEARTH_GUEST_KERNEL",
+        default_value = "/run/booted-system/kernel"
+    )]
+    pub guest_kernel: Utf8PathBuf,
+    #[arg(long, env = "HEARTH_GUEST_INITRAMFS")]
+    pub guest_initramfs: Option<Utf8PathBuf>,
     #[arg(long, env = "HEARTH_BRIDGE", default_value = "hearth0")]
     pub bridge: String,
     #[arg(long, env = "HEARTH_VSOCK_PORT", default_value_t = 1024)]
@@ -91,5 +99,10 @@ impl Config {
             format!("{image}.qcow2")
         };
         self.images_dir.join(filename)
+    }
+
+    pub fn image_manifest_path(&self, image: &str) -> Utf8PathBuf {
+        let base = image.strip_suffix(".qcow2").unwrap_or(image);
+        self.images_dir.join(format!("{base}.hearth.toml"))
     }
 }

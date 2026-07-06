@@ -1,0 +1,12 @@
+[Unit]
+Description=Hearth agent VM acceptance probe
+After=multi-user.target systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hearth-agent-probe
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

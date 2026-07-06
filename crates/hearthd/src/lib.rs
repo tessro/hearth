@@ -2,6 +2,7 @@ pub mod cloud_init;
 pub mod config;
 pub mod error;
 pub mod host;
+pub mod image;
 pub mod notify;
 pub mod registry;
 pub mod vsock;
@@ -10,6 +11,7 @@ use crate::{
     config::Config,
     error::{code_of, coded},
     host::{sanitize_image_name, unit_name, wait_for_inactive, Host},
+    image::ImageMetadata,
     registry::{validate_name, Allocations, CloudInit, Registry, RestartPolicy, Service},
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -225,6 +227,7 @@ impl<H: Host + 'static> Daemon<H> {
             Verb::Logs => self.logs(req.args).await,
             Verb::ImageLs => self.image_ls().await.map(Dispatch::One),
             Verb::ImagePull => self.image_pull(req.args).await.map(Dispatch::One),
+            Verb::ImageImport => self.image_import(req.args).await.map(Dispatch::One),
             Verb::ImageRm => self
                 .image_rm(required_str(&req.args, "name")?)
                 .await
@@ -308,6 +311,7 @@ impl<H: Host + 'static> Daemon<H> {
                 format!("base image not found: {image_path}"),
             ));
         }
+        let image_metadata = image::load(&self.cfg, &image).await?;
         let is_agent_in_charge = optional_bool(&args, "is_agent_in_charge").unwrap_or(false);
         if is_agent_in_charge && reg.services.values().any(|svc| svc.is_agent_in_charge) {
             return Err(coded(
@@ -343,21 +347,23 @@ impl<H: Host + 'static> Daemon<H> {
             reg.free(name);
             return Err(err);
         }
-        let tmp = tempfile::tempdir()?;
-        let user_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("user-data"))
-            .map_err(|_| anyhow!("non-utf8 temp path"))?;
-        let meta_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("meta-data"))
-            .map_err(|_| anyhow!("non-utf8 temp path"))?;
-        fs::write(&user_data_path, cloud_init::user_data(&svc)).await?;
-        fs::write(&meta_data_path, cloud_init::meta_data(&svc)).await?;
-        if let Err(err) = self
-            .host
-            .cloud_localds(&seed_path, &user_data_path, &meta_data_path)
-            .await
-        {
-            let _ = remove_path_file(disk_path).await;
-            reg.free(name);
-            return Err(err);
+        if matches!(image_metadata, ImageMetadata::CloudImage) {
+            let tmp = tempfile::tempdir()?;
+            let user_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("user-data"))
+                .map_err(|_| anyhow!("non-utf8 temp path"))?;
+            let meta_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("meta-data"))
+                .map_err(|_| anyhow!("non-utf8 temp path"))?;
+            fs::write(&user_data_path, cloud_init::user_data(&svc)).await?;
+            fs::write(&meta_data_path, cloud_init::meta_data(&svc)).await?;
+            if let Err(err) = self
+                .host
+                .cloud_localds(&seed_path, &user_data_path, &meta_data_path)
+                .await
+            {
+                let _ = remove_path_file(disk_path).await;
+                reg.free(name);
+                return Err(err);
+            }
         }
         if let Err(err) = Registry::write_allocations(&self.cfg, &reg.allocations).await {
             let _ = remove_path_file(disk_path).await;
@@ -383,7 +389,10 @@ impl<H: Host + 'static> Daemon<H> {
         let mut reg = self.registry().await?;
         let mut svc = reg.get(name)?.clone();
         if !self.is_running(name).await {
-            self.host.systemd_run_vm(&self.cfg, &svc).await?;
+            let image_metadata = image::load(&self.cfg, &svc.image).await?;
+            self.host
+                .systemd_run_vm(&self.cfg, &svc, &image_metadata)
+                .await?;
             self.host
                 .wait_for_vm_socket(&self.cfg.vm_socket(name), Duration::from_secs(20))
                 .await?;
@@ -571,14 +580,8 @@ impl<H: Host + 'static> Daemon<H> {
             if path.extension() != Some("qcow2") {
                 continue;
             }
-            let metadata = fs::metadata(&path).await?;
-            let sha256 = sha256_file(&path).await?;
-            images.push(json!({
-                "name": path.file_stem().unwrap_or_default(),
-                "path": path,
-                "bytes": metadata.len(),
-                "sha256": sha256,
-            }));
+            let name = path.file_stem().unwrap_or_default();
+            images.push(self.image_info(name).await?);
         }
         images.sort_by(|left, right| {
             left.get("name")
@@ -596,7 +599,7 @@ impl<H: Host + 'static> Daemon<H> {
         validate_name(&name)?;
         fs::create_dir_all(&self.cfg.images_dir).await?;
         let dest = self.cfg.image_path(&name);
-        if dest.exists() {
+        if dest.exists() || self.cfg.image_manifest_path(&name).exists() {
             return Err(coded(
                 "image.exists",
                 format!("image {name} already exists"),
@@ -622,7 +625,69 @@ impl<H: Host + 'static> Daemon<H> {
             return Err(err.into());
         }
         let sha256 = hex::encode(hasher.finalize());
-        Ok(json!({ "name": name, "path": dest, "bytes": total, "sha256": sha256 }))
+        Ok(json!({
+            "name": name,
+            "kind": image::CLOUD_IMAGE_KIND,
+            "path": dest,
+            "bytes": total,
+            "sha256": sha256
+        }))
+    }
+
+    async fn image_import(&self, args: Map<String, Value>) -> Result<Value> {
+        let name = required_str(&args, "name")?;
+        validate_name(name)?;
+        let qcow2_path = Utf8PathBuf::from(required_str(&args, "qcow2_path")?);
+        let manifest_path = Utf8PathBuf::from(required_str(&args, "manifest_path")?);
+        if !qcow2_path.is_file() {
+            return Err(coded(
+                "image.import_not_found",
+                format!("qcow2 import source not found: {qcow2_path}"),
+            ));
+        }
+        if !manifest_path.is_file() {
+            return Err(coded(
+                "image.import_not_found",
+                format!("manifest import source not found: {manifest_path}"),
+            ));
+        }
+        let _manifest = image::read_manifest(&manifest_path).await?;
+        fs::create_dir_all(&self.cfg.images_dir).await?;
+        let dest = self.cfg.image_path(name);
+        let manifest_dest = self.cfg.image_manifest_path(name);
+        if dest.exists() || manifest_dest.exists() {
+            return Err(coded(
+                "image.exists",
+                format!("image {name} already exists"),
+            ));
+        }
+        let qcow2_tmp = self.import_tmp_path(name, "qcow2");
+        let manifest_tmp = self.import_tmp_path(name, "manifest");
+        let _ = remove_path_file(qcow2_tmp.clone()).await;
+        let _ = remove_path_file(manifest_tmp.clone()).await;
+        if let Err(err) = fs::copy(&qcow2_path, &qcow2_tmp).await {
+            let _ = remove_path_file(qcow2_tmp).await;
+            return Err(err)
+                .with_context(|| format!("copy imported qcow2 {qcow2_path} into image store"));
+        }
+        if let Err(err) = fs::copy(&manifest_path, &manifest_tmp).await {
+            let _ = remove_path_file(qcow2_tmp).await;
+            let _ = remove_path_file(manifest_tmp).await;
+            return Err(err).with_context(|| {
+                format!("copy imported manifest {manifest_path} into image store")
+            });
+        }
+        if let Err(err) = fs::rename(&qcow2_tmp, &dest).await {
+            let _ = remove_path_file(qcow2_tmp).await;
+            let _ = remove_path_file(manifest_tmp).await;
+            return Err(err).with_context(|| format!("install imported qcow2 {dest}"));
+        }
+        if let Err(err) = fs::rename(&manifest_tmp, &manifest_dest).await {
+            let _ = remove_path_file(dest).await;
+            let _ = remove_path_file(manifest_tmp).await;
+            return Err(err).with_context(|| format!("install image manifest {manifest_dest}"));
+        }
+        self.image_info(name).await
     }
 
     async fn image_rm(&self, name: &str) -> Result<Value> {
@@ -643,7 +708,28 @@ impl<H: Host + 'static> Daemon<H> {
             return Err(coded("image.not_found", format!("image not found: {path}")));
         }
         fs::remove_file(path).await?;
+        remove_path_file(self.cfg.image_manifest_path(name)).await?;
         Ok(json!({ "removed": name }))
+    }
+
+    async fn image_info(&self, name: &str) -> Result<Value> {
+        let path = self.cfg.image_path(name);
+        let metadata = fs::metadata(&path).await?;
+        let sha256 = sha256_file(&path).await?;
+        let image_metadata = image::load(&self.cfg, name).await?;
+        Ok(json!({
+            "name": name,
+            "kind": image_metadata.kind(),
+            "path": path,
+            "bytes": metadata.len(),
+            "sha256": sha256,
+        }))
+    }
+
+    fn import_tmp_path(&self, name: &str, label: &str) -> Utf8PathBuf {
+        self.cfg
+            .images_dir
+            .join(format!(".{name}.{label}.tmp-{}", std::process::id()))
     }
 
     async fn net_setup(&self, args: Map<String, Value>) -> Result<Value> {
@@ -971,7 +1057,8 @@ pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
             .unwrap_or(false);
         if !running {
             warn!(service = %svc.name, "enabled service is not active; starting");
-            host.systemd_run_vm(cfg, svc).await?;
+            let image_metadata = image::load(cfg, &svc.image).await?;
+            host.systemd_run_vm(cfg, svc, &image_metadata).await?;
         }
     }
     for entry in WalkDir::new(cfg.run_dir.join("vms"))
@@ -1020,6 +1107,7 @@ mod tests {
     use super::*;
     use crate::host::Host;
     use crate::host::{cloud_hypervisor_argv, cloud_hypervisor_restore_argv};
+    use crate::image::ImageMetadata;
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8Path;
@@ -1042,7 +1130,7 @@ mod tests {
             cloud_init: CloudInit::default(),
             restart: RestartPolicy::default(),
         };
-        let argv = cloud_hypervisor_argv(&cfg, &svc).join(" ");
+        let argv = cloud_hypervisor_argv(&cfg, &svc, &ImageMetadata::CloudImage).join(" ");
         assert!(argv.contains("--api-socket /run/hearth/vms/mail.sock"));
         assert!(argv.contains("--vsock cid=100,socket=/run/hearth/vsock/mail.sock"));
         assert!(argv.contains("--cpus boot=2"));
@@ -1050,6 +1138,46 @@ mod tests {
         // CHV does not accept `bridge=...`; we pre-create the tap and pass it by name.
         assert!(argv.contains("--net tap=hrt-mail,mac=52:54:00:12:34:56"));
         assert!(!argv.contains("bridge="));
+    }
+
+    #[test]
+    fn docker_rootfs_argv_uses_direct_kernel_boot() {
+        let cfg = Config::parse_from([
+            "hearthd",
+            "--guest-kernel",
+            "/run/booted-system/kernel",
+            "--guest-initramfs",
+            "/var/lib/hearth/initramfs.cpio.gz",
+        ]);
+        let svc = Service {
+            name: "dev".into(),
+            enabled: false,
+            image: "exeuntu".into(),
+            cpu: 4,
+            memory_mib: 4096,
+            disk_gib: 40,
+            vsock_cid: 100,
+            mac: "52:54:00:12:34:56".into(),
+            is_agent_in_charge: false,
+            cloud_init: CloudInit::default(),
+            restart: RestartPolicy::default(),
+        };
+        let manifest = hearth_proto::ImageManifest::docker_rootfs(hearth_proto::OciProcess {
+            args: vec!["/usr/local/bin/init".to_string()],
+            env: vec!["EXEUNTU=1".to_string()],
+            cwd: "/home/exedev".to_string(),
+        })
+        .unwrap();
+        let argv =
+            cloud_hypervisor_argv(&cfg, &svc, &ImageMetadata::DockerRootfs(manifest)).join(" ");
+
+        assert!(argv.contains("--kernel /run/booted-system/kernel"));
+        assert!(argv.contains("--initramfs /var/lib/hearth/initramfs.cpio.gz"));
+        assert!(argv.contains("--disk path=/var/lib/hearth/disks/dev.qcow2"));
+        assert!(argv.contains(
+            "--cmdline console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init"
+        ));
+        assert!(!argv.contains("/var/lib/hearth/seeds/dev.iso"));
     }
 
     #[test]
@@ -1308,6 +1436,45 @@ backoff_sec = 10
     }
 
     #[tokio::test]
+    async fn create_from_docker_rootfs_image_skips_cloud_init_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("exeuntu"), b"base")
+            .await
+            .unwrap();
+        tokio::fs::write(cfg.image_manifest_path("exeuntu"), docker_manifest_toml())
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+        let req = Request::new(
+            "1",
+            Verb::Create,
+            Map::from_iter([
+                ("name".into(), json!("dev")),
+                ("image".into(), json!("exeuntu")),
+                ("disk_gib".into(), json!(40)),
+            ]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(responses[0].ok);
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls
+            .iter()
+            .any(|call| call.starts_with("qemu-img create ")));
+        assert!(!calls.iter().any(|call| call.starts_with("cloud-localds ")));
+        let registry = Registry::load(&cfg).await.unwrap();
+        let dev = registry.get("dev").unwrap();
+        assert_eq!(dev.image, "exeuntu");
+        assert_eq!(dev.disk_gib, 40);
+    }
+
+    #[tokio::test]
     async fn destroy_stops_and_removes_service_artifacts_and_allocations() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
@@ -1536,11 +1703,66 @@ backoff_sec = 10
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].get("name"), Some(&json!("alpha")));
         assert_eq!(images[1].get("name"), Some(&json!("zeta")));
+        assert_eq!(images[0].get("kind"), Some(&json!("cloud-image")));
         assert_eq!(images[0].get("bytes"), Some(&json!(1)));
         assert!(images[0]
             .get("sha256")
             .and_then(Value::as_str)
             .is_some_and(|hash| hash.len() == 64));
+    }
+
+    #[tokio::test]
+    async fn image_import_copies_qcow2_and_manifest_without_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        let source_dir = root.join("source");
+        tokio::fs::create_dir_all(&source_dir).await.unwrap();
+        let source_qcow2 = source_dir.join("exeuntu.qcow2");
+        let source_manifest = source_dir.join("exeuntu.hearth.toml");
+        tokio::fs::write(&source_qcow2, b"disk").await.unwrap();
+        tokio::fs::write(&source_manifest, docker_manifest_toml())
+            .await
+            .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let imported = daemon
+            .handle(Request::new(
+                "1",
+                Verb::ImageImport,
+                Map::from_iter([
+                    ("name".into(), json!("exeuntu")),
+                    ("qcow2_path".into(), json!(source_qcow2)),
+                    ("manifest_path".into(), json!(source_manifest)),
+                ]),
+            ))
+            .await;
+
+        assert!(imported[0].ok);
+        let result = imported[0].result.as_ref().unwrap();
+        assert_eq!(result.get("kind"), Some(&json!("docker-rootfs")));
+        assert!(cfg.image_path("exeuntu").exists());
+        assert!(cfg.image_manifest_path("exeuntu").exists());
+
+        let duplicate = daemon
+            .handle(Request::new(
+                "2",
+                Verb::ImageImport,
+                Map::from_iter([
+                    ("name".into(), json!("exeuntu")),
+                    ("qcow2_path".into(), json!(cfg.image_path("exeuntu"))),
+                    (
+                        "manifest_path".into(),
+                        json!(cfg.image_manifest_path("exeuntu")),
+                    ),
+                ]),
+            ))
+            .await;
+        assert!(!duplicate[0].ok);
+        assert_eq!(
+            duplicate[0].error.as_ref().map(|err| err.code.as_str()),
+            Some("image.exists")
+        );
     }
 
     #[tokio::test]
@@ -1554,6 +1776,9 @@ backoff_sec = 10
             .await
             .unwrap();
         tokio::fs::write(cfg.image_path("unused"), b"unused")
+            .await
+            .unwrap();
+        tokio::fs::write(cfg.image_manifest_path("unused"), docker_manifest_toml())
             .await
             .unwrap();
         let daemon = Daemon::new(cfg.clone(), FakeHost::default());
@@ -1577,6 +1802,7 @@ backoff_sec = 10
             .await;
         assert!(removed[0].ok);
         assert!(!cfg.image_path("unused").exists());
+        assert!(!cfg.image_manifest_path("unused").exists());
 
         let missing = daemon
             .handle(Request::new(
@@ -1586,6 +1812,21 @@ backoff_sec = 10
             ))
             .await;
         assert!(!missing[0].ok);
+    }
+
+    fn docker_manifest_toml() -> &'static str {
+        r#"
+version = 1
+kind = "docker-rootfs"
+root_device = "/dev/vda"
+root_fstype = "ext4"
+init = "/usr/local/bin/init"
+
+[oci]
+args = ["/usr/local/bin/init"]
+env = ["EXEUNTU=1"]
+cwd = "/home/exedev"
+"#
     }
 
     fn service_toml(name: &str, enabled: bool, cid: u32, mac: &str) -> String {
@@ -1679,7 +1920,12 @@ backoff_sec = 10
 
     #[async_trait]
     impl Host for FakeHost {
-        async fn systemd_run_vm(&self, _cfg: &Config, service: &Service) -> Result<()> {
+        async fn systemd_run_vm(
+            &self,
+            _cfg: &Config,
+            service: &Service,
+            _image: &ImageMetadata,
+        ) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(format!("systemd-run {}", service.name));
             state.running = true;

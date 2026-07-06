@@ -1,4 +1,4 @@
-use crate::{config::Config, error::coded, registry::Service};
+use crate::{config::Config, error::coded, image::ImageMetadata, registry::Service};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use camino::Utf8Path;
@@ -14,7 +14,12 @@ use tokio::{
 
 #[async_trait]
 pub trait Host: Send + Sync {
-    async fn systemd_run_vm(&self, cfg: &Config, service: &Service) -> Result<()>;
+    async fn systemd_run_vm(
+        &self,
+        cfg: &Config,
+        service: &Service,
+        image: &ImageMetadata,
+    ) -> Result<()>;
     async fn systemd_restore_vm(
         &self,
         cfg: &Config,
@@ -46,14 +51,19 @@ pub struct RealHost;
 
 #[async_trait]
 impl Host for RealHost {
-    async fn systemd_run_vm(&self, cfg: &Config, service: &Service) -> Result<()> {
+    async fn systemd_run_vm(
+        &self,
+        cfg: &Config,
+        service: &Service,
+        image: &ImageMetadata,
+    ) -> Result<()> {
         fs::create_dir_all(cfg.run_dir.join("vms")).await?;
         fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
         fs::create_dir_all(&cfg.log_dir).await?;
         unlink_stale(&cfg.vm_socket(&service.name)).await?;
         unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
         let _ = ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
-        systemd_run_chv(service, cloud_hypervisor_argv(cfg, service)).await
+        systemd_run_chv(service, cloud_hypervisor_argv(cfg, service, image)).await
     }
 
     async fn systemd_restore_vm(
@@ -168,8 +178,19 @@ async fn systemd_run_chv(service: &Service, argv: Vec<String>) -> Result<()> {
     run_status(cmd, "systemd-run").await
 }
 
-pub fn cloud_hypervisor_argv(cfg: &Config, service: &Service) -> Vec<String> {
-    vec![
+pub fn cloud_hypervisor_argv(
+    cfg: &Config,
+    service: &Service,
+    image: &ImageMetadata,
+) -> Vec<String> {
+    match image {
+        ImageMetadata::CloudImage => cloud_image_argv(cfg, service),
+        ImageMetadata::DockerRootfs(manifest) => docker_rootfs_argv(cfg, service, manifest),
+    }
+}
+
+fn cloud_image_argv(cfg: &Config, service: &Service) -> Vec<String> {
+    let mut args = vec![
         "cloud-hypervisor".to_string(),
         "--api-socket".to_string(),
         cfg.vm_socket(&service.name).to_string(),
@@ -181,12 +202,6 @@ pub fn cloud_hypervisor_argv(cfg: &Config, service: &Service) -> Vec<String> {
         format!("path={},readonly=on", cfg.seed_path(&service.name)),
         "--net".to_string(),
         format!("tap={},mac={}", tap_name(&service.name), service.mac),
-        "--vsock".to_string(),
-        format!(
-            "cid={},socket={}",
-            service.vsock_cid,
-            cfg.vm_vsock_socket(&service.name)
-        ),
         "--serial".to_string(),
         format!("file={}", cfg.console_path(&service.name)),
         "--console".to_string(),
@@ -195,7 +210,65 @@ pub fn cloud_hypervisor_argv(cfg: &Config, service: &Service) -> Vec<String> {
         format!("boot={}", service.cpu),
         "--memory".to_string(),
         format!("size={}M", service.memory_mib),
-    ]
+    ];
+    append_vsock(&mut args, cfg, service);
+    args
+}
+
+fn docker_rootfs_argv(
+    cfg: &Config,
+    service: &Service,
+    manifest: &hearth_proto::ImageManifest,
+) -> Vec<String> {
+    let mut args = vec![
+        "cloud-hypervisor".to_string(),
+        "--api-socket".to_string(),
+        cfg.vm_socket(&service.name).to_string(),
+        "--kernel".to_string(),
+        cfg.guest_kernel.to_string(),
+    ];
+    if let Some(initramfs) = &cfg.guest_initramfs {
+        args.push("--initramfs".to_string());
+        args.push(initramfs.to_string());
+    }
+    args.extend([
+        "--disk".to_string(),
+        format!("path={}", cfg.disk_path(&service.name)),
+        "--cmdline".to_string(),
+        docker_rootfs_cmdline(manifest),
+        "--net".to_string(),
+        format!("tap={},mac={}", tap_name(&service.name), service.mac),
+    ]);
+    append_vsock(&mut args, cfg, service);
+    args.extend([
+        "--serial".to_string(),
+        format!("file={}", cfg.console_path(&service.name)),
+        "--console".to_string(),
+        "off".to_string(),
+        "--cpus".to_string(),
+        format!("boot={}", service.cpu),
+        "--memory".to_string(),
+        format!("size={}M", service.memory_mib),
+    ]);
+    args
+}
+
+fn append_vsock(args: &mut Vec<String>, cfg: &Config, service: &Service) {
+    args.extend([
+        "--vsock".to_string(),
+        format!(
+            "cid={},socket={}",
+            service.vsock_cid,
+            cfg.vm_vsock_socket(&service.name)
+        ),
+    ]);
+}
+
+fn docker_rootfs_cmdline(manifest: &hearth_proto::ImageManifest) -> String {
+    format!(
+        "console=ttyS0 root={} rootfstype={} rw init={}",
+        manifest.root_device, manifest.root_fstype, manifest.init
+    )
 }
 
 pub fn cloud_hypervisor_restore_argv(

@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > >(tee -a /dev/ttyS0) 2>&1
+
+state_dir=/var/lib/hearth-agent-probe
+boot_count_path="${state_dir}/boot-count"
+mkdir -p "${state_dir}"
+
+boot_count=0
+if [ -f "${boot_count_path}" ]; then
+  boot_count=$(cat "${boot_count_path}")
+fi
+boot_count=$((boot_count + 1))
+printf '%s\n' "${boot_count}" > "${boot_count_path}"
+
+echo "HEARTH_AGENT_PROBE start boot_count=${boot_count}"
+
+test "$(cat /proc/1/comm)" = "systemd"
+test "$(findmnt -no FSTYPE /)" = "ext4"
+getent passwd agent >/dev/null
+su - agent -c 'test -w "$HOME"'
+su - agent -c 'sudo -n true'
+command -v git >/dev/null
+command -v curl >/dev/null
+command -v jq >/dev/null
+command -v python3 >/dev/null
+ip route show default | grep -q .
+
+echo "HEARTH_AGENT_PROBE ok boot_count=${boot_count}"

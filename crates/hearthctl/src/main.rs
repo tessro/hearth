@@ -10,7 +10,10 @@ use tokio::{
 };
 use ulid::Ulid;
 
+mod client;
 mod docker_run;
+mod image_build;
+mod oci;
 
 #[derive(Debug, Parser)]
 #[command(name = "hearthctl", version, about = "Operate hearthd")]
@@ -125,6 +128,18 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum ImageCommand {
     Ls,
+    Build {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        dockerfile: Utf8PathBuf,
+        #[arg(long, default_value = ".")]
+        context: Utf8PathBuf,
+        #[arg(long = "disk", default_value_t = 20)]
+        disk_gib: u64,
+        #[arg(long)]
+        rootless: bool,
+    },
     Pull {
         url: String,
         #[arg(long)]
@@ -167,6 +182,27 @@ async fn main() -> Result<()> {
             tap: tap.clone(),
             mac: mac.clone(),
             tap_setup: !*no_tap_setup,
+            socket: cli.socket.clone(),
+        })
+        .await;
+    }
+    if let Command::Image {
+        command:
+            ImageCommand::Build {
+                name,
+                dockerfile,
+                context,
+                disk_gib,
+                rootless,
+            },
+    } = &cli.command
+    {
+        return image_build::build(image_build::BuildOptions {
+            name: name.clone(),
+            dockerfile: dockerfile.clone(),
+            context: context.clone(),
+            disk_gib: *disk_gib,
+            rootless: *rootless,
             socket: cli.socket.clone(),
         })
         .await;
@@ -258,6 +294,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
         ),
         Command::Image { command } => match command {
             ImageCommand::Ls => (Verb::ImageLs, empty_args()),
+            ImageCommand::Build { .. } => return Err(anyhow!("image build is handled locally")),
             ImageCommand::Pull { url, name } => {
                 let mut args = args([("url", json!(url))]);
                 insert_opt(&mut args, "name", name.as_ref().map(|v| json!(v)));
@@ -366,10 +403,11 @@ fn render_images(result: Option<&Value>) -> Result<()> {
         .ok_or_else(|| anyhow!("malformed image ls response"))?;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(["NAME", "BYTES", "SHA256"]);
+    table.set_header(["NAME", "KIND", "BYTES", "SHA256"]);
     for image in images {
         table.add_row([
             cell(image, "name"),
+            cell(image, "kind"),
             cell(image, "bytes"),
             cell(image, "sha256"),
         ]);
@@ -449,6 +487,22 @@ mod tests {
     }
 
     #[test]
+    fn image_build_is_local_only() {
+        let err = to_request(&Command::Image {
+            command: ImageCommand::Build {
+                name: "exeuntu".to_string(),
+                dockerfile: Utf8PathBuf::from("./Dockerfile"),
+                context: Utf8PathBuf::from("."),
+                disk_gib: 40,
+                rootless: false,
+            },
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("handled locally"));
+    }
+
+    #[test]
     fn image_rm_maps_name() {
         let (verb, args) = to_request(&Command::Image {
             command: ImageCommand::Rm {
@@ -515,6 +569,43 @@ mod tests {
                 assert!(!no_tap_setup);
             }
             other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_build_subcommand_parses_required_shape() {
+        let cli = Cli::try_parse_from([
+            "hearthctl",
+            "image",
+            "build",
+            "--name",
+            "exeuntu",
+            "--dockerfile",
+            "./Dockerfile",
+            "--context",
+            ".",
+            "--disk",
+            "40",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Image {
+                command:
+                    ImageCommand::Build {
+                        name,
+                        dockerfile,
+                        context,
+                        disk_gib,
+                        rootless,
+                    },
+            } => {
+                assert_eq!(name, "exeuntu");
+                assert_eq!(dockerfile, Utf8PathBuf::from("./Dockerfile"));
+                assert_eq!(context, Utf8PathBuf::from("."));
+                assert_eq!(disk_gib, 40);
+                assert!(!rootless);
+            }
+            other => panic!("expected image build command, got {other:?}"),
         }
     }
 }

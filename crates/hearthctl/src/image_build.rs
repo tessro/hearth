@@ -1,0 +1,246 @@
+use crate::{
+    client::hearth_request,
+    oci::{
+        buildah_bud_args, buildah_push_args, command, data_dir, parent, read_oci_process,
+        remove_dir_if_exists, remove_file_if_exists, run_status, umoci_unpack_args_with_rootless,
+    },
+};
+use anyhow::{anyhow, bail, Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
+use hearth_proto::{ImageManifest, Verb};
+use serde_json::{json, Map, Value};
+use std::fs;
+
+#[derive(Debug, Clone)]
+pub struct BuildOptions {
+    pub name: String,
+    pub dockerfile: Utf8PathBuf,
+    pub context: Utf8PathBuf,
+    pub disk_gib: u64,
+    pub rootless: bool,
+    pub socket: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct BuildPaths {
+    image_layout: Utf8PathBuf,
+    bundle: Utf8PathBuf,
+    rootfs: Utf8PathBuf,
+    output_dir: Utf8PathBuf,
+    raw_disk: Utf8PathBuf,
+    qcow2: Utf8PathBuf,
+    manifest: Utf8PathBuf,
+}
+
+pub async fn build(opts: BuildOptions) -> Result<()> {
+    validate_image_name(&opts.name)?;
+    if opts.disk_gib == 0 {
+        bail!("--disk must be at least 1 GiB");
+    }
+    if !opts.dockerfile.exists() {
+        bail!("Dockerfile not found: {}", opts.dockerfile);
+    }
+    if !opts.context.exists() {
+        bail!("build context not found: {}", opts.context);
+    }
+    if !opts.context.is_dir() {
+        bail!("build context is not a directory: {}", opts.context);
+    }
+
+    let data_dir = data_dir()?;
+    let paths = BuildPaths::new(&data_dir, &opts.name);
+
+    run_status(
+        command(
+            "buildah",
+            buildah_bud_args(&opts.name, &opts.dockerfile, &opts.context),
+        ),
+        "buildah bud",
+    )
+    .await?;
+
+    remove_dir_if_exists(&paths.image_layout)
+        .with_context(|| format!("remove old image layout {}", paths.image_layout))?;
+    fs::create_dir_all(parent(&paths.image_layout)?)?;
+    run_status(
+        command(
+            "buildah",
+            buildah_push_args(&opts.name, &paths.image_layout),
+        ),
+        "buildah push",
+    )
+    .await?;
+
+    remove_dir_if_exists(&paths.bundle)
+        .with_context(|| format!("remove old bundle {}", paths.bundle))?;
+    fs::create_dir_all(parent(&paths.bundle)?)?;
+    run_status(
+        command(
+            "umoci",
+            umoci_unpack_args_with_rootless(&paths.image_layout, &paths.bundle, opts.rootless),
+        ),
+        "umoci unpack",
+    )
+    .await?;
+
+    let process = read_oci_process(&paths.bundle)?;
+    let manifest = ImageManifest::docker_rootfs(process).map_err(|message| anyhow!(message))?;
+    materialize_rootfs(&paths, opts.disk_gib).await?;
+    fs::write(&paths.manifest, toml::to_string_pretty(&manifest)?)?;
+
+    let result = import_image(&opts, &paths).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+impl BuildPaths {
+    fn new(data_dir: &Utf8Path, name: &str) -> Self {
+        let output_dir = data_dir.join("image-builds").join(name);
+        let bundle = data_dir.join("bundles").join(name);
+        Self {
+            image_layout: data_dir.join("oci-layouts").join(name),
+            rootfs: bundle.join("rootfs"),
+            bundle,
+            raw_disk: output_dir.join(format!("{name}.raw")),
+            qcow2: output_dir.join(format!("{name}.qcow2")),
+            manifest: output_dir.join(format!("{name}.hearth.toml")),
+            output_dir,
+        }
+    }
+}
+
+async fn materialize_rootfs(paths: &BuildPaths, disk_gib: u64) -> Result<()> {
+    remove_dir_if_exists(&paths.output_dir)
+        .with_context(|| format!("remove old build output {}", paths.output_dir))?;
+    fs::create_dir_all(&paths.output_dir)?;
+    run_status(
+        command(
+            "qemu-img",
+            qemu_img_create_raw_args(&paths.raw_disk, disk_gib),
+        ),
+        "qemu-img create raw root disk",
+    )
+    .await?;
+    run_status(
+        command("mkfs.ext4", mkfs_ext4_args(&paths.rootfs, &paths.raw_disk)),
+        "mkfs.ext4 rootfs",
+    )
+    .await?;
+    run_status(
+        command(
+            "qemu-img",
+            qemu_img_convert_args(&paths.raw_disk, &paths.qcow2),
+        ),
+        "qemu-img convert qcow2 root disk",
+    )
+    .await?;
+    remove_file_if_exists(&paths.raw_disk)?;
+    Ok(())
+}
+
+async fn import_image(opts: &BuildOptions, paths: &BuildPaths) -> Result<Value> {
+    hearth_request(
+        &opts.socket,
+        Verb::ImageImport,
+        Map::from_iter([
+            ("name".to_string(), json!(opts.name)),
+            ("qcow2_path".to_string(), json!(paths.qcow2)),
+            ("manifest_path".to_string(), json!(paths.manifest)),
+        ]),
+    )
+    .await
+}
+
+fn qemu_img_create_raw_args(raw_disk: &Utf8Path, disk_gib: u64) -> Vec<String> {
+    vec![
+        "create".to_string(),
+        "-f".to_string(),
+        "raw".to_string(),
+        raw_disk.to_string(),
+        format!("{disk_gib}G"),
+    ]
+}
+
+fn mkfs_ext4_args(rootfs: &Utf8Path, raw_disk: &Utf8Path) -> Vec<String> {
+    vec![
+        "-F".to_string(),
+        "-d".to_string(),
+        rootfs.to_string(),
+        raw_disk.to_string(),
+    ]
+}
+
+fn qemu_img_convert_args(raw_disk: &Utf8Path, qcow2: &Utf8Path) -> Vec<String> {
+    vec![
+        "convert".to_string(),
+        "-f".to_string(),
+        "raw".to_string(),
+        "-O".to_string(),
+        "qcow2".to_string(),
+        raw_disk.to_string(),
+        qcow2.to_string(),
+    ]
+}
+
+fn validate_image_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("image names must be kebab-case and start with a letter");
+    };
+    if !first.is_ascii_lowercase() {
+        bail!("image names must be kebab-case and start with a letter");
+    }
+    let mut last_was_dash = false;
+    for c in chars {
+        match c {
+            'a'..='z' | '0'..='9' => last_was_dash = false,
+            '-' if !last_was_dash => last_was_dash = true,
+            _ => bail!("image names must be kebab-case and start with a letter"),
+        }
+    }
+    if last_was_dash {
+        bail!("image names must be kebab-case and start with a letter");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialization_uses_raw_ext4_then_qcow2() {
+        assert_eq!(
+            qemu_img_create_raw_args(Utf8Path::new("/tmp/root.raw"), 40),
+            vec!["create", "-f", "raw", "/tmp/root.raw", "40G"]
+        );
+        assert_eq!(
+            mkfs_ext4_args(Utf8Path::new("/tmp/rootfs"), Utf8Path::new("/tmp/root.raw")),
+            vec!["-F", "-d", "/tmp/rootfs", "/tmp/root.raw"]
+        );
+        assert_eq!(
+            qemu_img_convert_args(
+                Utf8Path::new("/tmp/root.raw"),
+                Utf8Path::new("/tmp/root.qcow2")
+            ),
+            vec![
+                "convert",
+                "-f",
+                "raw",
+                "-O",
+                "qcow2",
+                "/tmp/root.raw",
+                "/tmp/root.qcow2"
+            ]
+        );
+    }
+
+    #[test]
+    fn image_names_are_kebab_case() {
+        assert!(validate_image_name("exeuntu").is_ok());
+        assert!(validate_image_name("debian-12").is_ok());
+        assert!(validate_image_name("Bad").is_err());
+        assert!(validate_image_name("bad_name").is_err());
+        assert!(validate_image_name("bad-").is_err());
+    }
+}

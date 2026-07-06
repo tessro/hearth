@@ -23,6 +23,7 @@ pub enum Verb {
     Logs,
     ImageLs,
     ImagePull,
+    ImageImport,
     ImageRm,
     NetSetup,
     NetTeardown,
@@ -48,6 +49,7 @@ impl Verb {
             Self::Logs => "logs",
             Self::ImageLs => "image-ls",
             Self::ImagePull => "image-pull",
+            Self::ImageImport => "image-import",
             Self::ImageRm => "image-rm",
             Self::NetSetup => "net-setup",
             Self::NetTeardown => "net-teardown",
@@ -169,4 +171,180 @@ pub fn version_result(crate_version: &str) -> Value {
         "protocol": PROTOCOL_VERSION,
         "version": crate_version,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciProcess {
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default = "default_cwd")]
+    pub cwd: String,
+}
+
+impl OciProcess {
+    pub fn validate_common(&mut self) -> Result<(), String> {
+        if self.args.is_empty() || self.args[0].is_empty() {
+            return Err("OCI config process.args must contain an executable".to_string());
+        }
+        if self.cwd.is_empty() {
+            self.cwd = default_cwd();
+        }
+        if !self.cwd.starts_with('/') {
+            return Err(format!(
+                "OCI config process.cwd must be absolute: {}",
+                self.cwd
+            ));
+        }
+        for env in &self.env {
+            if env.as_bytes().contains(&0) {
+                return Err("OCI config process.env contains a NUL byte".to_string());
+            }
+        }
+        for arg in &self.args {
+            if arg.as_bytes().contains(&0) {
+                return Err("OCI config process.args contains a NUL byte".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_init_only(&mut self) -> Result<(), String> {
+        self.validate_common()?;
+        if self.args.len() != 1 {
+            return Err(
+                "Dockerfile VM images currently require exactly one OCI process arg".to_string(),
+            );
+        }
+        validate_kernel_cmdline_path("OCI config process.args[0]", &self.args[0])?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageKind {
+    DockerRootfs,
+}
+
+impl ImageKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DockerRootfs => "docker-rootfs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageManifest {
+    pub version: u32,
+    pub kind: ImageKind,
+    pub root_device: String,
+    pub root_fstype: String,
+    pub init: String,
+    pub oci: OciProcess,
+}
+
+impl ImageManifest {
+    pub fn docker_rootfs(process: OciProcess) -> Result<Self, String> {
+        let mut process = process;
+        process.validate_init_only()?;
+        Ok(Self {
+            version: 1,
+            kind: ImageKind::DockerRootfs,
+            root_device: "/dev/vda".to_string(),
+            root_fstype: "ext4".to_string(),
+            init: process.args[0].clone(),
+            oci: process,
+        })
+    }
+
+    pub fn validate(&mut self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported Hearth image manifest version {}",
+                self.version
+            ));
+        }
+        match self.kind {
+            ImageKind::DockerRootfs => {
+                validate_kernel_cmdline_path("root_device", &self.root_device)?;
+                validate_kernel_cmdline_token("root_fstype", &self.root_fstype)?;
+                validate_kernel_cmdline_path("init", &self.init)?;
+                self.oci.validate_init_only()?;
+                if self.oci.args[0] != self.init {
+                    return Err("manifest init must match oci.args[0]".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_cwd() -> String {
+    "/".to_string()
+}
+
+fn validate_kernel_cmdline_path(label: &str, value: &str) -> Result<(), String> {
+    if !value.starts_with('/') {
+        return Err(format!("{label} must be an absolute path: {value}"));
+    }
+    validate_kernel_cmdline_token(label, value)
+}
+
+fn validate_kernel_cmdline_token(label: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!("{label} must not contain whitespace: {value}"));
+    }
+    if value.as_bytes().contains(&0) {
+        return Err(format!("{label} must not contain a NUL byte"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_rootfs_manifest_uses_absolute_init_as_pid_one() {
+        let manifest = ImageManifest::docker_rootfs(OciProcess {
+            args: vec!["/usr/local/bin/init".to_string()],
+            env: vec!["EXEUNTU=1".to_string()],
+            cwd: "/home/exedev".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(manifest.kind, ImageKind::DockerRootfs);
+        assert_eq!(manifest.init, "/usr/local/bin/init");
+        assert_eq!(manifest.root_device, "/dev/vda");
+        assert_eq!(manifest.root_fstype, "ext4");
+    }
+
+    #[test]
+    fn docker_rootfs_manifest_rejects_extra_args_for_now() {
+        let err = ImageManifest::docker_rootfs(OciProcess {
+            args: vec!["/init".to_string(), "--debug".to_string()],
+            env: Vec::new(),
+            cwd: "/".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(err.contains("exactly one"));
+    }
+
+    #[test]
+    fn docker_rootfs_manifest_rejects_relative_init() {
+        let err = ImageManifest::docker_rootfs(OciProcess {
+            args: vec!["init".to_string()],
+            env: Vec::new(),
+            cwd: "/".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(err.contains("absolute"));
+    }
 }
