@@ -248,6 +248,8 @@ impl<H: Host + 'static> Daemon<H> {
             Verb::NetSetup => self.net_setup(req.args).await.map(Dispatch::One),
             Verb::NetTeardown => self.net_teardown(req.args).await.map(Dispatch::One),
             Verb::HostCheck => self.host_check().await.map(Dispatch::One),
+            Verb::Publish => self.add_publish(req.args).await.map(Dispatch::One),
+            Verb::Unpublish => self.remove_publish(req.args).await.map(Dispatch::One),
         }
     }
 
@@ -883,6 +885,91 @@ impl<H: Host + 'static> Daemon<H> {
             .join(format!(".{name}.{label}.tmp-{}", std::process::id()))
     }
 
+    /// Add a named `[[publish]]` to a service and re-apply the nftables table
+    /// live — no VM restart. The DNAT is host-side, so a service already
+    /// listening on the guest port keeps running uninterrupted.
+    async fn add_publish(&self, args: Map<String, Value>) -> Result<Value> {
+        let service = required_str(&args, "name")?;
+        let _guard = self.service_guard(service).await;
+        let mut publish: crate::registry::Publish = serde_json::from_value(
+            args.get("publish")
+                .cloned()
+                .ok_or_else(|| coded("request.invalid", "missing publish object"))?,
+        )
+        .map_err(|e| coded("publish.invalid", format!("invalid publish args: {e}")))?;
+        publish.name = publish.name.trim().to_string();
+        if publish.name.is_empty() {
+            return Err(coded("publish.invalid", "publish name is required"));
+        }
+        validate_name(&publish.name)
+            .map_err(|e| coded("publish.invalid", format!("publish name {e:#}")))?;
+        publish
+            .validate()
+            .map_err(|e| coded("publish.invalid", format!("{e:#}")))?;
+        let mut reg = self.registry().await?;
+        let mut svc = reg.get(service)?.clone();
+        if svc
+            .publish
+            .iter()
+            .any(|p| p.effective_name() == publish.name)
+        {
+            return Err(coded(
+                "publish.name_exists",
+                format!(
+                    "service {service} already has a publish named {}",
+                    publish.name
+                ),
+            ));
+        }
+        // A duplicate (bind, protocol, host_port) across any service would
+        // install two conflicting DNAT rules; reject it up front.
+        for other in reg.services.values() {
+            if let Some(clash) = other.publish.iter().find(|p| {
+                p.protocol == publish.protocol
+                    && p.host_port == publish.host_port
+                    && p.bind == publish.bind
+            }) {
+                return Err(coded(
+                    "publish.host_port_in_use",
+                    format!(
+                        "host port {}/{} is already published by {} ({})",
+                        publish.host_port,
+                        publish.protocol,
+                        other.name,
+                        clash.effective_name()
+                    ),
+                ));
+            }
+        }
+        svc.publish.push(publish);
+        Registry::write_service(&self.cfg, &svc).await?;
+        reg.services.insert(service.to_string(), svc);
+        self.rewrite_nat(&reg).await;
+        self.status(service).await
+    }
+
+    /// Remove a service's publish by (effective) name and re-apply the nftables
+    /// table live.
+    async fn remove_publish(&self, args: Map<String, Value>) -> Result<Value> {
+        let service = required_str(&args, "name")?;
+        let publish_name = required_str(&args, "publish_name")?;
+        let _guard = self.service_guard(service).await;
+        let mut reg = self.registry().await?;
+        let mut svc = reg.get(service)?.clone();
+        let before = svc.publish.len();
+        svc.publish.retain(|p| p.effective_name() != publish_name);
+        if svc.publish.len() == before {
+            return Err(coded(
+                "publish.not_found",
+                format!("service {service} has no publish named {publish_name}"),
+            ));
+        }
+        Registry::write_service(&self.cfg, &svc).await?;
+        reg.services.insert(service.to_string(), svc);
+        self.rewrite_nat(&reg).await;
+        self.status(service).await
+    }
+
     async fn net_setup(&self, args: Map<String, Value>) -> Result<Value> {
         let tap = required_str(&args, "tap")?;
         validate_ifname("--tap", tap)?;
@@ -1310,8 +1397,9 @@ async fn read_kernel_contract(kernel: &Utf8PathBuf) -> Result<u32> {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                return Err(anyhow::Error::new(e)
-                    .context(format!("read kernel contract next to {kernel}")))
+                return Err(
+                    anyhow::Error::new(e).context(format!("read kernel contract next to {kernel}"))
+                )
             }
         },
         None => None,
@@ -1512,9 +1600,9 @@ pub async fn ensure_dirs(cfg: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Host;
     use crate::host::cloud_hypervisor_restore_argv;
     use crate::host::DiskFormat;
+    use crate::host::Host;
     use crate::image::ImageMetadata;
     use crate::provision::ProvisionPlan;
     use anyhow::Result;
@@ -1847,7 +1935,9 @@ backoff_sec = 10
             .iter()
             .any(|call| call.starts_with("qemu-img create ") && call.ends_with(" qcow2")));
         assert!(calls.iter().any(|call| call.starts_with("cloud-localds ")));
-        assert!(!calls.iter().any(|call| call.starts_with("build-docker-disk ")));
+        assert!(!calls
+            .iter()
+            .any(|call| call.starts_with("build-docker-disk ")));
         assert!(!calls.iter().any(|call| call.starts_with("systemd-run ")));
         let registry = Registry::load(&cfg).await.unwrap();
         let web = registry.get("web").unwrap();
@@ -2019,7 +2109,9 @@ backoff_sec = 10
         );
         // No disk was created and nothing was allocated.
         let calls = state.lock().unwrap().calls.clone();
-        assert!(!calls.iter().any(|call| call.starts_with("qemu-img create ")));
+        assert!(!calls
+            .iter()
+            .any(|call| call.starts_with("qemu-img create ")));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(registry.get("web").is_err());
         assert!(!registry.allocations.macs.contains_key("web"));
@@ -2033,7 +2125,9 @@ backoff_sec = 10
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
         // The drop-in dir must exist for a reservation to be written.
-        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
         tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
             .await
@@ -2149,6 +2243,188 @@ backoff_sec = 10
     }
 
     #[tokio::test]
+    async fn publish_add_and_remove_apply_nat_live_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let created = daemon
+            .handle(Request::new("1", Verb::Create, name_args("web")))
+            .await;
+        assert!(created[0].ok, "create failed: {:?}", created[0].error);
+
+        // Add a named forward live: nft is re-applied and it persists by name.
+        let add = daemon
+            .handle(Request::new(
+                "2",
+                Verb::Publish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    (
+                        "publish".into(),
+                        json!({ "name": "dashboard", "host_port": 8080, "guest_port": 80, "protocol": "tcp" }),
+                    ),
+                ]),
+            ))
+            .await;
+        assert!(add[0].ok, "publish failed: {:?}", add[0].error);
+        let ruleset = state.lock().unwrap().last_nft.clone().expect("nft applied");
+        assert!(ruleset.contains("tcp dport 8080 dnat to 10.26.8.16:80"));
+        let reg = Registry::load(&cfg).await.unwrap();
+        let pubs = reg.get("web").unwrap().publish.clone();
+        assert_eq!(pubs.len(), 1);
+        assert_eq!(pubs[0].name, "dashboard");
+
+        // A duplicate name is rejected.
+        let dup = daemon
+            .handle(Request::new(
+                "3",
+                Verb::Publish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    (
+                        "publish".into(),
+                        json!({ "name": "dashboard", "host_port": 9090, "guest_port": 90, "protocol": "tcp" }),
+                    ),
+                ]),
+            ))
+            .await;
+        assert_eq!(
+            dup[0].error.as_ref().map(|e| e.code.as_str()),
+            Some("publish.name_exists")
+        );
+
+        // A colliding host port (different name) is rejected.
+        let clash = daemon
+            .handle(Request::new(
+                "4",
+                Verb::Publish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    (
+                        "publish".into(),
+                        json!({ "name": "other", "host_port": 8080, "guest_port": 81, "protocol": "tcp" }),
+                    ),
+                ]),
+            ))
+            .await;
+        assert_eq!(
+            clash[0].error.as_ref().map(|e| e.code.as_str()),
+            Some("publish.host_port_in_use")
+        );
+
+        // An invalid (non-kebab) name is rejected before any nft change.
+        let bad = daemon
+            .handle(Request::new(
+                "5",
+                Verb::Publish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    (
+                        "publish".into(),
+                        json!({ "name": "Bad Name", "host_port": 7000, "guest_port": 70, "protocol": "tcp" }),
+                    ),
+                ]),
+            ))
+            .await;
+        assert_eq!(
+            bad[0].error.as_ref().map(|e| e.code.as_str()),
+            Some("publish.invalid")
+        );
+
+        // Remove by name: nft is re-applied without the rule and it is gone.
+        let rm = daemon
+            .handle(Request::new(
+                "6",
+                Verb::Unpublish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    ("publish_name".into(), json!("dashboard")),
+                ]),
+            ))
+            .await;
+        assert!(rm[0].ok, "unpublish failed: {:?}", rm[0].error);
+        let ruleset = state.lock().unwrap().last_nft.clone().expect("nft applied");
+        assert!(!ruleset.contains("dport 8080"));
+        assert!(Registry::load(&cfg)
+            .await
+            .unwrap()
+            .get("web")
+            .unwrap()
+            .publish
+            .is_empty());
+
+        // Removing an unknown name errors.
+        let miss = daemon
+            .handle(Request::new(
+                "7",
+                Verb::Unpublish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    ("publish_name".into(), json!("nope")),
+                ]),
+            ))
+            .await;
+        assert_eq!(
+            miss[0].error.as_ref().map(|e| e.code.as_str()),
+            Some("publish.not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn unpublish_targets_unnamed_forward_by_derived_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+        // A forward created without a name (as `spawn --publish` produces).
+        let created = daemon
+            .handle(Request::new(
+                "1",
+                Verb::Create,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    (
+                        "publish".into(),
+                        json!([{ "host_port": 9119, "guest_port": 9119, "protocol": "tcp" }]),
+                    ),
+                ]),
+            ))
+            .await;
+        assert!(created[0].ok, "create failed: {:?}", created[0].error);
+        // It is addressable by its deterministic `{host}-{proto}` handle.
+        let rm = daemon
+            .handle(Request::new(
+                "2",
+                Verb::Unpublish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    ("publish_name".into(), json!("9119-tcp")),
+                ]),
+            ))
+            .await;
+        assert!(rm[0].ok, "unpublish failed: {:?}", rm[0].error);
+        assert!(Registry::load(&cfg)
+            .await
+            .unwrap()
+            .get("web")
+            .unwrap()
+            .publish
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn create_rejects_invalid_publish() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
@@ -2178,7 +2454,9 @@ backoff_sec = 10
         assert_eq!(responses[0].error.as_ref().unwrap().code, "publish.invalid");
         // Nothing was allocated or applied.
         let calls = state.lock().unwrap().calls.clone();
-        assert!(!calls.iter().any(|call| call.starts_with("qemu-img create ")));
+        assert!(!calls
+            .iter()
+            .any(|call| call.starts_with("qemu-img create ")));
         assert!(!calls.contains(&"nft-apply".to_string()));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(!registry.allocations.ips.contains_key("web"));
@@ -2249,7 +2527,9 @@ backoff_sec = 10
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         write_service(&root, "mail", true).await;
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
+            .await
+            .unwrap();
         tokio::fs::write(cfg.dnsmasq_dropin_dir.join("mail.conf"), "dhcp-host=x\n")
             .await
             .unwrap();
@@ -2295,14 +2575,22 @@ backoff_sec = 10
             .handle(Request::new("1", Verb::Start, name_args("mail")))
             .await;
         assert!(start[0].ok);
-        assert!(state.lock().unwrap().calls.contains(&"nft-apply".to_string()));
+        assert!(state
+            .lock()
+            .unwrap()
+            .calls
+            .contains(&"nft-apply".to_string()));
 
         state.lock().unwrap().calls.clear();
         let stop = daemon
             .handle(Request::new("2", Verb::Stop, name_args("mail")))
             .await;
         assert!(stop[0].ok);
-        assert!(state.lock().unwrap().calls.contains(&"nft-apply".to_string()));
+        assert!(state
+            .lock()
+            .unwrap()
+            .calls
+            .contains(&"nft-apply".to_string()));
     }
 
     #[tokio::test]
@@ -2311,7 +2599,9 @@ backoff_sec = 10
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         write_service(&root, "mail", false).await;
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
+            .await
+            .unwrap();
         // Static reservation exists but the drop-in file is missing (simulating a
         // host reboot that wiped a tmpfs-backed drop-in dir).
         Registry::write_allocations(
@@ -2386,7 +2676,9 @@ backoff_sec = 10
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
 
-        let responses = daemon.handle(Request::new("1", Verb::Start, name_args("dev"))).await;
+        let responses = daemon
+            .handle(Request::new("1", Verb::Start, name_args("dev")))
+            .await;
 
         assert!(responses[0].ok, "start failed: {:?}", responses[0].error);
         let calls = state.lock().unwrap().calls.clone();
@@ -2404,10 +2696,15 @@ backoff_sec = 10
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
 
-        let responses = daemon.handle(Request::new("1", Verb::Start, name_args("dev"))).await;
+        let responses = daemon
+            .handle(Request::new("1", Verb::Start, name_args("dev")))
+            .await;
 
         assert!(!responses[0].ok);
-        assert_eq!(responses[0].error.as_ref().unwrap().code, "kernel.not_found");
+        assert_eq!(
+            responses[0].error.as_ref().unwrap().code,
+            "kernel.not_found"
+        );
         // The VM must not have been launched.
         let calls = state.lock().unwrap().calls.clone();
         assert!(!calls.iter().any(|c| c.starts_with("systemd-run ")));
@@ -2436,7 +2733,9 @@ cwd = "/home/exedev"
         let host = FakeHost::default();
         let daemon = Daemon::new(cfg.clone(), host);
 
-        let responses = daemon.handle(Request::new("1", Verb::Start, name_args("dev"))).await;
+        let responses = daemon
+            .handle(Request::new("1", Verb::Start, name_args("dev")))
+            .await;
 
         assert!(!responses[0].ok);
         assert_eq!(
@@ -2965,12 +3264,7 @@ backoff_sec = 10
 
     /// Write a docker-rootfs service plus its image + sidecar manifest so a
     /// `start` exercises the guest-kernel validation path.
-    async fn write_docker_service(
-        root: &Utf8Path,
-        name: &str,
-        enabled: bool,
-        manifest_toml: &str,
-    ) {
+    async fn write_docker_service(root: &Utf8Path, name: &str, enabled: bool, manifest_toml: &str) {
         let services = root.join("services");
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::write(
@@ -3015,8 +3309,12 @@ backoff_sec = 10
     async fn write_guest_kernel(root: &Utf8Path, contract: &str) {
         let dir = root.join("kernels/current");
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("vmlinux"), b"vmlinux").await.unwrap();
-        tokio::fs::write(dir.join("contract"), contract).await.unwrap();
+        tokio::fs::write(dir.join("vmlinux"), b"vmlinux")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("contract"), contract)
+            .await
+            .unwrap();
     }
 
     #[derive(Clone, Default)]
@@ -3131,11 +3429,10 @@ backoff_sec = 10
             _disk_gib: u64,
             plan: &ProvisionPlan,
         ) -> Result<()> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("build-docker-disk {disk} scratch={scratch} {}", plan.describe()));
+            self.state.lock().unwrap().calls.push(format!(
+                "build-docker-disk {disk} scratch={scratch} {}",
+                plan.describe()
+            ));
             Ok(())
         }
 

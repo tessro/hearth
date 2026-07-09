@@ -45,6 +45,11 @@ pub struct Service {
 /// renders every service's publishes into the `hearth_nat` nftables table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Publish {
+    // Management handle so `publish rm` can target one forward by name. Optional
+    // on disk: publishes created via `spawn --publish` (or before names existed)
+    // have none and fall back to a deterministic name via `effective_name`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub host_port: u16,
     pub guest_port: u16,
     #[serde(default = "default_protocol")]
@@ -73,6 +78,17 @@ impl Publish {
                 .map_err(|_| anyhow!("publish bind must be an IP address, got {bind:?}"))?;
         }
         Ok(())
+    }
+
+    /// The name `publish rm` matches on. Named forwards use their name; unnamed
+    /// ones (from `spawn --publish` or pre-names TOML) get a deterministic
+    /// `{host_port}-{protocol}` handle so they are still addressable.
+    pub fn effective_name(&self) -> String {
+        if self.name.is_empty() {
+            format!("{}-{}", self.host_port, self.protocol)
+        } else {
+            self.name.clone()
+        }
     }
 }
 
@@ -167,7 +183,10 @@ impl ProvisionFile {
             _ => {}
         }
         if !self.dest.is_absolute() {
-            bail!("provision file dest must be an absolute path: {}", self.dest);
+            bail!(
+                "provision file dest must be an absolute path: {}",
+                self.dest
+            );
         }
         if self
             .dest
@@ -389,7 +408,8 @@ impl Registry {
             .values()
             .filter_map(|s| s.parse().ok())
             .collect();
-        let ip = crate::net::allocate_ip(static_start, static_count, &used_ips).map(|ip| ip.to_string());
+        let ip =
+            crate::net::allocate_ip(static_start, static_count, &used_ips).map(|ip| ip.to_string());
         self.allocations.vsock_cids.insert(name.to_string(), cid);
         self.allocations.macs.insert(name.to_string(), mac.clone());
         if let Some(ip) = &ip {
@@ -573,7 +593,8 @@ mod tests {
     #[test]
     fn redacted_summary_never_echoes_literal_content() {
         let mut p = Provision::default();
-        p.files.push(literal_file("/home/agent/.env", "0600", "1000:1000"));
+        p.files
+            .push(literal_file("/home/agent/.env", "0600", "1000:1000"));
         let summary = p.redacted_summary().to_string();
         assert!(summary.contains("<literal>"));
         assert!(!summary.contains("secret"));
@@ -583,6 +604,7 @@ mod tests {
     #[test]
     fn publish_validate_accepts_well_formed_entries() {
         assert!(Publish {
+            name: String::new(),
             host_port: 9119,
             guest_port: 9119,
             protocol: "tcp".to_string(),
@@ -591,6 +613,7 @@ mod tests {
         .validate()
         .is_ok());
         assert!(Publish {
+            name: String::new(),
             host_port: 53,
             guest_port: 53,
             protocol: "udp".to_string(),
@@ -603,6 +626,7 @@ mod tests {
     #[test]
     fn publish_validate_rejects_bad_port_protocol_and_bind() {
         assert!(Publish {
+            name: String::new(),
             host_port: 0,
             guest_port: 80,
             protocol: "tcp".to_string(),
@@ -611,6 +635,7 @@ mod tests {
         .validate()
         .is_err());
         assert!(Publish {
+            name: String::new(),
             host_port: 80,
             guest_port: 80,
             protocol: "sctp".to_string(),
@@ -619,6 +644,7 @@ mod tests {
         .validate()
         .is_err());
         assert!(Publish {
+            name: String::new(),
             host_port: 80,
             guest_port: 80,
             protocol: "tcp".to_string(),
@@ -633,6 +659,23 @@ mod tests {
         let p: Publish = toml::from_str("host_port = 80\nguest_port = 80\n").unwrap();
         assert_eq!(p.protocol, "tcp");
         assert!(p.bind.is_none());
+    }
+
+    #[test]
+    fn publish_effective_name_falls_back_to_port_and_proto() {
+        // A nameless publish (from `spawn --publish` or pre-names TOML) is still
+        // addressable by a deterministic handle.
+        let p: Publish = toml::from_str("host_port = 9119\nguest_port = 9119\n").unwrap();
+        assert!(p.name.is_empty());
+        assert_eq!(p.effective_name(), "9119-tcp");
+        // A named publish keeps its name.
+        let named: Publish =
+            toml::from_str("name = \"dashboard\"\nhost_port = 80\nguest_port = 80\n").unwrap();
+        assert_eq!(named.effective_name(), "dashboard");
+        // The name round-trips (and is only serialized when set).
+        let text = toml::to_string_pretty(&named).unwrap();
+        assert!(text.contains("name = \"dashboard\""));
+        assert!(!toml::to_string_pretty(&p).unwrap().contains("name ="));
     }
 
     #[test]
@@ -651,6 +694,7 @@ mac = "52:54:00:12:34:56"
         )
         .unwrap();
         svc.publish.push(Publish {
+            name: String::new(),
             host_port: 9119,
             guest_port: 9119,
             protocol: "tcp".to_string(),
@@ -702,9 +746,11 @@ mac = "52:54:00:12:34:56"
         svc.disk = Some("hermes.raw".to_string());
         svc.provision.hostname = "hermes".to_string();
         svc.provision.reset_ssh_hostkeys = true;
-        svc.provision
-            .files
-            .push(literal_file("/home/agent/.hermes/.env", "0600", "1000:1000"));
+        svc.provision.files.push(literal_file(
+            "/home/agent/.hermes/.env",
+            "0600",
+            "1000:1000",
+        ));
         let text = toml::to_string_pretty(&svc).unwrap();
         let parsed: Service = toml::from_str(&text).unwrap();
         assert_eq!(parsed.disk.as_deref(), Some("hermes.raw"));

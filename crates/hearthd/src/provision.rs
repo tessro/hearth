@@ -265,7 +265,9 @@ mod tests {
         let ssh = Utf8PathBuf::from_path_buf(tmp.path().join("etc/ssh")).unwrap();
         fs::create_dir_all(&ssh).await.unwrap();
         fs::write(ssh.join("ssh_host_rsa_key"), b"k").await.unwrap();
-        fs::write(ssh.join("ssh_host_rsa_key.pub"), b"k").await.unwrap();
+        fs::write(ssh.join("ssh_host_rsa_key.pub"), b"k")
+            .await
+            .unwrap();
         fs::write(ssh.join("sshd_config"), b"cfg").await.unwrap();
 
         remove_ssh_hostkeys(&ssh).await.unwrap();

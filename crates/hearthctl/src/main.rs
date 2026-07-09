@@ -170,6 +170,34 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Manage a running service's host->guest port forwards. Changes apply live
+    /// (the nftables table is re-applied); the VM is not restarted.
+    Publish {
+        #[command(subcommand)]
+        command: PublishCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PublishCommand {
+    /// Add a named port forward and apply it live.
+    Add {
+        /// Service to publish from.
+        service: String,
+        /// Unique name for this forward (use it with `publish rm`).
+        name: String,
+        /// Forward spec: host:guest[/tcp|udp][@bind].
+        spec: String,
+    },
+    /// Remove a named port forward and apply the change live.
+    Rm {
+        /// Service the forward belongs to.
+        service: String,
+        /// Name of the forward to remove (see `publish ls`).
+        name: String,
+    },
+    /// List a service's port forwards.
+    Ls { service: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -407,6 +435,35 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
         Command::Host { command } => match command {
             HostCommand::Check => (Verb::HostCheck, empty_args()),
         },
+        Command::Publish { command } => match command {
+            PublishCommand::Add {
+                service,
+                name,
+                spec,
+            } => {
+                let parsed = spawn::parse_publish(spec)?;
+                let mut publish = Map::new();
+                publish.insert("name".to_string(), json!(name));
+                publish.insert("host_port".to_string(), json!(parsed.host_port));
+                publish.insert("guest_port".to_string(), json!(parsed.guest_port));
+                publish.insert("protocol".to_string(), json!(parsed.protocol));
+                if let Some(bind) = parsed.bind {
+                    publish.insert("bind".to_string(), json!(bind));
+                }
+                (
+                    Verb::Publish,
+                    args([
+                        ("name", json!(service)),
+                        ("publish", Value::Object(publish)),
+                    ]),
+                )
+            }
+            PublishCommand::Rm { service, name } => (
+                Verb::Unpublish,
+                args([("name", json!(service)), ("publish_name", json!(name))]),
+            ),
+            PublishCommand::Ls { service } => (Verb::Status, args([("name", json!(service))])),
+        },
     })
 }
 
@@ -452,6 +509,7 @@ fn render(command: &Command, responses: Vec<Response>) -> Result<()> {
         Command::Host {
             command: HostCommand::Check,
         } => render_checks(first.result.as_ref())?,
+        Command::Publish { .. } => render_publishes(first.result.as_ref())?,
         Command::Logs { .. } => {
             for response in responses {
                 if response.stream == Some(StreamKind::Data) {
@@ -515,6 +573,52 @@ fn render_images(result: Option<&Value>) -> Result<()> {
             cell(image, "kind"),
             cell(image, "bytes"),
             cell(image, "sha256"),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+fn render_publishes(result: Option<&Value>) -> Result<()> {
+    let service = result
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let empty = Vec::new();
+    let publishes = result
+        .and_then(|v| v.get("publish"))
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if publishes.is_empty() {
+        println!("{service} has no published ports");
+        return Ok(());
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(["NAME", "PROTO", "HOST", "GUEST", "BIND"]);
+    for p in publishes {
+        let host = p.get("host_port").and_then(Value::as_u64).unwrap_or(0);
+        let proto = p
+            .get("protocol")
+            .and_then(Value::as_str)
+            .unwrap_or("tcp")
+            .to_string();
+        // Mirror Publish::effective_name so unnamed forwards still show a handle.
+        let name = p
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{host}-{proto}"));
+        table.add_row([
+            name,
+            proto,
+            host.to_string(),
+            cell(p, "guest_port"),
+            p.get("bind")
+                .and_then(Value::as_str)
+                .unwrap_or("*")
+                .to_string(),
         ]);
     }
     println!("{table}");
@@ -659,6 +763,73 @@ mod tests {
         .unwrap();
         assert_eq!(verb, Verb::ImageRm);
         assert_eq!(args.get("name"), Some(&json!("debian")));
+    }
+
+    #[test]
+    fn publish_add_maps_spec_and_name_to_publish_verb() {
+        let (verb, args) = to_request(&Command::Publish {
+            command: PublishCommand::Add {
+                service: "web".to_string(),
+                name: "dashboard".to_string(),
+                spec: "8080:80/tcp@100.121.19.41".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, Verb::Publish);
+        assert_eq!(args.get("name"), Some(&json!("web")));
+        let p = args.get("publish").unwrap();
+        assert_eq!(p["name"], json!("dashboard"));
+        assert_eq!(p["host_port"], json!(8080));
+        assert_eq!(p["guest_port"], json!(80));
+        assert_eq!(p["protocol"], json!("tcp"));
+        assert_eq!(p["bind"], json!("100.121.19.41"));
+    }
+
+    #[test]
+    fn publish_rm_and_ls_map_to_verbs() {
+        let (verb, args) = to_request(&Command::Publish {
+            command: PublishCommand::Rm {
+                service: "web".to_string(),
+                name: "dashboard".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, Verb::Unpublish);
+        assert_eq!(args.get("name"), Some(&json!("web")));
+        assert_eq!(args.get("publish_name"), Some(&json!("dashboard")));
+
+        let (verb, args) = to_request(&Command::Publish {
+            command: PublishCommand::Ls {
+                service: "web".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(verb, Verb::Status);
+        assert_eq!(args.get("name"), Some(&json!("web")));
+    }
+
+    #[test]
+    fn publish_add_requires_service_name_and_spec() {
+        // Missing the spec positional is a parse error (all three are required).
+        assert!(Cli::try_parse_from(["hearthctl", "publish", "add", "web", "dashboard"]).is_err());
+        let cli =
+            Cli::try_parse_from(["hearthctl", "publish", "add", "web", "dashboard", "8080:80"])
+                .unwrap();
+        match cli.command {
+            Command::Publish {
+                command:
+                    PublishCommand::Add {
+                        service,
+                        name,
+                        spec,
+                    },
+            } => {
+                assert_eq!(service, "web");
+                assert_eq!(name, "dashboard");
+                assert_eq!(spec, "8080:80");
+            }
+            other => panic!("expected publish add, got {other:?}"),
+        }
     }
 
     #[test]

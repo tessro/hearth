@@ -85,11 +85,7 @@ pub struct Config {
     /// the `hearth0` bridge subnet (default gateway 10.26.8.1 → 10.26.8.0/24) and
     /// OUTSIDE dnsmasq's dynamic `dhcp-range`, or a reservation could collide with
     /// a dynamically handed-out lease.
-    #[arg(
-        long,
-        env = "HEARTH_DHCP_STATIC_START",
-        default_value = "10.26.8.16"
-    )]
+    #[arg(long, env = "HEARTH_DHCP_STATIC_START", default_value = "10.26.8.16")]
     pub dhcp_static_start: std::net::Ipv4Addr,
     /// Size of the static-lease slice starting at `dhcp_static_start`
     /// (10.26.8.16-10.26.8.79 by default). Must not overlap dnsmasq's dynamic

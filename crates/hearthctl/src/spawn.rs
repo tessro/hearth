@@ -151,9 +151,9 @@ pub fn parse_publish(value: &str) -> Result<PublishSpec> {
         Some((ports, proto)) => (ports, proto.to_string()),
         None => (left, "tcp".to_string()),
     };
-    let (host, guest) = ports.split_once(':').ok_or_else(|| {
-        anyhow!("--publish must be host:guest[/tcp|udp][@bind], got {value:?}")
-    })?;
+    let (host, guest) = ports
+        .split_once(':')
+        .ok_or_else(|| anyhow!("--publish must be host:guest[/tcp|udp][@bind], got {value:?}"))?;
     let host_port = parse_port(host, "host")?;
     let guest_port = parse_port(guest, "guest")?;
     if protocol != "tcp" && protocol != "udp" {
@@ -540,8 +540,14 @@ mod tests {
 
     #[test]
     fn publish_rejects_zero_and_out_of_range_ports() {
-        assert!(parse_publish("0:80").unwrap_err().to_string().contains("host"));
-        assert!(parse_publish("80:0").unwrap_err().to_string().contains("guest"));
+        assert!(parse_publish("0:80")
+            .unwrap_err()
+            .to_string()
+            .contains("host"));
+        assert!(parse_publish("80:0")
+            .unwrap_err()
+            .to_string()
+            .contains("guest"));
         // 70000 overflows u16.
         assert!(parse_publish("70000:80").is_err());
     }

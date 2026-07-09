@@ -147,6 +147,7 @@ mod tests {
 
     fn publish(host_port: u16, guest_port: u16, protocol: &str, bind: Option<&str>) -> Publish {
         Publish {
+            name: String::new(),
             host_port,
             guest_port,
             protocol: protocol.to_string(),
@@ -203,10 +204,16 @@ mod tests {
     fn allocate_ip_picks_lowest_free_and_skips_used() {
         let start: Ipv4Addr = "10.26.8.16".parse().unwrap();
         let mut used = BTreeSet::new();
-        assert_eq!(allocate_ip(start, 64, &used), Some("10.26.8.16".parse().unwrap()));
+        assert_eq!(
+            allocate_ip(start, 64, &used),
+            Some("10.26.8.16".parse().unwrap())
+        );
         used.insert("10.26.8.16".parse().unwrap());
         used.insert("10.26.8.17".parse().unwrap());
-        assert_eq!(allocate_ip(start, 64, &used), Some("10.26.8.18".parse().unwrap()));
+        assert_eq!(
+            allocate_ip(start, 64, &used),
+            Some("10.26.8.18".parse().unwrap())
+        );
     }
 
     #[test]
@@ -248,9 +255,9 @@ mod tests {
                 publish(53, 53, "udp", None),
             ],
         }]);
-        assert!(ruleset
-            .text
-            .contains("add chain ip hearth_nat prerouting { type nat hook prerouting priority -100 ; }"));
+        assert!(ruleset.text.contains(
+            "add chain ip hearth_nat prerouting { type nat hook prerouting priority -100 ; }"
+        ));
         assert!(ruleset
             .text
             .contains("add rule ip hearth_nat prerouting tcp dport 9119 dnat to 10.26.8.20:9119"));
@@ -286,9 +293,7 @@ mod tests {
                 publishes: vec![publish(80, 80, "tcp", None)],
             },
         ]);
-        assert!(ruleset
-            .text
-            .contains("dnat to 10.26.8.16:80"));
+        assert!(ruleset.text.contains("dnat to 10.26.8.16:80"));
         assert!(!ruleset.text.contains("unknown"));
         assert_eq!(ruleset.skipped, vec!["unknown".to_string()]);
     }

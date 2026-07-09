@@ -28,6 +28,8 @@ pub enum Verb {
     NetSetup,
     NetTeardown,
     HostCheck,
+    Publish,
+    Unpublish,
 }
 
 impl Verb {
@@ -57,6 +59,8 @@ impl Verb {
         Verb::NetSetup,
         Verb::NetTeardown,
         Verb::HostCheck,
+        Verb::Publish,
+        Verb::Unpublish,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -82,6 +86,8 @@ impl Verb {
             Self::NetSetup => "net-setup",
             Self::NetTeardown => "net-teardown",
             Self::HostCheck => "host-check",
+            Self::Publish => "publish",
+            Self::Unpublish => "unpublish",
         }
     }
 }
@@ -376,13 +382,15 @@ mod tests {
                 | Verb::ImageRm
                 | Verb::NetSetup
                 | Verb::NetTeardown
-                | Verb::HostCheck => {}
+                | Verb::HostCheck
+                | Verb::Publish
+                | Verb::Unpublish => {}
             }
         }
         for verb in Verb::ALL {
             witness(verb);
         }
-        assert_eq!(Verb::ALL.len(), 21, "Verb::ALL must list every variant");
+        assert_eq!(Verb::ALL.len(), 23, "Verb::ALL must list every variant");
         let mut names: Vec<&str> = Verb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();
