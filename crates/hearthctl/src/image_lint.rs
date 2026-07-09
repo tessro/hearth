@@ -46,6 +46,8 @@ const CHECKS: &[Check] = &[
     check_udevd_enabled,
     check_network_matches_en,
     check_sshd_enabled,
+    check_dbus_enabled,
+    check_pam_systemd_present,
     check_serial_getty_masked,
     check_growfs_in_fstab,
 ];
@@ -215,6 +217,49 @@ fn check_sshd_enabled(ctx: &LintCtx) -> Option<Finding> {
     }
 }
 
+/// The system bus is what logind is reached through and what socket-activates
+/// the per-user session bus. With no dbus.socket/dbus.service enabled the agent
+/// gets no logind session: `systemctl --user`, `loginctl`, and XDG_RUNTIME_DIR
+/// are all dead — the exact "container/VM lacks the infrastructure" the field
+/// report described.
+fn check_dbus_enabled(ctx: &LintCtx) -> Option<Finding> {
+    let enabled = ["sockets.target.wants", "multi-user.target.wants"]
+        .iter()
+        .any(|wants| {
+            wants_has(ctx, wants, |name| {
+                name == "dbus.socket" || name == "dbus.service"
+            })
+        });
+    if enabled {
+        None
+    } else {
+        Some(warn(
+            "dbus",
+            "dbus is not enabled (no dbus.socket/dbus.service under the *.target.wants dirs) — user sessions and logind will not work"
+                .to_string(),
+        ))
+    }
+}
+
+/// pam_systemd.so is what turns an SSH login into a registered logind session
+/// with XDG_RUNTIME_DIR (/run/user/1000) and a user manager. Missing it, logins
+/// still succeed but land in a session-less shell where `systemctl --user` and
+/// $XDG_RUNTIME_DIR do not work — invisible until an agent tries to use them.
+fn check_pam_systemd_present(ctx: &LintCtx) -> Option<Finding> {
+    let present = ["usr/lib", "lib"]
+        .iter()
+        .any(|libdir| security_dir_has_pam_systemd(ctx, libdir));
+    if present {
+        None
+    } else {
+        Some(warn(
+            "pam-systemd",
+            "pam_systemd.so is absent (no /usr/lib/*/security/pam_systemd.so or /lib/*/security/pam_systemd.so) — SSH logins will not get XDG_RUNTIME_DIR / user managers"
+                .to_string(),
+        ))
+    }
+}
+
 /// An unmasked serial-getty on ttyS0 races the kernel console and hangs boot for
 /// ~90s (inventory #5). Masked = a symlink to /dev/null.
 fn check_serial_getty_masked(ctx: &LintCtx) -> Option<Finding> {
@@ -279,6 +324,19 @@ fn wants_has(ctx: &LintCtx, wants: &str, pred: impl Fn(&str) -> bool) -> bool {
         Ok(entries) => entries
             .flatten()
             .any(|entry| entry.file_name().to_str().map(&pred).unwrap_or(false)),
+        Err(_) => false,
+    }
+}
+
+/// True if `<rootfs>/<libdir>/*/security/pam_systemd.so` exists — the one-level
+/// glob over the multiarch dir (e.g. `usr/lib/x86_64-linux-gnu/security`), the
+/// canonical PAM module location on Debian/Ubuntu.
+fn security_dir_has_pam_systemd(ctx: &LintCtx, libdir: &str) -> bool {
+    let base = ctx.rootfs.join(libdir);
+    match fs::read_dir(&base) {
+        Ok(entries) => entries
+            .flatten()
+            .any(|entry| entry.path().join("security/pam_systemd.so").exists()),
         Err(_) => false,
     }
 }
@@ -375,7 +433,14 @@ mod tests {
         )
         .unwrap();
         fs::write(sys.join("multi-user.target.wants/ssh.service"), b"").unwrap();
+        fs::write(sys.join("sockets.target.wants/dbus.socket"), b"").unwrap();
+        fs::write(sys.join("multi-user.target.wants/dbus.service"), b"").unwrap();
         symlink("/dev/null", sys.join("serial-getty@ttyS0.service")).unwrap();
+
+        // pam_systemd.so under the multiarch security dir (Debian/Ubuntu layout).
+        let security = root.join("usr/lib/x86_64-linux-gnu/security");
+        fs::create_dir_all(&security).unwrap();
+        fs::write(security.join("pam_systemd.so"), b"").unwrap();
     }
 
     fn tmp() -> (tempfile::TempDir, Utf8PathBuf) {
@@ -488,6 +553,31 @@ mod tests {
         let f = check_sshd_enabled(&ctx(&root)).unwrap();
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.check, "sshd");
+    }
+
+    #[test]
+    fn dbus_enabled() {
+        let (_dir, root) = tmp();
+        assert!(check_dbus_enabled(&ctx(&root)).is_none());
+
+        // Removing both the socket and service enablement fires the warning.
+        fs::remove_file(root.join("etc/systemd/system/sockets.target.wants/dbus.socket")).unwrap();
+        fs::remove_file(root.join("etc/systemd/system/multi-user.target.wants/dbus.service"))
+            .unwrap();
+        let f = check_dbus_enabled(&ctx(&root)).unwrap();
+        assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.check, "dbus");
+    }
+
+    #[test]
+    fn pam_systemd_present() {
+        let (_dir, root) = tmp();
+        assert!(check_pam_systemd_present(&ctx(&root)).is_none());
+
+        fs::remove_file(root.join("usr/lib/x86_64-linux-gnu/security/pam_systemd.so")).unwrap();
+        let f = check_pam_systemd_present(&ctx(&root)).unwrap();
+        assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.check, "pam-systemd");
     }
 
     #[test]

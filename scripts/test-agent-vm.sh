@@ -75,6 +75,9 @@ ctl spawn "${SERVICE_NAME}" \
   --image "${IMAGE_NAME}" \
   --mem "${MEMORY_MIB}" --cpu "${CPUS}" --disk "${SERVICE_DISK_GIB}" >/dev/null
 await_marker "${SERVICE_NAME}" "HEARTH_AGENT_PROBE ok boot_count=1" "${BOOT_BUDGET_S}"
+# vm-base contract: the agent user's systemd session stack (logind, session bus,
+# XDG_RUNTIME_DIR, lingering user@1000) is live at boot — before any login.
+await_marker "${SERVICE_NAME}" "HEARTH_USERSESSION ok" "${BOOT_BUDGET_S}"
 elapsed=$(( $(now_s) - start_s ))
 assert_lt "boot-to-probe under ${BOOT_BUDGET_S}s budget" "${elapsed}" "${BOOT_BUDGET_S}"
 

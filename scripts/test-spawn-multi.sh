@@ -87,6 +87,10 @@ spawn_agent "${NAME_B}"
 # 3. Both reach the readiness probe (they boot concurrently).
 await_marker "${NAME_A}" "HEARTH_AGENT_PROBE ok boot_count=1" "${BOOT_BUDGET_S}"
 await_marker "${NAME_B}" "HEARTH_AGENT_PROBE ok boot_count=1" "${BOOT_BUDGET_S}"
+# vm-base contract: each VM proves the agent user's session stack (logind,
+# session bus, XDG_RUNTIME_DIR, lingering user@1000) is live at boot.
+await_marker "${NAME_A}" "HEARTH_USERSESSION ok" "${BOOT_BUDGET_S}"
+await_marker "${NAME_B}" "HEARTH_USERSESSION ok" "${BOOT_BUDGET_S}"
 
 # 4. Read each VM's identity from status.
 addr_a="$(svc_field "${NAME_A}" .address)"

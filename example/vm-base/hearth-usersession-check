@@ -1,0 +1,50 @@
+#!/bin/sh
+# hearth-usersession-check — boot-time proof (REFACTOR_PROPOSAL.md §2 voice: every
+# line names the failure it catches) that the `agent` user's systemd *user*
+# session works before any login. A field agent hit a Hearth VM where
+# `systemctl --user`/`loginctl` were dead because logind, the session bus,
+# XDG_RUNTIME_DIR and cgroup delegation were all absent; this turns that silent
+# gap into one marker line on the serial console so `hearthctl wait --marker`
+# (and the acceptance tests) can gate on it.
+#
+# Emits EXACTLY one line to /dev/console:
+#   HEARTH_USERSESSION ok            — user@1000 active, /run/user/1000 present,
+#                                      the agent's session bus answers.
+#   HEARTH_USERSESSION fail <reason> — the first check that failed.
+#
+# Dependency-light on purpose: runuser (util-linux) + busctl/systemctl (systemd),
+# no extra packages.
+set -u
+
+uid=1000
+
+mark() {
+  # One line, to the serial console CHV wired to ttyS0 (falls back to stdout so a
+  # console-less run still records the verdict).
+  printf 'HEARTH_USERSESSION %s\n' "$1" > /dev/console 2>/dev/null \
+    || printf 'HEARTH_USERSESSION %s\n' "$1"
+}
+
+# 1. The lingering user manager must be active — it carries the delegated cgroup
+#    subtree (user@.service ships Delegate=…) the field report was missing.
+if ! systemctl is-active --quiet "user@${uid}.service"; then
+  mark "fail user@${uid}.service-inactive"
+  exit 0
+fi
+
+# 2. logind must have allocated the per-user runtime dir — this IS XDG_RUNTIME_DIR.
+if [ ! -d "/run/user/${uid}" ]; then
+  mark "fail no-XDG_RUNTIME_DIR"
+  exit 0
+fi
+
+# 3. The agent's session bus must answer — exactly what `systemctl --user` needs.
+#    runuser drops to the agent user; busctl --user derives the bus address from
+#    XDG_RUNTIME_DIR, so set it explicitly (runuser does not run pam_systemd).
+if ! runuser -u agent -- env "XDG_RUNTIME_DIR=/run/user/${uid}" \
+     busctl --user --no-pager list >/dev/null 2>&1; then
+  mark "fail session-bus-unreachable"
+  exit 0
+fi
+
+mark "ok"

@@ -41,6 +41,30 @@ FROM localhost/vm-base
 
 See `example/hermes-vm/Dockerfile` and `example/agent-vm/Dockerfile`.
 
+## User sessions
+
+Hearth VMs run autonomous agents as the `agent` user, so a full systemd **user**
+session must work for that user — both over SSH and at boot, before any login.
+`vm-base` bakes in the whole stack:
+
+- **`systemctl --user`, `loginctl`, the session bus, `XDG_RUNTIME_DIR`** all work
+  because the image installs `dbus-user-session` (the per-user session bus units)
+  and `libpam-systemd` (`pam_systemd.so`, which its `pam-auth-update` trigger
+  wires into `/etc/pam.d/common-session` so a login registers a logind session
+  and gets `/run/user/1000`), then explicitly enables `dbus.socket`,
+  `dbus.service`, and `systemd-logind.service` at boot — a `--no-install-recommends`
+  image runs no systemctl preset, so nothing enables them otherwise.
+- **Lingering is on for `agent`** (`/var/lib/systemd/linger/agent`), so
+  `user@1000.service` starts at boot with no login. Its cgroup subtree is
+  delegated (`user@.service` ships `Delegate=pids memory cpu` on Ubuntu 24.04's
+  systemd 255) — that delegation is the piece a container/VM without user-session
+  infrastructure lacks.
+- **Boot-time proof.** `hearth-usersession.service` runs after
+  `user@1000.service` and prints exactly one line to the serial console:
+  `HEARTH_USERSESSION ok` when the manager is active, `/run/user/1000` exists, and
+  the agent's session bus answers — or `HEARTH_USERSESSION fail <reason>`. The
+  acceptance tests gate on that marker with `hearthctl wait`.
+
 ## What a workload image still owns
 
 `vm-base` deliberately does **not** bake in:

@@ -1,0 +1,16 @@
+[Unit]
+Description=Verify the agent user's systemd session stack and mark it on the console
+# Only meaningful once the stack it checks is up: logind allocates /run/user/1000
+# and the lingering user manager (whose Delegate= subtree is the cgroup delegation
+# the field report lacked) is running. Wants= pulls user@1000.service into the
+# boot transaction so the ordering is deterministic, not linger-timing luck.
+After=multi-user.target systemd-logind.service user@1000.service
+Wants=user@1000.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hearth-usersession-check
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

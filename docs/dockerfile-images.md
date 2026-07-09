@@ -118,6 +118,25 @@ Rebuilding the kernel is only needed to bump the pinned version (edit the
 `KERNEL_VERSION`/`KERNEL_SHA256` constants in the script) — never for a host
 kernel change, since the guest kernel is fully self-contained.
 
+## User sessions
+
+Hearth VMs run autonomous agents as the `agent` user, so the guest contract
+includes a working systemd **user** session for that user — over SSH and at boot,
+before any login. Every image built on `example/vm-base` gets it: `systemctl
+--user`, `loginctl`, the per-user session bus, and `XDG_RUNTIME_DIR`
+(`/run/user/1000`) all work, and lingering is enabled for `agent` so
+`user@1000.service` (with its delegated cgroup subtree) is up at boot with no
+login. The pieces — `dbus-user-session`, `libpam-systemd`, an explicitly enabled
+system bus + logind, and the `agent` linger stamp — and why each is present live
+in `example/vm-base/README.md`.
+
+The boot-time proof is a single marker on the serial console:
+`HEARTH_USERSESSION ok` (or `HEARTH_USERSESSION fail <reason>`), emitted by
+`hearth-usersession.service` once the manager is active, `/run/user/1000` exists,
+and the agent's session bus answers. The acceptance tests below gate on it with
+`hearthctl wait`, and `hearthctl image build`'s linter warns at build time if
+dbus is not enabled or `pam_systemd.so` is missing from the rootfs.
+
 ## Agent VM Acceptance Test
 
 The repository includes a stripped-down agent VM fixture at
@@ -131,6 +150,9 @@ The fixture proves:
 - `/` is an ext4 root disk.
 - systemd-networkd gets a default route through Hearth networking.
 - the `agent` user exists and has passwordless sudo.
+- the `agent` user has a working systemd user session at boot — logind, the
+  session bus, `XDG_RUNTIME_DIR`, and lingering `user@1000` — proven by the
+  `HEARTH_USERSESSION ok` marker on the serial console.
 - common agent tools are present: `git`, `curl`, `jq`, and `python3`.
 - guest state persists across stop/start through a boot counter on the root
   disk.
