@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes VM serial-log probe
+After=hermes.service systemd-networkd.service
+Wants=hermes.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hermes-probe
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

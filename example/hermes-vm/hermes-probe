@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > >(tee -a /dev/ttyS0) 2>&1
+
+echo "HERMES_PROBE start"
+
+for _ in $(seq 1 90); do
+  if curl -s -o /dev/null http://127.0.0.1:9119/; then
+    addr=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    echo "HERMES_PROBE ok port=9119 addr=${addr:-unknown}"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "HERMES_PROBE fail port=9119"
+journalctl -u hermes.service --no-pager | tail -n 40 || true
+exit 1

@@ -40,7 +40,7 @@ pub fn meta_data(service: &Service) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{CloudInit, RestartPolicy, Service};
+    use crate::registry::{CloudInit, Provision, RestartPolicy, Service};
 
     fn service_with_keys(keys: Vec<&str>) -> Service {
         Service {
@@ -53,11 +53,14 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:00:00:01".into(),
             is_agent_in_charge: false,
+            disk: None,
+            publish: Vec::new(),
             cloud_init: CloudInit {
                 hostname: "web".into(),
                 ssh_keys: keys.into_iter().map(str::to_owned).collect(),
                 user: "agent".into(),
             },
+            provision: Provision::default(),
             restart: RestartPolicy::default(),
         }
     }

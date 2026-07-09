@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes VM boot-time network diagnostic
+After=network.target systemd-networkd.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netdiag
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Boot-time network diagnostic: dumps guest network state to the serial console
+# so we can see it in `hearthctl logs`. Safe to remove once networking is solid.
+set +e
+exec > >(tee -a /dev/ttyS0) 2>&1
+
+sleep 8
+echo "NETDIAG start"
+echo "--- systemd-udevd active? ---"; systemctl is-active systemd-udevd 2>&1
+echo "--- ip -br link ---";  ip -br link
+echo "--- ip -br addr ---";  ip -br addr
+echo "--- ip route ---";     ip route
+echo "--- net iface MACs ---"; for n in /sys/class/net/*/address; do echo "$(dirname "$n" | xargs basename) $(cat "$n")"; done
+echo "--- networkctl ---";   networkctl --no-pager 2>&1
+echo "--- resolv.conf ---"; cat /etc/resolv.conf 2>&1
+echo "--- outbound by IP (ping 8.8.8.8 = NAT/forwarding) ---"; ping -c1 -W3 8.8.8.8 2>&1 | tail -2
+echo "--- outbound TCP by IP (curl https 1.1.1.1) ---"; curl -s -o /dev/null -w "curl HTTP %{http_code}\n" --max-time 8 https://1.1.1.1 2>&1 || echo "curl-by-ip FAILED"
+echo "--- DNS resolve (getent hosts github.com) ---"; getent hosts github.com 2>&1 || echo "resolve FAILED"
+echo "--- outbound by NAME (curl https github.com) ---"; curl -s -o /dev/null -w "curl HTTP %{http_code}\n" --max-time 10 https://github.com 2>&1 || echo "curl-by-name FAILED"
+echo "NETDIAG end"

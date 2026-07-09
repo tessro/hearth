@@ -1,18 +1,28 @@
 [Unit]
 Description=Hearth VM management daemon
+Documentation=file:/usr/local/share/doc/hearth/operations.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
+# Firmware default in Config is /usr/share/hypervisor-fw/CLOUDHV.fd; `make
+# firmware` installs it here instead, so point hearthd at that path.
 Environment=HEARTH_FIRMWARE=/var/lib/hearth/firmware/CLOUDHV.fd
-Environment=PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+# Distro-generic PATH. hearthd shells out to cloud-hypervisor, qemu-img, nft,
+# dnsmasq, and systemctl; a release install commonly drops cloud-hypervisor in
+# /usr/local/bin. The guest-kernel default
+# (/var/lib/hearth/kernels/current/vmlinux) needs no override.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/hearthd
 Restart=on-failure
+RestartSec=2
 RuntimeDirectory=hearth
 RuntimeDirectoryMode=0770
 StateDirectory=hearth
 LogsDirectory=hearth
+# hearthd shuts each VM down with ACPI and waits up to 30s per VM; give the unit
+# room to stop cleanly before systemd escalates.
 TimeoutStopSec=120s
 
 [Install]

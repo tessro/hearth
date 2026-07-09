@@ -1,4 +1,6 @@
-use crate::{config::Config, error::coded, image::ImageMetadata, registry::Service};
+use crate::{
+    config::Config, error::coded, image::ImageMetadata, provision::ProvisionPlan, registry::Service,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use camino::Utf8Path;
@@ -11,6 +13,30 @@ use tokio::{
     process::Command,
     time::{sleep, timeout, Duration, Instant},
 };
+
+/// On-disk format of a per-VM disk. docker-rootfs VMs use sparse raw (loop-
+/// mountable for provisioning, and CHV's qcow2 reader rejects backing chains);
+/// cloud images keep qcow2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskFormat {
+    Qcow2,
+    Raw,
+}
+
+impl DiskFormat {
+    /// The `-O` argument for `qemu-img convert`.
+    pub fn qemu_output(&self) -> &'static str {
+        match self {
+            DiskFormat::Qcow2 => "qcow2",
+            DiskFormat::Raw => "raw",
+        }
+    }
+
+    /// The per-VM disk filename extension.
+    pub fn extension(&self) -> &'static str {
+        self.qemu_output()
+    }
+}
 
 #[async_trait]
 pub trait Host: Send + Sync {
@@ -33,7 +59,11 @@ pub trait Host: Send + Sync {
         backing: &Utf8Path,
         disk: &Utf8Path,
         disk_gib: u64,
+        format: DiskFormat,
     ) -> Result<()>;
+    /// Loop-mount a raw per-VM disk and apply `plan`, then unmount. Docker-rootfs
+    /// only; called once at create time.
+    async fn provision_disk(&self, disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()>;
     async fn cloud_localds(
         &self,
         seed: &Utf8Path,
@@ -44,6 +74,13 @@ pub trait Host: Send + Sync {
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value>;
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool>;
     async fn delete_tap(&self, tap: &str) -> Result<()>;
+    /// Apply an nftables ruleset via `nft -f -` (stdin). The daemon feeds a full
+    /// `add table` + `flush table` + rules transaction, so this is an idempotent
+    /// rewrite of the `hearth_nat` table (REFACTOR_PROPOSAL.md §4.3).
+    async fn nft_apply(&self, ruleset: &str) -> Result<()>;
+    /// SIGHUP dnsmasq so it re-reads its drop-in dir (REFACTOR_PROPOSAL.md §4.2).
+    /// Errs if the unit does not exist; callers warn-and-continue.
+    async fn reload_dnsmasq(&self) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -100,19 +137,21 @@ impl Host for RealHost {
         backing: &Utf8Path,
         disk: &Utf8Path,
         disk_gib: u64,
+        format: DiskFormat,
     ) -> Result<()> {
         if let Some(parent) = disk.parent() {
             fs::create_dir_all(parent).await?;
         }
         // CHV's qcow2 reader rejects any backing chain, so copy the base image
-        // into a standalone per-VM disk and grow it to the requested size.
+        // into a standalone per-VM disk and grow it to the requested size. Raw
+        // stays sparse and is loop-mountable for provisioning.
         let mut convert = Command::new("qemu-img");
         convert.args([
             "convert",
             "-f",
             "qcow2",
             "-O",
-            "qcow2",
+            format.qemu_output(),
             backing.as_str(),
             disk.as_str(),
         ]);
@@ -120,6 +159,29 @@ impl Host for RealHost {
         let mut resize = Command::new("qemu-img");
         resize.args(["resize", disk.as_str(), &format!("{disk_gib}G")]);
         run_status(resize, "qemu-img resize").await
+    }
+
+    async fn provision_disk(&self, disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()> {
+        let tmp = tempfile::tempdir()
+            .map_err(|e| coded("provision.mount_failed", format!("create mount dir: {e}")))?;
+        let mount_point = Utf8Path::from_path(tmp.path())
+            .ok_or_else(|| coded("provision.mount_failed", "non-utf8 mount path"))?;
+        // The rootfs is a bare whole-device ext4 (no partition table), so a plain
+        // loop mount of the raw disk works.
+        let mut mount = Command::new("mount");
+        mount.args(["-o", "loop", disk.as_str(), mount_point.as_str()]);
+        run_status(mount, "mount -o loop")
+            .await
+            .map_err(|e| coded("provision.mount_failed", format!("{e:#}")))?;
+        // Apply, then unmount regardless of the result (finally pattern): never
+        // leave the loop device attached on an apply failure.
+        let applied = crate::provision::apply_to_root(mount_point, plan).await;
+        let mut umount = Command::new("umount");
+        umount.arg(mount_point.as_str());
+        let unmounted = run_status(umount, "umount").await;
+        applied.map_err(|e| coded("provision.apply_failed", format!("{e:#}")))?;
+        unmounted.map_err(|e| coded("provision.unmount_failed", format!("{e:#}")))?;
+        Ok(())
     }
 
     async fn cloud_localds(
@@ -150,6 +212,37 @@ impl Host for RealHost {
 
     async fn delete_tap(&self, tap: &str) -> Result<()> {
         delete_tap_device(tap).await
+    }
+
+    async fn nft_apply(&self, ruleset: &str) -> Result<()> {
+        let mut child = Command::new("nft")
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn nft -f -")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("nft stdin unavailable"))?;
+        stdin.write_all(ruleset.as_bytes()).await?;
+        drop(stdin); // close stdin so nft sees EOF and applies the transaction
+        let output = child.wait_with_output().await.context("wait nft -f -")?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "nft -f - failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    async fn reload_dnsmasq(&self) -> Result<()> {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(["kill", "-s", "HUP", "dnsmasq.service"]);
+        run_status(cmd, "systemctl kill -s HUP dnsmasq.service").await
     }
 }
 
@@ -197,7 +290,7 @@ fn cloud_image_argv(cfg: &Config, service: &Service) -> Vec<String> {
         "--kernel".to_string(),
         cfg.firmware.to_string(),
         "--disk".to_string(),
-        format!("path={}", cfg.disk_path(&service.name)),
+        format!("path={}", cfg.disk_path(service)),
         "--disk".to_string(),
         format!("path={},readonly=on", cfg.seed_path(&service.name)),
         "--net".to_string(),
@@ -233,7 +326,7 @@ fn docker_rootfs_argv(
     }
     args.extend([
         "--disk".to_string(),
-        format!("path={}", cfg.disk_path(&service.name)),
+        format!("path={}", cfg.disk_path(service)),
         "--cmdline".to_string(),
         docker_rootfs_cmdline(manifest),
         "--net".to_string(),
@@ -400,6 +493,69 @@ pub fn unit_name(name: &str) -> String {
     format!("hearth-vm-{name}.service")
 }
 
+/// Parse the `argv[]=` segment of a systemd `ExecStart` property value (as
+/// printed by `systemctl show -p ExecStart --value <unit>`) into its argument
+/// vector. The property looks like:
+/// `{ path=/usr/bin/cloud-hypervisor ; argv[]=cloud-hypervisor --api-socket ... ; ignore_errors=no ; ... }`
+/// Returns `None` when there is no `argv[]=` segment to read.
+pub fn parse_execstart_argv(execstart: &str) -> Option<Vec<String>> {
+    let start = execstart.find("argv[]=")? + "argv[]=".len();
+    let rest = &execstart[start..];
+    // The argv segment ends at the next " ; " systemd field separator.
+    let segment = rest.split(" ; ").next().unwrap_or(rest);
+    let argv = split_execstart_args(segment);
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
+/// Split a systemd `argv[]` segment into arguments, honoring the double quotes
+/// systemd wraps around any argument containing whitespace (our `--cmdline`
+/// value is the one that needs it). Quotes are stripped so the result
+/// space-joins back to the plain command line `cloud_hypervisor_argv` builds.
+fn split_execstart_args(segment: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for ch in segment.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            ws if ws.is_whitespace() && !in_quotes => {
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            other => {
+                current.push(other);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+/// Compare the argv systemd recorded for a running unit against the argv we
+/// would launch now. `Some(true)` = current, `Some(false)` = drifted, `None` =
+/// couldn't determine (no parseable argv, or a resumed snapshot whose
+/// `--restore` command line never matches a fresh boot).
+pub fn boot_config_status(execstart: &str, expected_argv: &[String]) -> Option<bool> {
+    let running = parse_execstart_argv(execstart)?;
+    if running.iter().any(|arg| arg == "--restore") {
+        return None;
+    }
+    Some(running.join(" ") == expected_argv.join(" "))
+}
+
 /// Tap device name for a service. Linux interface names are capped at 15 bytes.
 pub fn tap_name(name: &str) -> String {
     let simple = format!("hrt-{name}");
@@ -489,5 +645,51 @@ mod tests {
 
         assert!(tap.len() <= 15);
         assert!(tap.starts_with("hrt-http-"));
+    }
+
+    #[test]
+    fn parses_argv_from_real_execstart_including_quoted_cmdline() {
+        // Shape and quoting as produced by `systemctl show -p ExecStart --value`:
+        // the space-containing `--cmdline` value is double-quoted by systemd.
+        let execstart = "{ path=/usr/bin/cloud-hypervisor ; argv[]=cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --kernel /var/lib/hearth/kernels/current/vmlinux --disk path=/var/lib/hearth/disks/mail.qcow2 --cmdline \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init\" --net tap=hrt-mail,mac=52:54:00:12:34:56 ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
+        let argv = parse_execstart_argv(execstart).unwrap();
+        assert_eq!(argv[0], "cloud-hypervisor");
+        assert_eq!(argv[1], "--api-socket");
+        // The quoted, space-containing cmdline resolves to a single argument.
+        assert!(argv.contains(
+            &"console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init".to_string()
+        ));
+        assert_eq!(argv.last().unwrap(), "tap=hrt-mail,mac=52:54:00:12:34:56");
+    }
+
+    #[test]
+    fn parse_returns_none_without_an_argv_segment() {
+        assert!(parse_execstart_argv("{ path=/usr/bin/cloud-hypervisor }").is_none());
+        assert!(parse_execstart_argv("").is_none());
+    }
+
+    #[test]
+    fn boot_config_status_matches_and_detects_drift() {
+        let expected: Vec<String> = [
+            "cloud-hypervisor",
+            "--api-socket",
+            "/run/hearth/vms/mail.sock",
+            "--cmdline",
+            "console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let current = "{ path=/x ; argv[]=cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --cmdline \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init\" ; ignore_errors=no }";
+        assert_eq!(boot_config_status(current, &expected), Some(true));
+        let drifted = "{ path=/x ; argv[]=cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --kernel /old/vmlinux ; ignore_errors=no }";
+        assert_eq!(boot_config_status(drifted, &expected), Some(false));
+    }
+
+    #[test]
+    fn boot_config_status_ignores_resumed_snapshots() {
+        let expected = vec!["cloud-hypervisor".to_string()];
+        let restored = "{ path=/x ; argv[]=cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --restore source_url=file:///snap/mail/before,resume=true ; ignore_errors=no }";
+        assert_eq!(boot_config_status(restored, &expected), None);
     }
 }

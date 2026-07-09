@@ -1,0 +1,15 @@
+[Unit]
+Description=Generate SSH host keys before sshd if absent
+# §3 provisioning removes /etc/ssh/ssh_host_* so each spawned VM gets unique
+# host keys instead of the cloned pair baked into the shared image. Regenerate
+# them here, ordered before sshd, and skip the work when keys already exist.
+Before=ssh.service
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

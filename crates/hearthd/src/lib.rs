@@ -3,16 +3,25 @@ pub mod config;
 pub mod error;
 pub mod host;
 pub mod image;
+pub mod net;
 pub mod notify;
+pub mod provision;
 pub mod registry;
 pub mod vsock;
 
 use crate::{
     config::Config,
     error::{code_of, coded},
-    host::{sanitize_image_name, unit_name, wait_for_inactive, Host},
+    host::{
+        boot_config_status, cloud_hypervisor_argv, sanitize_image_name, unit_name,
+        wait_for_inactive, DiskFormat, Host,
+    },
     image::ImageMetadata,
-    registry::{validate_name, Allocations, CloudInit, Registry, RestartPolicy, Service},
+    net::PublishTarget,
+    provision::ProvisionPlan,
+    registry::{
+        validate_name, Allocations, CloudInit, Provision, Publish, Registry, RestartPolicy, Service,
+    },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
@@ -191,7 +200,11 @@ impl<H: Host + 'static> Daemon<H> {
 
     async fn dispatch(&self, req: Request) -> Result<Dispatch> {
         match req.verb {
-            Verb::Ping => Ok(Dispatch::One(json!({"pong": true}))),
+            Verb::Ping => Ok(Dispatch::One(json!({
+                "pong": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "pid": std::process::id(),
+            }))),
             Verb::Version => Ok(Dispatch::One(version_result(env!("CARGO_PKG_VERSION")))),
             Verb::Ls => self.ls().await.map(Dispatch::One),
             Verb::Status => self
@@ -256,10 +269,12 @@ impl<H: Host + 'static> Daemon<H> {
 
     async fn ls(&self) -> Result<Value> {
         let reg = self.registry().await?;
+        let leases = self.load_leases().await;
         let mut services = Vec::new();
         for svc in reg.services.values() {
             let running = self.is_running(&svc.name).await;
-            services.push(service_summary(svc, running));
+            let address = resolved_address(&reg, &leases, svc);
+            services.push(service_summary(svc, running, address.map(|(ip, _)| ip)));
         }
         Ok(json!({ "services": services }))
     }
@@ -269,6 +284,22 @@ impl<H: Host + 'static> Daemon<H> {
         let svc = reg.get(name)?;
         let running = self.is_running(name).await;
         let mut value = serde_json::to_value(svc)?;
+        // Never echo provisioning literal contents back: replace the serialized
+        // provision block with a redacted summary (dest/mode/owner + flags).
+        value["provision"] = svc.provision.redacted_summary();
+        // Always surface publishes (even when empty) and the guest address.
+        value["publish"] = json!(svc.publish);
+        let leases = self.load_leases().await;
+        value["static_lease"] = json!(reg.allocations.ips.contains_key(name));
+        match resolved_address(&reg, &leases, svc) {
+            Some((ip, source)) => {
+                value["address"] = json!(ip);
+                value["address_source"] = json!(source);
+            }
+            None => {
+                value["address"] = Value::Null;
+            }
+        }
         value["running"] = json!(running);
         if running {
             if let Ok(info) = self
@@ -277,6 +308,9 @@ impl<H: Host + 'static> Daemon<H> {
                 .await
             {
                 value["runtime"] = info;
+            }
+            if let Some(state) = boot_config_state(&self.cfg, self.host.as_ref(), svc).await {
+                value["boot_config"] = json!(state);
             }
         }
         Ok(value)
@@ -312,6 +346,7 @@ impl<H: Host + 'static> Daemon<H> {
             ));
         }
         let image_metadata = image::load(&self.cfg, &image).await?;
+        let is_docker = matches!(image_metadata, ImageMetadata::DockerRootfs(_));
         let is_agent_in_charge = optional_bool(&args, "is_agent_in_charge").unwrap_or(false);
         if is_agent_in_charge && reg.services.values().any(|svc| svc.is_agent_in_charge) {
             return Err(coded(
@@ -319,7 +354,70 @@ impl<H: Host + 'static> Daemon<H> {
                 "at most one service may set is_agent_in_charge = true",
             ));
         }
-        let (vsock_cid, mac) = reg.allocate(name);
+
+        // Provisioning args mirror the [provision] TOML shape; the CLI has
+        // already resolved any client-side files into `from_literal` content.
+        let mut provisioning = match args.get("provision") {
+            Some(value) => serde_json::from_value::<Provision>(value.clone())
+                .map_err(|e| coded("provision.invalid", format!("invalid provision args: {e}")))?,
+            None => Provision::default(),
+        };
+        let hostname_arg = optional_str(&args, "hostname").map(str::to_string);
+        // Provisioning is docker-rootfs only; cloud images keep cloud-init.
+        let wants_provision = !provisioning.files.is_empty()
+            || provisioning.reset_ssh_hostkeys
+            || !provisioning.hostname.is_empty();
+        if !is_docker && wants_provision {
+            return Err(coded(
+                "provision.unsupported_image",
+                format!(
+                    "service {name} uses a cloud image; per-service provisioning is only \
+                     supported for docker-rootfs images (cloud images use cloud-init)"
+                ),
+            ));
+        }
+        // Resolve the hostname: an explicit --hostname wins, then a hostname set
+        // inside the provision block, then the service name.
+        let hostname = hostname_arg
+            .clone()
+            .filter(|h| !h.is_empty())
+            .or_else(|| Some(provisioning.hostname.clone()).filter(|h| !h.is_empty()))
+            .unwrap_or_else(|| name.to_string());
+        let plan = if is_docker {
+            provisioning.hostname = hostname.clone();
+            // Build (and validate) the plan before any disk work so bad
+            // provision args fail with no side effects.
+            Some(
+                ProvisionPlan::from_provision(&provisioning)
+                    .map_err(|e| coded("provision.invalid", format!("{e:#}")))?,
+            )
+        } else {
+            // Cloud images do not persist a provision block.
+            provisioning = Provision::default();
+            None
+        };
+
+        // Managed publishes mirror the [[publish]] TOML shape. Validate every
+        // entry before any disk work so bad ports/protocols fail cleanly.
+        let publish = match args.get("publish") {
+            Some(value) => serde_json::from_value::<Vec<Publish>>(value.clone())
+                .map_err(|e| coded("publish.invalid", format!("invalid publish args: {e}")))?,
+            None => Vec::new(),
+        };
+        for entry in &publish {
+            entry
+                .validate()
+                .map_err(|e| coded("publish.invalid", format!("{e:#}")))?;
+        }
+
+        let (vsock_cid, mac, static_ip) =
+            reg.allocate(name, self.cfg.dhcp_static_start, self.cfg.dhcp_static_count);
+        let disk_format = if is_docker {
+            DiskFormat::Raw
+        } else {
+            DiskFormat::Qcow2
+        };
+        let disk_filename = format!("{name}.{}", disk_format.extension());
         let svc = Service {
             name: name.to_string(),
             enabled: false,
@@ -330,18 +428,21 @@ impl<H: Host + 'static> Daemon<H> {
             vsock_cid,
             mac,
             is_agent_in_charge,
+            disk: Some(disk_filename.clone()),
+            publish,
             cloud_init: CloudInit {
-                hostname: name.to_string(),
+                hostname: hostname.clone(),
                 ssh_keys: optional_array_str(&args, "ssh_keys"),
                 user: optional_str(&args, "user").unwrap_or("agent").to_string(),
             },
+            provision: provisioning,
             restart: RestartPolicy::default(),
         };
-        let disk_path = self.cfg.disk_path(name);
+        let disk_path = self.cfg.disks_dir.join(&disk_filename);
         let seed_path = self.cfg.seed_path(name);
         if let Err(err) = self
             .host
-            .qemu_img_create(&image_path, &disk_path, disk_gib)
+            .qemu_img_create(&image_path, &disk_path, disk_gib, disk_format)
             .await
         {
             reg.free(name);
@@ -365,6 +466,15 @@ impl<H: Host + 'static> Daemon<H> {
                 return Err(err);
             }
         }
+        // Provision the per-VM disk once, before the registry write. On failure,
+        // clean up exactly like the other create() error paths.
+        if let Some(plan) = &plan {
+            if let Err(err) = self.host.provision_disk(&disk_path, plan).await {
+                let _ = remove_path_file(disk_path).await;
+                reg.free(name);
+                return Err(err);
+            }
+        }
         if let Err(err) = Registry::write_allocations(&self.cfg, &reg.allocations).await {
             let _ = remove_path_file(disk_path).await;
             let _ = remove_path_file(seed_path).await;
@@ -377,7 +487,18 @@ impl<H: Host + 'static> Daemon<H> {
             let _ = Registry::write_allocations(&self.cfg, &reg.allocations).await;
             return Err(err);
         }
-        Ok(json!({ "created": service_summary(&svc, false) }))
+        // Register the static lease and (re)apply the NAT table. Neither failing
+        // should undo a created service: reconcile re-writes missing drop-ins and
+        // re-applies the table on the next daemon start (self-healing), so these
+        // warn-and-continue.
+        reg.services.insert(name.to_string(), svc.clone());
+        if let Some(ip) = &static_ip {
+            if let Err(err) = self.write_dnsmasq_dropin(name, &svc.mac, ip).await {
+                warn!(service = %name, error = %err, "failed to write dnsmasq drop-in; reconcile will retry");
+            }
+        }
+        self.rewrite_nat(&reg).await;
+        Ok(json!({ "created": service_summary(&svc, false, static_ip) }))
     }
 
     async fn start(&self, name: &str) -> Result<Value> {
@@ -390,6 +511,7 @@ impl<H: Host + 'static> Daemon<H> {
         let mut svc = reg.get(name)?.clone();
         if !self.is_running(name).await {
             let image_metadata = image::load(&self.cfg, &svc.image).await?;
+            validate_boot_prerequisites(&self.cfg, &image_metadata).await?;
             self.host
                 .systemd_run_vm(&self.cfg, &svc, &image_metadata)
                 .await?;
@@ -400,6 +522,9 @@ impl<H: Host + 'static> Daemon<H> {
         svc.enabled = true;
         Registry::write_service(&self.cfg, &svc).await?;
         reg.services.insert(name.to_string(), svc);
+        // Re-apply the NAT table: the VM may have just picked up a lease, and its
+        // publishes must be routed now that it is running.
+        self.rewrite_nat(&reg).await;
         self.status(name).await
     }
 
@@ -451,6 +576,7 @@ impl<H: Host + 'static> Daemon<H> {
         }
         svc.enabled = false;
         Registry::write_service(&self.cfg, &svc).await?;
+        self.rewrite_nat(&reg).await;
         Ok(json!({ "name": name, "running": false, "enabled": false }))
     }
 
@@ -470,14 +596,24 @@ impl<H: Host + 'static> Daemon<H> {
         self.stop_unlocked(name).await?;
         let _registry_guard = self.registry_lock.lock().await;
         let mut reg = self.registry().await?;
-        remove_path_file(self.cfg.disk_path(name)).await?;
+        // The per-VM disk is raw (docker-rootfs) or qcow2 (cloud image / legacy
+        // services). Remove whichever exists.
+        remove_path_file(self.cfg.disk_path_ext(name, "raw")).await?;
+        remove_path_file(self.cfg.disk_path_ext(name, "qcow2")).await?;
         remove_path_file(self.cfg.seed_path(name)).await?;
         remove_path_file(self.cfg.console_path(name)).await?;
         remove_path_dir(self.cfg.snapshots_dir.join(name)).await?;
         self.host.delete_tap(&host::tap_name(name)).await?;
         Registry::remove_service(&self.cfg, name).await?;
         reg.free(name);
+        reg.services.remove(name);
         Registry::write_allocations(&self.cfg, &reg.allocations).await?;
+        // Drop the static-lease drop-in and re-apply the NAT table without this
+        // service's rules.
+        if let Err(err) = self.remove_dnsmasq_dropin(name).await {
+            warn!(service = %name, error = %err, "failed to remove dnsmasq drop-in");
+        }
+        self.rewrite_nat(&reg).await;
         Ok(json!({ "destroyed": name }))
     }
 
@@ -520,6 +656,11 @@ impl<H: Host + 'static> Daemon<H> {
             .await?;
         svc.enabled = true;
         Registry::write_service(&self.cfg, &svc).await?;
+        // Re-apply the NAT table (mirror start_unlocked): the resumed guest may
+        // have come up on a different lease than it held before the stop above,
+        // so its publishes' DNAT rules must point at the current address.
+        let reg = self.registry().await?;
+        self.rewrite_nat(&reg).await;
         Ok(json!({ "name": name, "tag": tag, "restored": true }))
     }
 
@@ -758,6 +899,7 @@ impl<H: Host + 'static> Daemon<H> {
             check_path("run_dir", &self.cfg.run_dir, true),
             check_path("log_dir", &self.cfg.log_dir, true),
             check_path("firmware", &self.cfg.firmware, false),
+            check_path("guest_kernel", &self.cfg.guest_kernel, false),
             check_path("kvm_device", &Utf8PathBuf::from("/dev/kvm"), false),
             check_path(
                 "bridge",
@@ -768,6 +910,7 @@ impl<H: Host + 'static> Daemon<H> {
             check_command("qemu-img"),
             check_command("cloud-localds"),
             check_command("socat"),
+            check_command("nft"),
             check_kernel_module("kvm").await?,
             check_kernel_module("vhost_vsock").await?,
         ];
@@ -781,6 +924,63 @@ impl<H: Host + 'static> Daemon<H> {
             .await
             .map(|s| s.trim() == "active")
             .unwrap_or(false)
+    }
+
+    /// Read + parse the dnsmasq lease file. A missing/unreadable file yields no
+    /// leases (never an error): the address is simply reported as null.
+    async fn load_leases(&self) -> Vec<net::Lease> {
+        read_leases(&self.cfg).await
+    }
+
+    /// Fully rewrite the `hearth_nat` nftables table from the registry (every
+    /// service's publishes joined to its resolved address). Idempotent — the
+    /// same wholesale-rewrite pattern as tap setup — so it is safe to call on
+    /// create/start/stop/destroy/reconcile. Failures warn and continue: an
+    /// unreachable published port is not a reason to fail the whole operation.
+    async fn rewrite_nat(&self, reg: &Registry) {
+        apply_nat(&self.cfg, self.host.as_ref(), reg).await
+    }
+
+    /// Write the dnsmasq static-lease drop-in for a service and SIGHUP dnsmasq.
+    /// If the drop-in dir is absent (dev host without a managed dnsmasq), warn
+    /// and skip — the VM still works with dynamic DHCP.
+    async fn write_dnsmasq_dropin(&self, name: &str, mac: &str, ip: &str) -> Result<()> {
+        let dir = &self.cfg.dnsmasq_dropin_dir;
+        if !dir.exists() {
+            warn!(
+                service = %name,
+                dir = %dir,
+                "dnsmasq drop-in dir absent; skipping static lease (dynamic DHCP still works)"
+            );
+            return Ok(());
+        }
+        let path = dir.join(format!("{name}.conf"));
+        fs::write(&path, net::dhcp_host_line(mac, ip))
+            .await
+            .with_context(|| format!("write dnsmasq drop-in {path}"))?;
+        self.reload_dnsmasq(name).await;
+        Ok(())
+    }
+
+    /// Remove a service's dnsmasq drop-in and SIGHUP dnsmasq if one existed.
+    async fn remove_dnsmasq_dropin(&self, name: &str) -> Result<()> {
+        let path = self.cfg.dnsmasq_dropin_dir.join(format!("{name}.conf"));
+        let existed = path.exists();
+        remove_path_file(path).await?;
+        if existed {
+            self.reload_dnsmasq(name).await;
+        }
+        Ok(())
+    }
+
+    async fn reload_dnsmasq(&self, name: &str) {
+        if let Err(err) = self.host.reload_dnsmasq().await {
+            warn!(
+                service = %name,
+                error = %err,
+                "failed to SIGHUP dnsmasq (unit may not exist); the static lease applies on the next dnsmasq restart"
+            );
+        }
     }
 
     async fn stream_log(
@@ -841,7 +1041,7 @@ async fn write_response(write: &mut OwnedWriteHalf, response: &Response) -> Resu
     Ok(())
 }
 
-fn service_summary(svc: &Service, running: bool) -> Value {
+fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Value {
     json!({
         "name": svc.name,
         "enabled": svc.enabled,
@@ -852,6 +1052,7 @@ fn service_summary(svc: &Service, running: bool) -> Value {
         "disk_gib": svc.disk_gib,
         "vsock_cid": svc.vsock_cid,
         "mac": svc.mac,
+        "address": address,
         "is_agent_in_charge": svc.is_agent_in_charge,
     })
 }
@@ -1046,6 +1247,178 @@ fn set_socket_permissions(path: &camino::Utf8Path) -> Result<()> {
     Ok(())
 }
 
+/// Fail fast, daemon-side and before CHV is spawned, if a docker-rootfs image
+/// cannot boot with the configured guest kernel. A clear `start` error beats a
+/// kernel panic (`Unable to mount root fs`) or a busybox shell on serial. Cloud
+/// images boot firmware and skip this. Lives here (not in RealHost) so FakeHost
+/// tests exercise it.
+pub async fn validate_boot_prerequisites(cfg: &Config, image: &ImageMetadata) -> Result<()> {
+    let ImageMetadata::DockerRootfs(manifest) = image else {
+        return Ok(());
+    };
+    if !cfg.guest_kernel.exists() {
+        return Err(coded(
+            "kernel.not_found",
+            format!(
+                "guest kernel not found at {}; build it with scripts/build-guest-kernel.sh",
+                cfg.guest_kernel
+            ),
+        ));
+    }
+    if let Some(initramfs) = &cfg.guest_initramfs {
+        if !initramfs.exists() {
+            return Err(coded(
+                "initramfs.not_found",
+                format!(
+                    "guest initramfs not found at {initramfs}; build it or unset --guest-initramfs (the vanilla guest kernel needs none)"
+                ),
+            ));
+        }
+    }
+    let kernel_contract = read_kernel_contract(&cfg.guest_kernel).await?;
+    if !image::kernel_contract_satisfies(manifest.min_kernel_contract, kernel_contract) {
+        return Err(coded(
+            "kernel.contract_too_old",
+            format!(
+                "image requires guest kernel contract {} but {} provides contract {}; rebuild with scripts/build-guest-kernel.sh",
+                manifest.min_kernel_contract, cfg.guest_kernel, kernel_contract
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the guest kernel's contract number: canonicalize the (possibly
+/// `current`-symlinked) kernel path and read the `contract` file next to it. A
+/// missing contract file means contract 1 (see `image::parse_kernel_contract`).
+async fn read_kernel_contract(kernel: &Utf8PathBuf) -> Result<u32> {
+    let resolved = fs::canonicalize(kernel.as_std_path())
+        .await
+        .with_context(|| format!("resolve guest kernel {kernel}"))?;
+    let contents = match resolved.parent().map(|dir| dir.join("contract")) {
+        Some(path) => match fs::read_to_string(&path).await {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("read kernel contract next to {kernel}")))
+            }
+        },
+        None => None,
+    };
+    image::parse_kernel_contract(contents.as_deref())
+}
+
+/// Boot-config drift state of a *running* service: fetch the argv systemd
+/// recorded in the transient unit's `ExecStart` and compare it to what we would
+/// launch now. `Some("current")`/`Some("stale")` when determinable, `None`
+/// (→ omitted from status; not warned in reconcile) when the image or ExecStart
+/// can't be resolved. Free function so `status` and `reconcile` share it.
+async fn boot_config_state<H: Host>(cfg: &Config, host: &H, svc: &Service) -> Option<&'static str> {
+    let image = image::load(cfg, &svc.image).await.ok()?;
+    let expected = cloud_hypervisor_argv(cfg, svc, &image);
+    let unit = unit_name(&svc.name);
+    let execstart = host
+        .systemctl(&["show", "-p", "ExecStart", "--value", &unit])
+        .await
+        .ok()?;
+    match boot_config_status(&execstart, &expected) {
+        Some(true) => Some("current"),
+        Some(false) => Some("stale"),
+        None => None,
+    }
+}
+
+/// Read + parse the dnsmasq lease file. A missing/unreadable file yields no
+/// leases (never an error). Free function so `reconcile` (no `self`) shares it.
+async fn read_leases(cfg: &Config) -> Vec<net::Lease> {
+    match fs::read_to_string(&cfg.lease_file).await {
+        Ok(text) => net::parse_leases(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Resolve a service's address: an observed lease wins (ground truth), else the
+/// static reservation (expected address). `(ip, "lease"|"static")` or `None`.
+fn resolved_address(
+    reg: &Registry,
+    leases: &[net::Lease],
+    svc: &Service,
+) -> Option<(String, &'static str)> {
+    let lease_ip = net::lease_for_mac(leases, &svc.mac).map(|l| l.ip.as_str());
+    let static_ip = reg.allocations.ips.get(&svc.name).map(|s| s.as_str());
+    net::resolve_address(lease_ip, static_ip).map(|(ip, source)| (ip.to_string(), source))
+}
+
+/// Fully rewrite the `hearth_nat` table from the registry. Shared by the
+/// per-operation path (`Daemon::rewrite_nat`) and startup reconcile. Warns and
+/// continues on any failure.
+async fn apply_nat<H: Host>(cfg: &Config, host: &H, reg: &Registry) {
+    let leases = read_leases(cfg).await;
+    let targets: Vec<PublishTarget> = reg
+        .services
+        .values()
+        .map(|svc| PublishTarget {
+            service: svc.name.clone(),
+            address: resolved_address(reg, &leases, svc).map(|(ip, _)| ip),
+            publishes: svc.publish.clone(),
+        })
+        .collect();
+    let ruleset = net::nat_ruleset(&targets);
+    for service in &ruleset.skipped {
+        warn!(
+            service = %service,
+            "service has publishes but no known address; its DNAT rules are omitted until it gets a lease"
+        );
+    }
+    if let Err(err) = host.nft_apply(&ruleset.text).await {
+        warn!(error = %err, "failed to apply nft hearth_nat table");
+    }
+}
+
+/// Re-write any static-lease drop-in that is missing from the drop-in dir (e.g.
+/// after a host reboot wiped a tmpfs-backed dir, or a config change). Returns
+/// true if any drop-in was written, so the caller SIGHUPs dnsmasq once.
+async fn rewrite_missing_dropins<H: Host>(cfg: &Config, host: &H, reg: &Registry) {
+    let dir = &cfg.dnsmasq_dropin_dir;
+    if !dir.exists() {
+        return;
+    }
+    let mut wrote_any = false;
+    for svc in reg.services.values() {
+        let Some(ip) = reg.allocations.ips.get(&svc.name) else {
+            continue;
+        };
+        let path = dir.join(format!("{}.conf", svc.name));
+        if path.exists() {
+            continue;
+        }
+        warn!(service = %svc.name, "re-writing missing dnsmasq drop-in");
+        match fs::write(&path, net::dhcp_host_line(&svc.mac, ip)).await {
+            Ok(()) => wrote_any = true,
+            Err(err) => {
+                warn!(service = %svc.name, error = %err, "failed to re-write dnsmasq drop-in")
+            }
+        }
+    }
+    if wrote_any {
+        if let Err(err) = host.reload_dnsmasq().await {
+            warn!(error = %err, "failed to SIGHUP dnsmasq during reconcile");
+        }
+    }
+}
+
+/// Bring one enabled-but-inactive service up during reconcile: load its image
+/// metadata, verify boot prerequisites, then launch the transient VM unit.
+/// Fallible so the reconcile loop can warn-and-continue instead of aborting the
+/// whole daemon on a single service whose boot cannot proceed.
+async fn start_enabled_service<H: Host>(cfg: &Config, host: &H, svc: &Service) -> Result<()> {
+    let image_metadata = image::load(cfg, &svc.image).await?;
+    validate_boot_prerequisites(cfg, &image_metadata).await?;
+    host.systemd_run_vm(cfg, svc, &image_metadata).await?;
+    Ok(())
+}
+
 pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
     let reg = Registry::load(cfg).await?;
     for svc in reg.services.values().filter(|svc| svc.enabled) {
@@ -1057,8 +1430,27 @@ pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
             .unwrap_or(false);
         if !running {
             warn!(service = %svc.name, "enabled service is not active; starting");
-            let image_metadata = image::load(cfg, &svc.image).await?;
-            host.systemd_run_vm(cfg, svc, &image_metadata).await?;
+            // Warn-and-continue like the nft/dnsmasq self-heal below. If image
+            // load, boot-prerequisite validation, or the VM launch fails (e.g.
+            // a guest kernel wiped or bumped out of contract after a reboot),
+            // one bad service must not abort reconcile: that would leave systemd
+            // crash-looping the daemon so it never binds its socket, and would
+            // skip the networking self-heal for every other service.
+            if let Err(err) = start_enabled_service(cfg, host, svc).await {
+                warn!(
+                    service = %svc.name,
+                    error = %err,
+                    "failed to start enabled service during reconcile; leaving it down for operator action"
+                );
+            }
+        } else if boot_config_state(cfg, host, svc).await == Some("stale") {
+            // The running unit was booted with flags that differ from what we
+            // would launch now (older daemon, changed kernel/cmdline). Surface
+            // it instead of silently adopting; restart stays the operator's call.
+            warn!(
+                service = %svc.name,
+                "adopting running unit booted with a stale boot config; restart to apply current flags"
+            );
         }
     }
     for entry in WalkDir::new(cfg.run_dir.join("vms"))
@@ -1079,6 +1471,11 @@ pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
             }
         }
     }
+    // Self-heal host networking that does not survive a reboot (inventory #8):
+    // runtime nft rules are gone, and a tmpfs-backed drop-in dir may be empty.
+    // Re-write missing static-lease drop-ins and re-apply the NAT table.
+    rewrite_missing_dropins(cfg, host, &reg).await;
+    apply_nat(cfg, host, &reg).await;
     Ok(())
 }
 
@@ -1106,8 +1503,10 @@ pub async fn ensure_dirs(cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::host::Host;
-    use crate::host::{cloud_hypervisor_argv, cloud_hypervisor_restore_argv};
+    use crate::host::cloud_hypervisor_restore_argv;
+    use crate::host::DiskFormat;
     use crate::image::ImageMetadata;
+    use crate::provision::ProvisionPlan;
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8Path;
@@ -1127,7 +1526,10 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
             is_agent_in_charge: false,
+            disk: None,
+            publish: Vec::new(),
             cloud_init: CloudInit::default(),
+            provision: Provision::default(),
             restart: RestartPolicy::default(),
         };
         let argv = cloud_hypervisor_argv(&cfg, &svc, &ImageMetadata::CloudImage).join(" ");
@@ -1159,7 +1561,10 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
             is_agent_in_charge: false,
+            disk: Some("dev.raw".into()),
+            publish: Vec::new(),
             cloud_init: CloudInit::default(),
+            provision: Provision::default(),
             restart: RestartPolicy::default(),
         };
         let manifest = hearth_proto::ImageManifest::docker_rootfs(hearth_proto::OciProcess {
@@ -1173,7 +1578,8 @@ mod tests {
 
         assert!(argv.contains("--kernel /run/booted-system/kernel"));
         assert!(argv.contains("--initramfs /var/lib/hearth/initramfs.cpio.gz"));
-        assert!(argv.contains("--disk path=/var/lib/hearth/disks/dev.qcow2"));
+        // docker-rootfs per-VM disks are raw, and the filename must not lie.
+        assert!(argv.contains("--disk path=/var/lib/hearth/disks/dev.raw"));
         assert!(argv.contains(
             "--cmdline console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init"
         ));
@@ -1193,7 +1599,10 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
             is_agent_in_charge: false,
+            disk: None,
+            publish: Vec::new(),
             cloud_init: CloudInit::default(),
+            provision: Provision::default(),
             restart: RestartPolicy::default(),
         };
         let argv =
@@ -1268,9 +1677,10 @@ backoff_sec = 10
             root.join("allocations.toml").as_str(),
         ]);
         let mut registry = Registry::load(&cfg).await.unwrap();
-        let (cid, mac) = registry.allocate("web");
+        let (cid, mac, ip) = registry.allocate("web", "10.26.8.16".parse().unwrap(), 64);
         assert_eq!(cid, 101);
         assert_ne!(mac, "52:54:00:00:00:01");
+        assert_eq!(ip.as_deref(), Some("10.26.8.16"));
     }
 
     #[tokio::test]
@@ -1420,10 +1830,13 @@ backoff_sec = 10
 
         assert!(responses[0].ok);
         let calls = state.lock().unwrap().calls.clone();
+        // Cloud images get a qcow2 per-VM disk and a cloud-init seed, and are
+        // never provisioned via loop-mount.
         assert!(calls
             .iter()
-            .any(|call| call.starts_with("qemu-img create ")));
+            .any(|call| call.starts_with("qemu-img create ") && call.ends_with(" qcow2")));
         assert!(calls.iter().any(|call| call.starts_with("cloud-localds ")));
+        assert!(!calls.iter().any(|call| call.starts_with("provision-disk ")));
         assert!(!calls.iter().any(|call| call.starts_with("systemd-run ")));
         let registry = Registry::load(&cfg).await.unwrap();
         let web = registry.get("web").unwrap();
@@ -1431,6 +1844,7 @@ backoff_sec = 10
         assert_eq!(web.cpu, 4);
         assert_eq!(web.memory_mib, 4096);
         assert_eq!(web.disk_gib, 30);
+        assert_eq!(web.disk.as_deref(), Some("web.qcow2"));
         assert_eq!(registry.allocations.vsock_cids.get("web"), Some(&100));
         assert!(registry.allocations.macs.contains_key("web"));
     }
@@ -1464,14 +1878,638 @@ backoff_sec = 10
 
         assert!(responses[0].ok);
         let calls = state.lock().unwrap().calls.clone();
+        // docker-rootfs gets a raw per-VM disk, no cloud-init seed, and a
+        // provisioning pass (default hostname = service name, machine-id reset).
         assert!(calls
             .iter()
-            .any(|call| call.starts_with("qemu-img create ")));
+            .any(|call| call.starts_with("qemu-img create ") && call.ends_with(" raw")));
         assert!(!calls.iter().any(|call| call.starts_with("cloud-localds ")));
+        assert!(calls.iter().any(|call| {
+            call.starts_with("provision-disk ")
+                && call.contains("reset_machine_id=true")
+                && call.contains("hostname=dev")
+        }));
         let registry = Registry::load(&cfg).await.unwrap();
         let dev = registry.get("dev").unwrap();
         assert_eq!(dev.image, "exeuntu");
         assert_eq!(dev.disk_gib, 40);
+        assert_eq!(dev.disk.as_deref(), Some("dev.raw"));
+        assert_eq!(dev.provision.hostname, "dev");
+    }
+
+    #[tokio::test]
+    async fn create_docker_rootfs_applies_provision_files_and_hostname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("exeuntu"), b"base")
+            .await
+            .unwrap();
+        tokio::fs::write(cfg.image_manifest_path("exeuntu"), docker_manifest_toml())
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+        let req = Request::new(
+            "1",
+            Verb::Create,
+            Map::from_iter([
+                ("name".into(), json!("hermes")),
+                ("image".into(), json!("exeuntu")),
+                ("hostname".into(), json!("hermes-a")),
+                (
+                    "provision".into(),
+                    json!({
+                        "reset_ssh_hostkeys": true,
+                        "files": [{
+                            "from_literal": "TOKEN=secret",
+                            "dest": "/home/agent/.hermes/.env",
+                            "mode": "0600",
+                            "owner": "1000:1000"
+                        }]
+                    }),
+                ),
+            ]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
+        let calls = state.lock().unwrap().calls.clone();
+        let provision_call = calls
+            .iter()
+            .find(|call| call.starts_with("provision-disk "))
+            .expect("provision-disk call recorded");
+        assert!(provision_call.contains("/home/agent/.hermes/.env<-<literal>:0600:1000:1000"));
+        assert!(provision_call.contains("reset_ssh_hostkeys=true"));
+        assert!(provision_call.contains("hostname=hermes-a"));
+        // The literal secret must never appear in a recorded/emitted call.
+        assert!(!provision_call.contains("secret"));
+
+        // Persisted, and status redacts the literal content.
+        let registry = Registry::load(&cfg).await.unwrap();
+        let svc = registry.get("hermes").unwrap();
+        assert_eq!(svc.provision.hostname, "hermes-a");
+        assert!(svc.provision.reset_ssh_hostkeys);
+        assert_eq!(svc.provision.files.len(), 1);
+        assert_eq!(
+            svc.provision.files[0].from_literal.as_deref(),
+            Some("TOKEN=secret")
+        );
+        let status = daemon
+            .handle(Request::new("2", Verb::Status, name_args("hermes")))
+            .await;
+        let value = status[0].result.as_ref().unwrap();
+        let rendered = value["provision"].to_string();
+        assert!(rendered.contains("<literal>"));
+        assert!(!rendered.contains("TOKEN=secret"));
+    }
+
+    #[tokio::test]
+    async fn create_cloud_image_rejects_provision_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+        let req = Request::new(
+            "1",
+            Verb::Create,
+            Map::from_iter([
+                ("name".into(), json!("web")),
+                (
+                    "provision".into(),
+                    json!({
+                        "files": [{
+                            "from_literal": "x",
+                            "dest": "/etc/x",
+                            "mode": "0600",
+                            "owner": "0:0"
+                        }]
+                    }),
+                ),
+            ]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(
+            responses[0].error.as_ref().unwrap().code,
+            "provision.unsupported_image"
+        );
+        // No disk was created and nothing was allocated.
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(!calls.iter().any(|call| call.starts_with("qemu-img create ")));
+        let registry = Registry::load(&cfg).await.unwrap();
+        assert!(registry.get("web").is_err());
+        assert!(!registry.allocations.macs.contains_key("web"));
+    }
+
+    // ---- §4 networking: managed addresses, static leases, managed publish ----
+
+    #[tokio::test]
+    async fn create_allocates_static_ip_writes_dropin_and_sighups_dnsmasq() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        // The drop-in dir must exist for a reservation to be written.
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Create, name_args("web")))
+            .await;
+
+        assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
+        // The static IP is recorded next to CID/MAC and returned as the address.
+        let registry = Registry::load(&cfg).await.unwrap();
+        let ip = registry.allocations.ips.get("web").cloned();
+        assert_eq!(ip.as_deref(), Some("10.26.8.16"));
+        assert_eq!(
+            responses[0].result.as_ref().unwrap()["created"]["address"],
+            json!("10.26.8.16")
+        );
+        // The drop-in file was written and dnsmasq was SIGHUP'd.
+        let dropin = cfg.dnsmasq_dropin_dir.join("web.conf");
+        let contents = tokio::fs::read_to_string(&dropin).await.unwrap();
+        let mac = registry.allocations.macs.get("web").unwrap();
+        assert_eq!(contents, format!("dhcp-host={mac},10.26.8.16\n"));
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&"reload-dnsmasq".to_string()));
+        // The NAT table is (re)applied even with no publishes.
+        assert!(calls.contains(&"nft-apply".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_skips_dropin_when_dir_absent_but_still_allocates_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        // Deliberately do NOT create the drop-in dir (dev host without managed
+        // dnsmasq): create must still succeed and skip the reservation.
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Create, name_args("web")))
+            .await;
+
+        assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
+        assert!(!cfg.dnsmasq_dropin_dir.join("web.conf").exists());
+        let calls = state.lock().unwrap().calls.clone();
+        // No drop-in written -> no dnsmasq reload, but the IP is still reserved.
+        assert!(!calls.contains(&"reload-dnsmasq".to_string()));
+        let registry = Registry::load(&cfg).await.unwrap();
+        assert_eq!(
+            registry.allocations.ips.get("web").map(String::as_str),
+            Some("10.26.8.16")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_publish_renders_dnat_rules_and_persists_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+        let req = Request::new(
+            "1",
+            Verb::Create,
+            Map::from_iter([
+                ("name".into(), json!("web")),
+                (
+                    "publish".into(),
+                    json!([
+                        { "host_port": 9119, "guest_port": 9119, "protocol": "tcp" },
+                        { "host_port": 53, "guest_port": 53, "protocol": "udp", "bind": "100.121.19.41" }
+                    ]),
+                ),
+            ]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
+        // The applied ruleset DNATs both ports to the reserved static IP.
+        let ruleset = state.lock().unwrap().last_nft.clone().expect("nft applied");
+        assert!(ruleset.starts_with("add table ip hearth_nat\nflush table ip hearth_nat\n"));
+        assert!(ruleset
+            .contains("add rule ip hearth_nat prerouting tcp dport 9119 dnat to 10.26.8.16:9119"));
+        assert!(ruleset.contains(
+            "add rule ip hearth_nat prerouting ip daddr 100.121.19.41 udp dport 53 dnat to 10.26.8.16:53"
+        ));
+        // Publishes persist and status surfaces them.
+        let registry = Registry::load(&cfg).await.unwrap();
+        assert_eq!(registry.get("web").unwrap().publish.len(), 2);
+        let status = daemon
+            .handle(Request::new("2", Verb::Status, name_args("web")))
+            .await;
+        let value = status[0].result.as_ref().unwrap();
+        assert_eq!(value["publish"][0]["host_port"], json!(9119));
+        assert_eq!(value["static_lease"], json!(true));
+        assert_eq!(value["address"], json!("10.26.8.16"));
+        assert_eq!(value["address_source"], json!("static"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+        let req = Request::new(
+            "1",
+            Verb::Create,
+            Map::from_iter([
+                ("name".into(), json!("web")),
+                (
+                    "publish".into(),
+                    json!([{ "host_port": 80, "guest_port": 80, "protocol": "sctp" }]),
+                ),
+            ]),
+        );
+
+        let responses = daemon.handle(req).await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(responses[0].error.as_ref().unwrap().code, "publish.invalid");
+        // Nothing was allocated or applied.
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(!calls.iter().any(|call| call.starts_with("qemu-img create ")));
+        assert!(!calls.contains(&"nft-apply".to_string()));
+        let registry = Registry::load(&cfg).await.unwrap();
+        assert!(!registry.allocations.ips.contains_key("web"));
+    }
+
+    #[tokio::test]
+    async fn status_and_ls_report_lease_address_over_static() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", false).await;
+        let cfg = test_config(&root);
+        // Allocations carry a static IP; the lease file reports a (different)
+        // observed address for the service MAC, which must win.
+        Registry::write_allocations(
+            &cfg,
+            &Allocations {
+                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
+                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
+                    .collect(),
+                ips: std::iter::once(("mail".to_string(), "10.26.8.16".to_string())).collect(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &cfg.lease_file,
+            "1720500000 52:54:00:00:00:01 10.26.8.99 mail *\n",
+        )
+        .await
+        .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let status = daemon
+            .handle(Request::new("1", Verb::Status, name_args("mail")))
+            .await;
+        let value = status[0].result.as_ref().unwrap();
+        assert_eq!(value["address"], json!("10.26.8.99"));
+        assert_eq!(value["address_source"], json!("lease"));
+        assert_eq!(value["static_lease"], json!(true));
+
+        let ls = daemon.handle(Request::new("2", Verb::Ls, Map::new())).await;
+        let services = ls[0].result.as_ref().unwrap()["services"]
+            .as_array()
+            .unwrap();
+        assert_eq!(services[0]["address"], json!("10.26.8.99"));
+    }
+
+    #[tokio::test]
+    async fn status_address_is_null_without_lease_or_static() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", false).await;
+        let cfg = test_config(&root);
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let status = daemon
+            .handle(Request::new("1", Verb::Status, name_args("mail")))
+            .await;
+        let value = status[0].result.as_ref().unwrap();
+        assert_eq!(value["address"], Value::Null);
+        assert_eq!(value["static_lease"], json!(false));
+        assert!(value.get("address_source").is_none());
+    }
+
+    #[tokio::test]
+    async fn destroy_removes_dropin_and_reapplies_nat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", true).await;
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir).await.unwrap();
+        tokio::fs::write(cfg.dnsmasq_dropin_dir.join("mail.conf"), "dhcp-host=x\n")
+            .await
+            .unwrap();
+        Registry::write_allocations(
+            &cfg,
+            &Allocations {
+                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
+                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
+                    .collect(),
+                ips: std::iter::once(("mail".to_string(), "10.26.8.16".to_string())).collect(),
+            },
+        )
+        .await
+        .unwrap();
+        let host = FakeHost::running();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Destroy, name_args("mail")))
+            .await;
+
+        assert!(responses[0].ok);
+        assert!(!cfg.dnsmasq_dropin_dir.join("mail.conf").exists());
+        let registry = Registry::load(&cfg).await.unwrap();
+        assert!(!registry.allocations.ips.contains_key("mail"));
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&"reload-dnsmasq".to_string()));
+        assert!(calls.contains(&"nft-apply".to_string()));
+    }
+
+    #[tokio::test]
+    async fn start_and_stop_reapply_the_nat_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", false).await;
+        let cfg = test_config(&root);
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let start = daemon
+            .handle(Request::new("1", Verb::Start, name_args("mail")))
+            .await;
+        assert!(start[0].ok);
+        assert!(state.lock().unwrap().calls.contains(&"nft-apply".to_string()));
+
+        state.lock().unwrap().calls.clear();
+        let stop = daemon
+            .handle(Request::new("2", Verb::Stop, name_args("mail")))
+            .await;
+        assert!(stop[0].ok);
+        assert!(state.lock().unwrap().calls.contains(&"nft-apply".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rewrites_missing_dropin_and_reapplies_nat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", false).await;
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir).await.unwrap();
+        // Static reservation exists but the drop-in file is missing (simulating a
+        // host reboot that wiped a tmpfs-backed drop-in dir).
+        Registry::write_allocations(
+            &cfg,
+            &Allocations {
+                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
+                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
+                    .collect(),
+                ips: std::iter::once(("mail".to_string(), "10.26.8.16".to_string())).collect(),
+            },
+        )
+        .await
+        .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+
+        reconcile(&cfg, &host).await.unwrap();
+
+        let dropin = cfg.dnsmasq_dropin_dir.join("mail.conf");
+        assert_eq!(
+            tokio::fs::read_to_string(&dropin).await.unwrap(),
+            "dhcp-host=52:54:00:00:00:01,10.26.8.16\n"
+        );
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&"reload-dnsmasq".to_string()));
+        assert!(calls.contains(&"nft-apply".to_string()));
+    }
+
+    #[tokio::test]
+    async fn reconcile_survives_service_with_failed_boot_prerequisites() {
+        // An enabled docker-rootfs service whose guest kernel is absent (fresh
+        // deploy / wiped kernels dir) must not abort reconcile: the daemon has
+        // to keep booting, skip only the broken service, and still self-heal
+        // host networking for the rest.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_docker_service(&root, "dev", true, docker_manifest_toml()).await;
+        // Deliberately no write_guest_kernel: validate_boot_prerequisites fails
+        // with kernel.not_found for this service.
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
+            .await
+            .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+
+        // The key assertion: reconcile returns Ok rather than propagating the
+        // kernel.not_found error out to main() (which would crash-loop hearthd).
+        reconcile(&cfg, &host).await.unwrap();
+
+        let calls = state.lock().unwrap().calls.clone();
+        // The broken service was skipped: its VM was never launched.
+        assert!(
+            !calls.iter().any(|c| c.starts_with("systemd-run ")),
+            "service with missing kernel must not be launched: {calls:?}"
+        );
+        // The networking self-heal still ran for every service.
+        assert!(
+            calls.contains(&"nft-apply".to_string()),
+            "reconcile must still re-apply NAT after skipping a broken service: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_docker_rootfs_boots_when_kernel_present_and_contract_satisfied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        write_guest_kernel(&root, "1").await;
+        let cfg = test_config(&root);
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon.handle(Request::new("1", Verb::Start, name_args("dev"))).await;
+
+        assert!(responses[0].ok, "start failed: {:?}", responses[0].error);
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(calls.contains(&"systemd-run dev".to_string()));
+    }
+
+    #[tokio::test]
+    async fn start_docker_rootfs_fails_without_guest_kernel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        // No write_guest_kernel: the configured guest kernel does not exist.
+        let cfg = test_config(&root);
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon.handle(Request::new("1", Verb::Start, name_args("dev"))).await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(responses[0].error.as_ref().unwrap().code, "kernel.not_found");
+        // The VM must not have been launched.
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(!calls.iter().any(|c| c.starts_with("systemd-run ")));
+    }
+
+    #[tokio::test]
+    async fn start_docker_rootfs_fails_when_contract_too_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let manifest = r#"
+version = 1
+kind = "docker-rootfs"
+root_device = "/dev/vda"
+root_fstype = "ext4"
+init = "/usr/local/bin/init"
+min_kernel_contract = 2
+
+[oci]
+args = ["/usr/local/bin/init"]
+env = ["EXEUNTU=1"]
+cwd = "/home/exedev"
+"#;
+        write_docker_service(&root, "dev", false, manifest).await;
+        write_guest_kernel(&root, "1").await;
+        let cfg = test_config(&root);
+        let host = FakeHost::default();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon.handle(Request::new("1", Verb::Start, name_args("dev"))).await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(
+            responses[0].error.as_ref().unwrap().code,
+            "kernel.contract_too_old"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_boot_config_current_when_execstart_matches_launch_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        let cfg = test_config(&root);
+        let svc = Registry::load(&cfg)
+            .await
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .clone();
+        let image = crate::image::load(&cfg, "exeuntu").await.unwrap();
+        let argv = cloud_hypervisor_argv(&cfg, &svc, &image);
+        let host = FakeHost::with_exec_start(fake_execstart(&argv));
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Status, name_args("dev")))
+            .await;
+
+        assert!(responses[0].ok, "status failed: {:?}", responses[0].error);
+        assert_eq!(
+            responses[0].result.as_ref().unwrap().get("boot_config"),
+            Some(&json!("current"))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_boot_config_stale_when_execstart_drifts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        let cfg = test_config(&root);
+        let svc = Registry::load(&cfg)
+            .await
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .clone();
+        let image = crate::image::load(&cfg, "exeuntu").await.unwrap();
+        let mut argv = cloud_hypervisor_argv(&cfg, &svc, &image);
+        // Simulate a unit booted by an older daemon: a different kernel path.
+        let kernel = argv.iter().position(|arg| arg == "--kernel").unwrap();
+        argv[kernel + 1] = "/var/lib/hearth/kernels/OLD/vmlinux".to_string();
+        let host = FakeHost::with_exec_start(fake_execstart(&argv));
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Status, name_args("dev")))
+            .await;
+
+        assert!(responses[0].ok);
+        assert_eq!(
+            responses[0].result.as_ref().unwrap().get("boot_config"),
+            Some(&json!("stale"))
+        );
+    }
+
+    /// Render an argv the way `systemctl show -p ExecStart --value` would,
+    /// quoting arguments that contain spaces (systemd's behavior for our
+    /// `--cmdline`).
+    fn fake_execstart(argv: &[String]) -> String {
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|arg| {
+                if arg.contains(' ') {
+                    format!("\"{arg}\"")
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        format!(
+            "{{ path=/usr/bin/cloud-hypervisor ; argv[]={} ; ignore_errors=no ; start_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}",
+            rendered.join(" ")
+        )
     }
 
     #[tokio::test]
@@ -1486,7 +2524,7 @@ backoff_sec = 10
         tokio::fs::create_dir_all(cfg.snapshots_dir.join("mail"))
             .await
             .unwrap();
-        tokio::fs::write(cfg.disk_path("mail"), b"disk")
+        tokio::fs::write(cfg.disk_path_ext("mail", "qcow2"), b"disk")
             .await
             .unwrap();
         tokio::fs::write(cfg.seed_path("mail"), b"seed")
@@ -1501,6 +2539,7 @@ backoff_sec = 10
                 vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
                 macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
                     .collect(),
+                ..Allocations::default()
             },
         )
         .await
@@ -1517,7 +2556,7 @@ backoff_sec = 10
         assert!(calls
             .iter()
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
-        assert!(!cfg.disk_path("mail").exists());
+        assert!(!cfg.disk_path_ext("mail", "qcow2").exists());
         assert!(!cfg.seed_path("mail").exists());
         assert!(!cfg.console_path("mail").exists());
         assert!(!cfg.snapshots_dir.join("mail").exists());
@@ -1601,6 +2640,16 @@ backoff_sec = 10
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
         assert!(calls.iter().any(|call| call == "systemd-restore mail"));
         assert!(calls.iter().any(|call| call.starts_with("wait-socket ")));
+        // Restore must refresh the NAT table *after* bringing the VM back up, in
+        // case the resumed guest took a different lease than it held before.
+        let restore_idx = calls
+            .iter()
+            .position(|call| call == "systemd-restore mail")
+            .unwrap();
+        assert!(
+            calls[restore_idx..].iter().any(|call| call == "nft-apply"),
+            "restore must re-apply NAT after resuming the VM: {calls:?}"
+        );
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(registry.get("mail").unwrap().enabled);
     }
@@ -1892,8 +2941,70 @@ backoff_sec = 10
             root.join("log").as_str(),
             "--firmware",
             root.join("CLOUDHV.fd").as_str(),
+            "--guest-kernel",
+            root.join("kernels/current/vmlinux").as_str(),
+            "--lease-file",
+            root.join("leases").as_str(),
+            "--dnsmasq-dropin-dir",
+            root.join("dnsmasq.d").as_str(),
             "--disable-vsock",
         ])
+    }
+
+    /// Write a docker-rootfs service plus its image + sidecar manifest so a
+    /// `start` exercises the guest-kernel validation path.
+    async fn write_docker_service(
+        root: &Utf8Path,
+        name: &str,
+        enabled: bool,
+        manifest_toml: &str,
+    ) {
+        let services = root.join("services");
+        tokio::fs::create_dir_all(&services).await.unwrap();
+        tokio::fs::write(
+            services.join(format!("{name}.toml")),
+            format!(
+                r#"
+name = "{name}"
+enabled = {enabled}
+image = "exeuntu"
+cpu = 2
+memory_mib = 2048
+disk_gib = 20
+vsock_cid = 100
+mac = "52:54:00:00:00:01"
+
+[cloud_init]
+hostname = "{name}"
+ssh_keys = []
+user = "agent"
+
+[restart]
+policy = "on-failure"
+max_retries = 5
+backoff_sec = 10
+"#
+            ),
+        )
+        .await
+        .unwrap();
+        let images = root.join("images");
+        tokio::fs::create_dir_all(&images).await.unwrap();
+        tokio::fs::write(images.join("exeuntu.qcow2"), b"base")
+            .await
+            .unwrap();
+        tokio::fs::write(images.join("exeuntu.hearth.toml"), manifest_toml)
+            .await
+            .unwrap();
+    }
+
+    /// Install a fake guest kernel (a plain file plus a `contract` sibling) at
+    /// the path `test_config` points `--guest-kernel` to.
+    async fn write_guest_kernel(root: &Utf8Path, contract: &str) {
+        let dir = root.join("kernels/current");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("vmlinux"), b"vmlinux").await.unwrap();
+        tokio::fs::write(dir.join("contract"), contract).await.unwrap();
     }
 
     #[derive(Clone, Default)]
@@ -1905,14 +3016,29 @@ backoff_sec = 10
     struct FakeState {
         calls: Vec<String>,
         running: bool,
+        exec_start: Option<String>,
+        last_nft: Option<String>,
     }
 
     impl FakeHost {
         fn running() -> Self {
             Self {
                 state: Arc::new(StdMutex::new(FakeState {
-                    calls: Vec::new(),
                     running: true,
+                    ..FakeState::default()
+                })),
+            }
+        }
+
+        /// A running host whose transient unit reports `exec_start` from
+        /// `systemctl show -p ExecStart --value`, so boot-config drift can be
+        /// exercised without systemd.
+        fn with_exec_start(exec_start: String) -> Self {
+            Self {
+                state: Arc::new(StdMutex::new(FakeState {
+                    running: true,
+                    exec_start: Some(exec_start),
+                    ..FakeState::default()
                 })),
             }
         }
@@ -1964,6 +3090,8 @@ backoff_sec = 10
                 } else {
                     "inactive\n".to_string()
                 })
+            } else if args.first() == Some(&"show") {
+                Ok(state.exec_start.clone().unwrap_or_default())
             } else {
                 Ok(String::new())
             }
@@ -1974,12 +3102,21 @@ backoff_sec = 10
             backing: &Utf8Path,
             disk: &Utf8Path,
             disk_gib: u64,
+            format: DiskFormat,
         ) -> Result<()> {
+            self.state.lock().unwrap().calls.push(format!(
+                "qemu-img create {backing} {disk} {disk_gib} {}",
+                format.extension()
+            ));
+            Ok(())
+        }
+
+        async fn provision_disk(&self, disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()> {
             self.state
                 .lock()
                 .unwrap()
                 .calls
-                .push(format!("qemu-img create {backing} {disk} {disk_gib}"));
+                .push(format!("provision-disk {disk} {}", plan.describe()));
             Ok(())
         }
 
@@ -2030,6 +3167,22 @@ backoff_sec = 10
                 .unwrap()
                 .calls
                 .push(format!("delete-tap {tap}"));
+            Ok(())
+        }
+
+        async fn nft_apply(&self, ruleset: &str) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("nft-apply".to_string());
+            state.last_nft = Some(ruleset.to_string());
+            Ok(())
+        }
+
+        async fn reload_dnsmasq(&self) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push("reload-dnsmasq".to_string());
             Ok(())
         }
     }

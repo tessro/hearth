@@ -11,9 +11,11 @@ use tokio::{
 use ulid::Ulid;
 
 mod client;
-mod docker_run;
 mod image_build;
+mod image_lint;
 mod oci;
+mod spawn;
+mod wait;
 
 #[derive(Debug, Parser)]
 #[command(name = "hearthctl", version, about = "Operate hearthd")]
@@ -56,6 +58,61 @@ enum Command {
         #[arg(long)]
         agent_in_charge: bool,
     },
+    /// Build (if needed), create, and start one VM from a template in a single
+    /// command. Repeatable flags provision each VM independently.
+    Spawn {
+        name: String,
+        /// Template image the VM is created from (required).
+        #[arg(long)]
+        image: String,
+        /// Build this Dockerfile into `--image` first, but only if the image is
+        /// not already on the daemon.
+        #[arg(long)]
+        dockerfile: Option<Utf8PathBuf>,
+        /// Build context directory (only used on the build-if-missing path).
+        #[arg(long, default_value = ".")]
+        context: Utf8PathBuf,
+        /// Root-disk size for the build-if-missing path, in GiB.
+        #[arg(long = "build-disk", default_value_t = 20)]
+        build_disk_gib: u64,
+        /// Network namespace for build RUN steps (build-if-missing path).
+        #[arg(long = "build-network", value_enum, default_value_t = oci::BuildNetwork::Host)]
+        build_network: oci::BuildNetwork,
+        /// Build argument forwarded verbatim as `--build-arg KEY=VALUE`
+        /// (build-if-missing path). Repeatable.
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// Provision a local file into the VM: `source=<path>,dest=<abs>[,mode=<octal>][,owner=<uid:gid>]`.
+        /// Repeatable. `source` is read client-side and sent as literal content.
+        /// mode/owner default to 0644/0:0; pass mode=0600 for secrets. Fields are
+        /// comma-separated, so a `source` path may contain `=` but not a comma.
+        #[arg(long = "provision-file")]
+        provision_file: Vec<String>,
+        /// VM hostname (default: the service name).
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(long)]
+        cpu: Option<u32>,
+        #[arg(long = "mem")]
+        memory_mib: Option<u64>,
+        #[arg(long = "disk")]
+        disk_gib: Option<u64>,
+        /// Publish a guest port: `<host>:<guest>[/tcp|udp][@bind]`. Repeatable.
+        #[arg(long)]
+        publish: Vec<String>,
+        /// Delete the image's baked SSH host keys so this VM regenerates a
+        /// unique set on first boot. Needed for images that bake `ssh_host_*`
+        /// keys (e.g. a base whose openssh install ran `ssh-keygen -A` and does
+        /// not `rm` them); vm-base already removes them, so this is a no-op there.
+        #[arg(long = "reset-ssh-hostkeys")]
+        reset_ssh_hostkeys: bool,
+        /// Start the VM after creating it (the default).
+        #[arg(long, overrides_with = "no_start")]
+        start: bool,
+        /// Create the VM but do not start it.
+        #[arg(long = "no-start", overrides_with = "start")]
+        no_start: bool,
+    },
     Destroy {
         name: String,
     },
@@ -81,28 +138,6 @@ enum Command {
         #[arg(long)]
         tag: String,
     },
-    Run {
-        #[arg(long)]
-        dockerfile: Utf8PathBuf,
-        #[arg(long, default_value = ".")]
-        context: Utf8PathBuf,
-        #[arg(long, default_value = "hearth-test")]
-        name: String,
-        #[arg(long = "mem", default_value = "512M")]
-        memory: String,
-        #[arg(long, default_value_t = 1)]
-        cpus: u32,
-        #[arg(long, value_enum, default_value = "none")]
-        network: docker_run::NetworkMode,
-        #[arg(long, default_value = "hearth0")]
-        bridge: String,
-        #[arg(long)]
-        tap: Option<String>,
-        #[arg(long)]
-        mac: Option<String>,
-        #[arg(long)]
-        no_tap_setup: bool,
-    },
     Resize {
         name: String,
         #[arg(long)]
@@ -114,6 +149,18 @@ enum Command {
         name: String,
         #[arg(long)]
         follow: bool,
+    },
+    /// Block until a marker substring appears in a service's console log, then
+    /// exit 0 printing the matched line; exit non-zero on timeout. Client-side
+    /// tail of the `logs --follow` stream — replaces the scripts' wait_for_log().
+    Wait {
+        name: String,
+        /// Substring to wait for on any console line (e.g. `HERMES_PROBE ok`).
+        #[arg(long)]
+        marker: String,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
     },
     Image {
         #[command(subcommand)]
@@ -139,6 +186,20 @@ enum ImageCommand {
         disk_gib: u64,
         #[arg(long)]
         rootless: bool,
+        /// Network namespace for RUN steps. Defaults to `host`: netavark races
+        /// its own iptables chains between consecutive RUN steps ("Chain
+        /// already exists") on this host config as of buildah 1.43, so `host`
+        /// is used until that is fixed or a multi-user host needs isolation.
+        #[arg(long = "build-network", value_enum, default_value_t = oci::BuildNetwork::Host)]
+        build_network: oci::BuildNetwork,
+        /// Build argument forwarded verbatim to buildah as `--build-arg
+        /// KEY=VALUE`. Repeatable; must contain `=`.
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// Skip the build-time rootfs linter. Use only for images that boot
+        /// something other than systemd, whose contract the linter models.
+        #[arg(long = "skip-lint")]
+        skip_lint: bool,
     },
     Pull {
         url: String,
@@ -158,34 +219,6 @@ enum HostCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::Run {
-        dockerfile,
-        context,
-        name,
-        memory,
-        cpus,
-        network,
-        bridge,
-        tap,
-        mac,
-        no_tap_setup,
-    } = &cli.command
-    {
-        return docker_run::run(docker_run::RunOptions {
-            dockerfile: dockerfile.clone(),
-            context: context.clone(),
-            name: name.clone(),
-            memory: memory.clone(),
-            cpus: *cpus,
-            network: *network,
-            bridge: bridge.clone(),
-            tap: tap.clone(),
-            mac: mac.clone(),
-            tap_setup: !*no_tap_setup,
-            socket: cli.socket.clone(),
-        })
-        .await;
-    }
     if let Command::Image {
         command:
             ImageCommand::Build {
@@ -194,6 +227,9 @@ async fn main() -> Result<()> {
                 context,
                 disk_gib,
                 rootless,
+                build_network,
+                build_arg,
+                skip_lint,
             },
     } = &cli.command
     {
@@ -203,9 +239,65 @@ async fn main() -> Result<()> {
             context: context.clone(),
             disk_gib: *disk_gib,
             rootless: *rootless,
+            network: *build_network,
+            build_args: build_arg.clone(),
+            skip_lint: *skip_lint,
             socket: cli.socket.clone(),
         })
         .await;
+    }
+
+    if let Command::Spawn {
+        name,
+        image,
+        dockerfile,
+        context,
+        build_disk_gib,
+        build_network,
+        build_arg,
+        provision_file,
+        hostname,
+        cpu,
+        memory_mib,
+        disk_gib,
+        publish,
+        reset_ssh_hostkeys,
+        no_start,
+        // `start` only exists so `--start` can override a preceding `--no-start`
+        // (last flag wins); the effective decision is `!no_start`.
+        start: _,
+    } = &cli.command
+    {
+        return spawn::run(
+            &cli.socket,
+            spawn::SpawnOptions {
+                name: name.clone(),
+                image: image.clone(),
+                dockerfile: dockerfile.clone(),
+                context: context.clone(),
+                build_disk_gib: *build_disk_gib,
+                build_network: *build_network,
+                build_args: build_arg.clone(),
+                provision_file: provision_file.clone(),
+                hostname: hostname.clone(),
+                cpu: *cpu,
+                memory_mib: *memory_mib,
+                disk_gib: *disk_gib,
+                publish: publish.clone(),
+                reset_ssh_hostkeys: *reset_ssh_hostkeys,
+                start: !no_start,
+            },
+        )
+        .await;
+    }
+
+    if let Command::Wait {
+        name,
+        marker,
+        timeout,
+    } = &cli.command
+    {
+        return wait::run(&cli.socket, name, marker, *timeout).await;
     }
 
     let (verb, args) = to_request(&cli.command)?;
@@ -216,6 +308,15 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(response)?);
         }
         return Ok(());
+    }
+    // Upgrade an unknown-verb serde failure into a stale-daemon message before it
+    // reaches a human. Shared with the image-build path in client.rs.
+    if let Some(err) = responses.first().and_then(|resp| resp.error.as_ref()) {
+        if let Some(hint) =
+            client::stale_daemon_hint(&cli.socket, &req.verb, &err.code, &err.message).await
+        {
+            return Err(anyhow!("{hint}"));
+        }
     }
     render(&cli.command, responses)
 }
@@ -263,6 +364,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             }
             (Verb::Create, args)
         }
+        Command::Spawn { .. } => return Err(anyhow!("spawn is handled locally")),
         Command::Destroy { name } => (Verb::Destroy, args([("name", json!(name))])),
         Command::Start { name } => (Verb::Start, args([("name", json!(name))])),
         Command::Stop { name } => (Verb::Stop, args([("name", json!(name))])),
@@ -277,7 +379,6 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             Verb::Restore,
             args([("name", json!(name)), ("tag", json!(tag))]),
         ),
-        Command::Run { .. } => return Err(anyhow!("run is handled locally")),
         Command::Resize {
             name,
             cpu,
@@ -292,6 +393,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             Verb::Logs,
             args([("name", json!(name)), ("follow", json!(follow))]),
         ),
+        Command::Wait { .. } => return Err(anyhow!("wait is handled locally")),
         Command::Image { command } => match command {
             ImageCommand::Ls => (Verb::ImageLs, empty_args()),
             ImageCommand::Build { .. } => return Err(anyhow!("image build is handled locally")),
@@ -342,7 +444,7 @@ fn render(command: &Command, responses: Vec<Response>) -> Result<()> {
         return Err(anyhow!("{}: {}", err.code, err.message));
     }
     match command {
-        Command::Ping => println!("pong"),
+        Command::Ping => println!("{}", format_pong(first.result.as_ref())),
         Command::Ls => render_ls(first.result.as_ref())?,
         Command::Image {
             command: ImageCommand::Ls,
@@ -380,7 +482,9 @@ fn render_ls(result: Option<&Value>) -> Result<()> {
         .ok_or_else(|| anyhow!("malformed ls response"))?;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(["NAME", "ENABLED", "RUNNING", "IMAGE", "CPU", "MEM", "CID"]);
+    table.set_header([
+        "NAME", "ENABLED", "RUNNING", "IMAGE", "CPU", "MEM", "CID", "ADDRESS",
+    ]);
     for svc in services {
         table.add_row([
             cell(svc, "name"),
@@ -390,6 +494,7 @@ fn render_ls(result: Option<&Value>) -> Result<()> {
             cell(svc, "cpu"),
             cell(svc, "memory_mib"),
             cell(svc, "vsock_cid"),
+            address_cell(svc),
         ]);
     }
     println!("{table}");
@@ -431,6 +536,21 @@ fn render_checks(result: Option<&Value>) -> Result<()> {
     Ok(())
 }
 
+/// Render `ping` so the operator always knows which daemon answered. Falls back
+/// to a bare "pong" when talking to an older daemon that omits version/pid.
+fn format_pong(result: Option<&Value>) -> String {
+    let version = result
+        .and_then(|value| value.get("version"))
+        .and_then(Value::as_str);
+    let pid = result
+        .and_then(|value| value.get("pid"))
+        .and_then(Value::as_u64);
+    match (version, pid) {
+        (Some(version), Some(pid)) => format!("pong — hearthd {version} (pid {pid})"),
+        _ => "pong".to_string(),
+    }
+}
+
 fn cell(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -440,6 +560,15 @@ fn cell(value: &Value, key: &str) -> String {
                 .unwrap_or_else(|| v.to_string())
         })
         .unwrap_or_default()
+}
+
+/// Render a service's `address`, which is JSON null until a lease or static
+/// reservation exists. A bare "-" reads better in the table than "null".
+fn address_cell(value: &Value) -> String {
+    match value.get("address").and_then(Value::as_str) {
+        Some(addr) => addr.to_string(),
+        None => "-".to_string(),
+    }
 }
 
 fn args<const N: usize>(items: [(&str, Value); N]) -> Map<String, Value> {
@@ -458,6 +587,21 @@ fn insert_opt(args: &mut Map<String, Value>, key: &str, value: Option<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pong_includes_daemon_version_and_pid_when_present() {
+        let result = json!({ "pong": true, "version": "0.1.0", "pid": 4321 });
+        assert_eq!(
+            format_pong(Some(&result)),
+            "pong — hearthd 0.1.0 (pid 4321)"
+        );
+    }
+
+    #[test]
+    fn pong_falls_back_when_daemon_omits_version_or_pid() {
+        assert_eq!(format_pong(Some(&json!({ "pong": true }))), "pong");
+        assert_eq!(format_pong(None), "pong");
+    }
 
     #[test]
     fn image_ls_maps_to_protocol_verb() {
@@ -495,6 +639,9 @@ mod tests {
                 context: Utf8PathBuf::from("."),
                 disk_gib: 40,
                 rootless: false,
+                build_network: oci::BuildNetwork::Host,
+                build_arg: vec![],
+                skip_lint: false,
             },
         })
         .unwrap_err();
@@ -541,38 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn run_subcommand_parses_dockerfile() {
-        let cli =
-            Cli::try_parse_from(["hearthctl", "run", "--dockerfile", "./Dockerfile"]).unwrap();
-        match cli.command {
-            Command::Run {
-                dockerfile,
-                context,
-                name,
-                memory,
-                cpus,
-                network,
-                bridge,
-                tap,
-                mac,
-                no_tap_setup,
-            } => {
-                assert_eq!(dockerfile, Utf8PathBuf::from("./Dockerfile"));
-                assert_eq!(context, Utf8PathBuf::from("."));
-                assert_eq!(name, "hearth-test");
-                assert_eq!(memory, "512M");
-                assert_eq!(cpus, 1);
-                assert_eq!(network, docker_run::NetworkMode::None);
-                assert_eq!(bridge, "hearth0");
-                assert_eq!(tap, None);
-                assert_eq!(mac, None);
-                assert!(!no_tap_setup);
-            }
-            other => panic!("expected run command, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn image_build_subcommand_parses_required_shape() {
         let cli = Cli::try_parse_from([
             "hearthctl",
@@ -597,6 +712,9 @@ mod tests {
                         context,
                         disk_gib,
                         rootless,
+                        build_network,
+                        build_arg,
+                        skip_lint,
                     },
             } => {
                 assert_eq!(name, "exeuntu");
@@ -604,6 +722,113 @@ mod tests {
                 assert_eq!(context, Utf8PathBuf::from("."));
                 assert_eq!(disk_gib, 40);
                 assert!(!rootless);
+                // Defaults: host network, no build args, lint on.
+                assert_eq!(build_network, oci::BuildNetwork::Host);
+                assert!(build_arg.is_empty());
+                assert!(!skip_lint);
+            }
+            other => panic!("expected image build command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_parses_repeatable_flags_and_defaults_to_start() {
+        let cli = Cli::try_parse_from([
+            "hearthctl",
+            "spawn",
+            "hermes-a",
+            "--image",
+            "hermes-vm",
+            "--provision-file",
+            "source=./a.env,dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000",
+            "--publish",
+            "9119:9119",
+            "--cpu",
+            "4",
+            "--mem",
+            "4096",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Spawn {
+                name,
+                image,
+                provision_file,
+                publish,
+                cpu,
+                memory_mib,
+                no_start,
+                dockerfile,
+                ..
+            } => {
+                assert_eq!(name, "hermes-a");
+                assert_eq!(image, "hermes-vm");
+                assert_eq!(provision_file.len(), 1);
+                assert_eq!(publish, vec!["9119:9119"]);
+                assert_eq!(cpu, Some(4));
+                assert_eq!(memory_mib, Some(4096));
+                assert!(dockerfile.is_none());
+                // Default is to start; --no-start absent.
+                assert!(!no_start);
+            }
+            other => panic!("expected spawn command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_start_overrides_a_preceding_no_start() {
+        // Last of --no-start/--start wins, so the effective `!no_start` is true.
+        let cli = Cli::try_parse_from([
+            "hearthctl",
+            "spawn",
+            "dev",
+            "--image",
+            "exeuntu",
+            "--no-start",
+            "--start",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Spawn { no_start, .. } => assert!(!no_start),
+            other => panic!("expected spawn command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_build_subcommand_parses_network_and_build_args() {
+        let cli = Cli::try_parse_from([
+            "hearthctl",
+            "image",
+            "build",
+            "--name",
+            "exeuntu",
+            "--dockerfile",
+            "./Dockerfile",
+            "--build-network",
+            "netavark",
+            "--build-arg",
+            "HERMES_BRANCH=main",
+            "--build-arg",
+            "HERMES_COMMIT=abc123",
+            "--skip-lint",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Image {
+                command:
+                    ImageCommand::Build {
+                        build_network,
+                        build_arg,
+                        skip_lint,
+                        ..
+                    },
+            } => {
+                assert_eq!(build_network, oci::BuildNetwork::Netavark);
+                assert_eq!(
+                    build_arg,
+                    vec!["HERMES_BRANCH=main", "HERMES_COMMIT=abc123"]
+                );
+                assert!(skip_lint);
             }
             other => panic!("expected image build command, got {other:?}"),
         }

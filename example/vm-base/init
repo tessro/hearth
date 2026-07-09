@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+mkdir -p /dev /dev/pts /proc /sys /run /tmp
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+
+# Static resolver: the hearth0 gateway (10.26.8.1) runs dnsmasq. systemd-networkd
+# alone does not write /etc/resolv.conf, and we don't ship systemd-resolved, so
+# set it here in the guest before systemd/networkd start. Done at boot because
+# buildah bind-mounts /etc/resolv.conf during RUN and discards changes.
+rm -f /etc/resolv.conf
+printf 'nameserver 10.26.8.1\n' > /etc/resolv.conf
+
+exec /sbin/init

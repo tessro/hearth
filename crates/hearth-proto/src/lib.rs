@@ -31,6 +31,34 @@ pub enum Verb {
 }
 
 impl Verb {
+    /// Every protocol verb, in declaration order. `version_result` publishes the
+    /// wire names from this list so a client can tell whether a daemon speaks a
+    /// given verb; the exhaustiveness test keeps it from drifting out of sync
+    /// with the enum.
+    pub const ALL: &'static [Verb] = &[
+        Verb::Ping,
+        Verb::Version,
+        Verb::Ls,
+        Verb::Status,
+        Verb::Create,
+        Verb::Destroy,
+        Verb::Start,
+        Verb::Stop,
+        Verb::Restart,
+        Verb::Reboot,
+        Verb::Snapshot,
+        Verb::Restore,
+        Verb::Resize,
+        Verb::Logs,
+        Verb::ImageLs,
+        Verb::ImagePull,
+        Verb::ImageImport,
+        Verb::ImageRm,
+        Verb::NetSetup,
+        Verb::NetTeardown,
+        Verb::HostCheck,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -170,6 +198,7 @@ pub fn version_result(crate_version: &str) -> Value {
     json!({
         "protocol": PROTOCOL_VERSION,
         "version": crate_version,
+        "verbs": Verb::ALL.iter().map(|verb| verb.as_str()).collect::<Vec<_>>(),
     })
 }
 
@@ -242,6 +271,12 @@ pub struct ImageManifest {
     pub root_device: String,
     pub root_fstype: String,
     pub init: String,
+    /// Minimum guest-kernel contract this image needs. hearthd refuses to boot
+    /// it against a kernel whose contract is lower. Defaults to 1 (the original
+    /// contract) so older manifests keep booting. Kept before `oci` so it
+    /// serializes as a top-level scalar, not inside the `[oci]` table.
+    #[serde(default = "default_min_kernel_contract")]
+    pub min_kernel_contract: u32,
     pub oci: OciProcess,
 }
 
@@ -255,6 +290,7 @@ impl ImageManifest {
             root_device: "/dev/vda".to_string(),
             root_fstype: "ext4".to_string(),
             init: process.args[0].clone(),
+            min_kernel_contract: default_min_kernel_contract(),
             oci: process,
         })
     }
@@ -285,6 +321,10 @@ fn default_cwd() -> String {
     "/".to_string()
 }
 
+fn default_min_kernel_contract() -> u32 {
+    1
+}
+
 fn validate_kernel_cmdline_path(label: &str, value: &str) -> Result<(), String> {
     if !value.starts_with('/') {
         return Err(format!("{label} must be an absolute path: {value}"));
@@ -308,6 +348,56 @@ fn validate_kernel_cmdline_token(label: &str, value: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verb_all_has_enum_cardinality_and_unique_wire_names() {
+        // Exhaustive match: adding a `Verb` variant fails to compile here until
+        // it is handled, a reminder to also extend `Verb::ALL`. The length
+        // assertion then pins the count.
+        fn witness(verb: &Verb) {
+            match verb {
+                Verb::Ping
+                | Verb::Version
+                | Verb::Ls
+                | Verb::Status
+                | Verb::Create
+                | Verb::Destroy
+                | Verb::Start
+                | Verb::Stop
+                | Verb::Restart
+                | Verb::Reboot
+                | Verb::Snapshot
+                | Verb::Restore
+                | Verb::Resize
+                | Verb::Logs
+                | Verb::ImageLs
+                | Verb::ImagePull
+                | Verb::ImageImport
+                | Verb::ImageRm
+                | Verb::NetSetup
+                | Verb::NetTeardown
+                | Verb::HostCheck => {}
+            }
+        }
+        for verb in Verb::ALL {
+            witness(verb);
+        }
+        assert_eq!(Verb::ALL.len(), 21, "Verb::ALL must list every variant");
+        let mut names: Vec<&str> = Verb::ALL.iter().map(|verb| verb.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "Verb::ALL has duplicate wire names");
+    }
+
+    #[test]
+    fn version_result_lists_all_verb_wire_names() {
+        let value = version_result("9.9.9");
+        let verbs = value.get("verbs").and_then(Value::as_array).unwrap();
+        assert_eq!(verbs.len(), Verb::ALL.len());
+        assert!(verbs.iter().any(|verb| verb == "image-import"));
+        assert_eq!(value.get("version").and_then(Value::as_str), Some("9.9.9"));
+    }
 
     #[test]
     fn docker_rootfs_manifest_uses_absolute_init_as_pid_one() {
@@ -334,6 +424,36 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("exactly one"));
+    }
+
+    #[test]
+    fn manifest_min_kernel_contract_defaults_to_one_when_absent() {
+        let manifest: ImageManifest = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "kind": "docker-rootfs",
+                "root_device": "/dev/vda",
+                "root_fstype": "ext4",
+                "init": "/usr/local/bin/init",
+                "oci": { "args": ["/usr/local/bin/init"] }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.min_kernel_contract, 1);
+    }
+
+    #[test]
+    fn manifest_min_kernel_contract_round_trips() {
+        let mut manifest = ImageManifest::docker_rootfs(OciProcess {
+            args: vec!["/usr/local/bin/init".to_string()],
+            env: Vec::new(),
+            cwd: "/".to_string(),
+        })
+        .unwrap();
+        manifest.min_kernel_contract = 3;
+        let text = serde_json::to_string(&manifest).unwrap();
+        let parsed: ImageManifest = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.min_kernel_contract, 3);
     }
 
     #[test]

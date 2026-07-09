@@ -3,12 +3,22 @@
 {
   # https://devenv.sh/basics/
   env.GREET = "devenv";
-  env.HEARTH_BUSYBOX = "${pkgs.pkgsStatic.busybox}/bin/busybox";
 
   # https://devenv.sh/packages/
   packages = with pkgs; [
     git
     jq
+
+    # mkfs.ext4 for `hearthctl image build` rootfs materialization.
+    e2fsprogs
+
+    # Guest-kernel build toolchain for scripts/build-guest-kernel.sh (optional
+    # dev convenience; the script itself only needs ordinary host packages).
+    flex
+    bison
+    bc
+    elfutils
+    openssl
 
     cargo
     clippy
@@ -29,18 +39,6 @@
   # https://devenv.sh/scripts/
   scripts.hello.exec = ''
     echo hello from $GREET
-  '';
-
-  scripts.build-hearth-runner.exec = ''
-    LIBRARY_PATH="${pkgs.glibc.static}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}" \
-      cargo rustc -p hearth-runner --release -- -C target-feature=+crt-static
-  '';
-
-  scripts.build-hearth-initramfs.exec = ''
-    scripts/build-initramfs.sh \
-      --busybox ${pkgs.pkgsStatic.busybox}/bin/busybox \
-      --runner target/release/hearth-runner \
-      "$@"
   '';
 
   # https://devenv.sh/basics/

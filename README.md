@@ -16,9 +16,22 @@ cargo test
 cargo build
 ```
 
+Install the daemon, CLI, and systemd unit; then build the dedicated guest kernel
+(vanilla kernel.org sources, no Nix) that docker-rootfs VMs boot directly:
+
+```sh
+sudo make install                     # /usr/local/bin + hearth.service
+sudo scripts/build-guest-kernel.sh    # /var/lib/hearth/kernels/current/vmlinux
+hearthctl host check                  # verify every prerequisite before starting
+```
+
+Host prerequisites, the bridge/dnsmasq contract, and the upgrade rule live in
+`docs/operations.md`.
+
 Dockerfile VM images:
 
 ```sh
+make vm-base                          # the shared FROM localhost/vm-base base layer
 hearthctl image build --name exeuntu --dockerfile ./Dockerfile --context . --disk 40
 hearthctl create dev --from exeuntu --disk 80 --mem 4096 --cpu 4
 hearthctl start dev
@@ -26,17 +39,42 @@ hearthctl start dev
 
 Dockerfile images are VM root filesystem recipes: the resolved OCI
 `ENTRYPOINT + CMD` must be an init-like absolute path and becomes guest PID 1.
-See `docs/dockerfile-images.md`.
+`image build` runs a build-time linter over the unpacked rootfs (rejecting a
+missing init or fstab root entry, warning on missing udev/networkd/sshd) so an
+image-content bug fails the build instead of a boot. See
+`docs/dockerfile-images.md`.
 
-Agent VM acceptance test:
+Spawn N VMs from one template, each individually provisioned and reachable, in a
+single command each:
 
 ```sh
-devenv shell cargo build
-sudo -E scripts/test-agent-vm.sh
+hearthctl spawn web-a --image exeuntu \
+  --provision-file source=./a.env,dest=/etc/app.env,mode=0600,owner=1000:1000 \
+  --publish 8080:80 --mem 2048 --cpu 2
+hearthctl spawn web-b --image exeuntu \
+  --provision-file source=./b.env,dest=/etc/app.env,mode=0600,owner=1000:1000 \
+  --publish 8081:80
+hearthctl wait web-a --marker 'HEARTH_PROBE ok'   # block on a readiness marker
 ```
 
-This builds `example/agent-vm`, boots it through Hearth, waits for the guest
-probe on the serial log, then stop/starts it to verify root-disk persistence.
+`spawn` = build-if-missing → `create` (with per-VM `[provision]` files and
+`[[publish]]` port forwards) → `start`. Two VMs from one image share nothing but
+the immutable image — distinct name, hostname, MAC, address, machine-id, and SSH
+host keys.
+
+Acceptance tests (run as root on a prepared host — KVM, Cloud Hypervisor, a built
+guest kernel, and `hearth0` DHCP/NAT):
+
+```sh
+cargo build
+sudo scripts/test-agent-vm.sh      # one VM: address, reachability, MAC==alloc, budget, persistence, cleanup
+sudo scripts/test-spawn-multi.sh   # two VMs from one image: distinct address/MAC/hostname, reachable
+sudo scripts/test-hermes-vm.sh     # the §10 multi-VM story (needs HERMES_COMMIT to build the image)
+```
+
+Each asserts through `hearthctl --json` + `jq` and uses `hearthctl wait` for the
+guest readiness marker. Run `scripts/test-agent-vm.sh --help` for the tunable
+environment.
 
 Local smoke test without touching `/etc` or `/var`:
 

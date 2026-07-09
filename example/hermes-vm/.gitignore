@@ -1,0 +1,4 @@
+# Local per-VM secrets provisioned at create time (spawn --provision-file),
+# never baked into the image. Never commit these.
+hermes.env
+authorized_keys
