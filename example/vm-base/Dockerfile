@@ -2,8 +2,12 @@
 #
 # Build it once as a plain local buildah image, then base workload images on it:
 #
-#   buildah bud --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
+#   buildah bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 #   #   ...then, in a workload Dockerfile:  FROM localhost/vm-base
+#
+# --network host runs the RUN steps in the host network namespace: netavark
+# races its own iptables chains between consecutive RUN steps ("Chain already
+# exists"). VM-rootfs builds only need outbound access, so host is safe here.
 #
 # Everything here was learned the hard way during the 2026-07 Hermes bring-up:
 # each line prevents a boot failure that cost a full build+boot cycle (~10 min)

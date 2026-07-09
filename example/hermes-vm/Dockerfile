@@ -2,7 +2,7 @@
 # getty mask, sshd, the agent user) lives in vm-base; this image adds only the
 # Hermes workload. Build vm-base first:
 #
-#   buildah bud --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
+#   buildah bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 #
 # then build this image with a pinned Hermes commit (see README):
 #

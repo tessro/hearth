@@ -17,9 +17,12 @@ build:
 
 # Build the shared VM base layer as a plain local buildah image. Workload images
 # (example/hermes-vm, example/agent-vm) are `FROM localhost/vm-base`, so build
-# this first. --layers caches each step for cheap rebuilds.
+# this first. --layers caches each step for cheap rebuilds. --network host runs
+# RUN steps in the host netns: netavark races its own iptables chains between
+# consecutive RUN steps and fails with "Chain already exists" — the same reason
+# `hearthctl image build` defaults to host. VM-rootfs builds only need outbound.
 vm-base:
-	$(BUILDAH) bud --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
+	$(BUILDAH) bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 
 test:
 	$(CARGO) test --release

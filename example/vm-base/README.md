@@ -18,8 +18,14 @@ from the serial console during the 2026-07 Hermes bring-up. See
 `image build` step (it is not a bootable image on its own, just a base layer):
 
 ```sh
-buildah bud --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
+buildah bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 ```
+
+`--network host` runs the `RUN` steps in the host network namespace. Without it,
+netavark races its own iptables chains between consecutive `RUN` steps and the
+build dies with `netavark: iptables: Chain already exists` — the same reason
+`hearthctl image build` defaults to host. VM-rootfs builds only need outbound
+network, so this is safe on a single-operator host.
 
 or, from the repo root:
 
