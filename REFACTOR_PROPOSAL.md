@@ -165,18 +165,23 @@ disk-copy step in `create`):
   hostname = "hermes"
   ```
 
-- Implementation (revised — zero new host deps, no libguestfs): per-service
-  docker-rootfs disks switch from qcow2 to **sparse raw** (`qemu-img convert
-  -O raw` at create; the base image in the store stays qcow2). The rootfs is a
-  bare whole-device ext4 — no partition table — so provisioning is a plain
-  `mount -o loop` of the per-VM disk by hearthd (which already runs as root):
-  copy/write files, `chown`/`chmod`, truncate `/etc/machine-id`, remove SSH
-  host keys, write `/etc/hostname`, unmount. One-shot at create time; the
-  image stays generic. Raw also sidesteps CHV's qcow2 limitations (its reader
-  already rejects backing chains, which is why create does a full-copy
-  convert today) and costs nothing on a sparse file.
-- Per-VM disk filenames must not lie about their format (no `.qcow2` suffix on
-  a raw disk); cloud-image services keep qcow2 + seed ISO untouched.
+- Implementation (revised — zero new host deps, no libguestfs): at create,
+  hearthd converts the base image into a **raw scratch** disk (`qemu-img
+  convert -O raw`; the base in the store stays qcow2). The rootfs is a bare
+  whole-device ext4 — no partition table — so provisioning is a plain `mount -o
+  loop` of the scratch by hearthd (which already runs as root): copy/write
+  files, `chown`/`chmod`, truncate `/etc/machine-id`, remove SSH host keys,
+  write `/etc/hostname`, unmount. The provisioned scratch is then converted to
+  the final **qcow2** boot disk and discarded. One-shot at create time; the
+  image stays generic.
+- The boot disk is qcow2, not raw: Cloud Hypervisor's raw write path triggers
+  guest EXT4 I/O errors on some host filesystems (notably ZFS, where a raw
+  root disk panics the guest at mount — `I/O error while writing superblock`).
+  qcow2 also sidesteps CHV's backing-chain rejection (the reason create does a
+  full-copy convert). Raw is used only as the loop-mountable provisioning
+  intermediate.
+- Per-VM disk filenames must not lie about their format; every boot disk is
+  `{name}.qcow2`. cloud-image services keep qcow2 + seed ISO untouched.
 - `source =` paths are read by hearthd (absolute, e.g.
   `/etc/hearth/secrets/…`); `from_literal` carries content inline in the
   service TOML. `hearthctl` conveniences (`spawn --provision-file`, §10) read

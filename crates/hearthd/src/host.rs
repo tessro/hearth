@@ -14,9 +14,10 @@ use tokio::{
     time::{sleep, timeout, Duration, Instant},
 };
 
-/// On-disk format of a per-VM disk. docker-rootfs VMs use sparse raw (loop-
-/// mountable for provisioning, and CHV's qcow2 reader rejects backing chains);
-/// cloud images keep qcow2.
+/// Output format for a standalone per-VM disk built from a qcow2 base. All boot
+/// disks are qcow2 (CHV's raw write path fails on some host FSes, e.g. ZFS);
+/// `Raw` is used only for the transient, loop-mountable provisioning scratch in
+/// [`Host::build_docker_disk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskFormat {
     Qcow2,
@@ -63,7 +64,21 @@ pub trait Host: Send + Sync {
     ) -> Result<()>;
     /// Loop-mount a raw per-VM disk and apply `plan`, then unmount. Docker-rootfs
     /// only; called once at create time.
-    async fn provision_disk(&self, disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()>;
+    /// Build a docker-rootfs per-VM boot disk: convert the qcow2 base into a raw
+    /// scratch copy, apply `plan` to it via a loop mount, then convert the
+    /// provisioned scratch into the final qcow2 boot disk at `disk` and remove
+    /// the scratch. docker-rootfs VMs boot from qcow2, not raw: Cloud
+    /// Hypervisor's raw write path triggers guest EXT4 I/O errors on some host
+    /// filesystems (notably ZFS). A bare-ext4 raw image is used only as the
+    /// intermediate because qcow2 is not loop-mountable for provisioning.
+    async fn build_docker_disk(
+        &self,
+        backing: &Utf8Path,
+        disk: &Utf8Path,
+        scratch: &Utf8Path,
+        disk_gib: u64,
+        plan: &ProvisionPlan,
+    ) -> Result<()>;
     async fn cloud_localds(
         &self,
         seed: &Utf8Path,
@@ -161,27 +176,41 @@ impl Host for RealHost {
         run_status(resize, "qemu-img resize").await
     }
 
-    async fn provision_disk(&self, disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()> {
-        let tmp = tempfile::tempdir()
-            .map_err(|e| coded("provision.mount_failed", format!("create mount dir: {e}")))?;
-        let mount_point = Utf8Path::from_path(tmp.path())
-            .ok_or_else(|| coded("provision.mount_failed", "non-utf8 mount path"))?;
-        // The rootfs is a bare whole-device ext4 (no partition table), so a plain
-        // loop mount of the raw disk works.
-        let mut mount = Command::new("mount");
-        mount.args(["-o", "loop", disk.as_str(), mount_point.as_str()]);
-        run_status(mount, "mount -o loop")
-            .await
-            .map_err(|e| coded("provision.mount_failed", format!("{e:#}")))?;
-        // Apply, then unmount regardless of the result (finally pattern): never
-        // leave the loop device attached on an apply failure.
-        let applied = crate::provision::apply_to_root(mount_point, plan).await;
-        let mut umount = Command::new("umount");
-        umount.arg(mount_point.as_str());
-        let unmounted = run_status(umount, "umount").await;
-        applied.map_err(|e| coded("provision.apply_failed", format!("{e:#}")))?;
-        unmounted.map_err(|e| coded("provision.unmount_failed", format!("{e:#}")))?;
-        Ok(())
+    async fn build_docker_disk(
+        &self,
+        backing: &Utf8Path,
+        disk: &Utf8Path,
+        scratch: &Utf8Path,
+        disk_gib: u64,
+        plan: &ProvisionPlan,
+    ) -> Result<()> {
+        // 1. base qcow2 -> sized raw scratch (loop-mountable), reusing the same
+        //    standalone convert+resize the cloud path uses.
+        self.qemu_img_create(backing, scratch, disk_gib, DiskFormat::Raw)
+            .await?;
+        // 2. provision the scratch in place; drop it if provisioning fails.
+        if let Err(err) = provision_raw_disk(scratch, plan).await {
+            let _ = fs::remove_file(scratch.as_str()).await;
+            return Err(err);
+        }
+        // 3. raw scratch -> qcow2 boot disk, then discard the scratch. Boot is
+        //    qcow2 because CHV's raw write path fails on some host FSes (ZFS).
+        if let Some(parent) = disk.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let mut convert = Command::new("qemu-img");
+        convert.args([
+            "convert",
+            "-f",
+            "raw",
+            "-O",
+            "qcow2",
+            scratch.as_str(),
+            disk.as_str(),
+        ]);
+        let converted = run_status(convert, "qemu-img convert raw->qcow2").await;
+        let _ = fs::remove_file(scratch.as_str()).await;
+        converted
     }
 
     async fn cloud_localds(
@@ -244,6 +273,30 @@ impl Host for RealHost {
         cmd.args(["kill", "-s", "HUP", "dnsmasq.service"]);
         run_status(cmd, "systemctl kill -s HUP dnsmasq.service").await
     }
+}
+
+/// Apply a provisioning plan to a bare-ext4 raw disk via a loop mount. The mount
+/// is always torn down, even when application fails (finally pattern), so a
+/// failed provision never leaves the loop device attached.
+async fn provision_raw_disk(disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()> {
+    let tmp = tempfile::tempdir()
+        .map_err(|e| coded("provision.mount_failed", format!("create mount dir: {e}")))?;
+    let mount_point = Utf8Path::from_path(tmp.path())
+        .ok_or_else(|| coded("provision.mount_failed", "non-utf8 mount path"))?;
+    // The rootfs is a bare whole-device ext4 (no partition table), so a plain
+    // loop mount of the raw disk works.
+    let mut mount = Command::new("mount");
+    mount.args(["-o", "loop", disk.as_str(), mount_point.as_str()]);
+    run_status(mount, "mount -o loop")
+        .await
+        .map_err(|e| coded("provision.mount_failed", format!("{e:#}")))?;
+    let applied = crate::provision::apply_to_root(mount_point, plan).await;
+    let mut umount = Command::new("umount");
+    umount.arg(mount_point.as_str());
+    let unmounted = run_status(umount, "umount").await;
+    applied.map_err(|e| coded("provision.apply_failed", format!("{e:#}")))?;
+    unmounted.map_err(|e| coded("provision.unmount_failed", format!("{e:#}")))?;
+    Ok(())
 }
 
 async fn systemd_run_chv(service: &Service, argv: Vec<String>) -> Result<()> {

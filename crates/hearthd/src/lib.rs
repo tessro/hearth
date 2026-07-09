@@ -412,12 +412,12 @@ impl<H: Host + 'static> Daemon<H> {
 
         let (vsock_cid, mac, static_ip) =
             reg.allocate(name, self.cfg.dhcp_static_start, self.cfg.dhcp_static_count);
-        let disk_format = if is_docker {
-            DiskFormat::Raw
-        } else {
-            DiskFormat::Qcow2
-        };
-        let disk_filename = format!("{name}.{}", disk_format.extension());
+        // Every per-VM boot disk is a standalone qcow2 (no backing chain, which
+        // CHV rejects, and qcow2 avoids the raw write-path failures CHV hits on
+        // some host filesystems such as ZFS). docker-rootfs images are
+        // provisioned on a raw scratch and converted to qcow2; see
+        // Host::build_docker_disk.
+        let disk_filename = format!("{name}.qcow2");
         let svc = Service {
             name: name.to_string(),
             enabled: false,
@@ -440,39 +440,49 @@ impl<H: Host + 'static> Daemon<H> {
         };
         let disk_path = self.cfg.disks_dir.join(&disk_filename);
         let seed_path = self.cfg.seed_path(name);
-        if let Err(err) = self
-            .host
-            .qemu_img_create(&image_path, &disk_path, disk_gib, disk_format)
-            .await
-        {
-            reg.free(name);
-            return Err(err);
-        }
-        if matches!(image_metadata, ImageMetadata::CloudImage) {
-            let tmp = tempfile::tempdir()?;
-            let user_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("user-data"))
-                .map_err(|_| anyhow!("non-utf8 temp path"))?;
-            let meta_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("meta-data"))
-                .map_err(|_| anyhow!("non-utf8 temp path"))?;
-            fs::write(&user_data_path, cloud_init::user_data(&svc)).await?;
-            fs::write(&meta_data_path, cloud_init::meta_data(&svc)).await?;
-            if let Err(err) = self
-                .host
-                .cloud_localds(&seed_path, &user_data_path, &meta_data_path)
-                .await
-            {
-                let _ = remove_path_file(disk_path).await;
-                reg.free(name);
-                return Err(err);
+        // docker-rootfs (plan = Some) provisions a raw scratch and boots the
+        // resulting qcow2; cloud images (plan = None) get a qcow2 disk plus a
+        // cloud-init seed. On failure, clean up exactly like the other create()
+        // error paths.
+        match &plan {
+            Some(plan) => {
+                let scratch = self.cfg.disk_path_ext(name, "raw");
+                if let Err(err) = self
+                    .host
+                    .build_docker_disk(&image_path, &disk_path, &scratch, disk_gib, plan)
+                    .await
+                {
+                    let _ = remove_path_file(scratch).await;
+                    let _ = remove_path_file(disk_path).await;
+                    reg.free(name);
+                    return Err(err);
+                }
             }
-        }
-        // Provision the per-VM disk once, before the registry write. On failure,
-        // clean up exactly like the other create() error paths.
-        if let Some(plan) = &plan {
-            if let Err(err) = self.host.provision_disk(&disk_path, plan).await {
-                let _ = remove_path_file(disk_path).await;
-                reg.free(name);
-                return Err(err);
+            None => {
+                if let Err(err) = self
+                    .host
+                    .qemu_img_create(&image_path, &disk_path, disk_gib, DiskFormat::Qcow2)
+                    .await
+                {
+                    reg.free(name);
+                    return Err(err);
+                }
+                let tmp = tempfile::tempdir()?;
+                let user_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("user-data"))
+                    .map_err(|_| anyhow!("non-utf8 temp path"))?;
+                let meta_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("meta-data"))
+                    .map_err(|_| anyhow!("non-utf8 temp path"))?;
+                fs::write(&user_data_path, cloud_init::user_data(&svc)).await?;
+                fs::write(&meta_data_path, cloud_init::meta_data(&svc)).await?;
+                if let Err(err) = self
+                    .host
+                    .cloud_localds(&seed_path, &user_data_path, &meta_data_path)
+                    .await
+                {
+                    let _ = remove_path_file(disk_path).await;
+                    reg.free(name);
+                    return Err(err);
+                }
             }
         }
         if let Err(err) = Registry::write_allocations(&self.cfg, &reg.allocations).await {
@@ -1561,7 +1571,7 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
             is_agent_in_charge: false,
-            disk: Some("dev.raw".into()),
+            disk: Some("dev.qcow2".into()),
             publish: Vec::new(),
             cloud_init: CloudInit::default(),
             provision: Provision::default(),
@@ -1578,8 +1588,9 @@ mod tests {
 
         assert!(argv.contains("--kernel /run/booted-system/kernel"));
         assert!(argv.contains("--initramfs /var/lib/hearth/initramfs.cpio.gz"));
-        // docker-rootfs per-VM disks are raw, and the filename must not lie.
-        assert!(argv.contains("--disk path=/var/lib/hearth/disks/dev.raw"));
+        // docker-rootfs boots from the standalone qcow2 disk (provisioned via a
+        // raw scratch at create time), and the filename must not lie.
+        assert!(argv.contains("--disk path=/var/lib/hearth/disks/dev.qcow2"));
         assert!(argv.contains(
             "--cmdline console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init"
         ));
@@ -1836,7 +1847,7 @@ backoff_sec = 10
             .iter()
             .any(|call| call.starts_with("qemu-img create ") && call.ends_with(" qcow2")));
         assert!(calls.iter().any(|call| call.starts_with("cloud-localds ")));
-        assert!(!calls.iter().any(|call| call.starts_with("provision-disk ")));
+        assert!(!calls.iter().any(|call| call.starts_with("build-docker-disk ")));
         assert!(!calls.iter().any(|call| call.starts_with("systemd-run ")));
         let registry = Registry::load(&cfg).await.unwrap();
         let web = registry.get("web").unwrap();
@@ -1878,14 +1889,15 @@ backoff_sec = 10
 
         assert!(responses[0].ok);
         let calls = state.lock().unwrap().calls.clone();
-        // docker-rootfs gets a raw per-VM disk, no cloud-init seed, and a
-        // provisioning pass (default hostname = service name, machine-id reset).
-        assert!(calls
-            .iter()
-            .any(|call| call.starts_with("qemu-img create ") && call.ends_with(" raw")));
+        // docker-rootfs builds its qcow2 boot disk via a provisioned raw
+        // scratch, with no cloud-init seed. Provisioning defaults apply (hostname
+        // = service name, machine-id reset).
         assert!(!calls.iter().any(|call| call.starts_with("cloud-localds ")));
         assert!(calls.iter().any(|call| {
-            call.starts_with("provision-disk ")
+            call.starts_with("build-docker-disk ")
+                && call.contains("dev.qcow2")
+                && call.contains("scratch=")
+                && call.contains("dev.raw")
                 && call.contains("reset_machine_id=true")
                 && call.contains("hostname=dev")
         }));
@@ -1893,7 +1905,7 @@ backoff_sec = 10
         let dev = registry.get("dev").unwrap();
         assert_eq!(dev.image, "exeuntu");
         assert_eq!(dev.disk_gib, 40);
-        assert_eq!(dev.disk.as_deref(), Some("dev.raw"));
+        assert_eq!(dev.disk.as_deref(), Some("dev.qcow2"));
         assert_eq!(dev.provision.hostname, "dev");
     }
 
@@ -1940,8 +1952,8 @@ backoff_sec = 10
         let calls = state.lock().unwrap().calls.clone();
         let provision_call = calls
             .iter()
-            .find(|call| call.starts_with("provision-disk "))
-            .expect("provision-disk call recorded");
+            .find(|call| call.starts_with("build-docker-disk "))
+            .expect("build-docker-disk call recorded");
         assert!(provision_call.contains("/home/agent/.hermes/.env<-<literal>:0600:1000:1000"));
         assert!(provision_call.contains("reset_ssh_hostkeys=true"));
         assert!(provision_call.contains("hostname=hermes-a"));
@@ -3111,12 +3123,19 @@ backoff_sec = 10
             Ok(())
         }
 
-        async fn provision_disk(&self, disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()> {
+        async fn build_docker_disk(
+            &self,
+            _backing: &Utf8Path,
+            disk: &Utf8Path,
+            scratch: &Utf8Path,
+            _disk_gib: u64,
+            plan: &ProvisionPlan,
+        ) -> Result<()> {
             self.state
                 .lock()
                 .unwrap()
                 .calls
-                .push(format!("provision-disk {disk} {}", plan.describe()));
+                .push(format!("build-docker-disk {disk} scratch={scratch} {}", plan.describe()));
             Ok(())
         }
 

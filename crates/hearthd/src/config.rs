@@ -112,9 +112,8 @@ impl Config {
     }
 
     /// The per-VM disk path for a service. New services record their disk
-    /// filename (`{name}.raw` for docker-rootfs, `{name}.qcow2` for cloud
-    /// images); services created before that field existed resolve to the
-    /// legacy `{name}.qcow2`.
+    /// filename (`{name}.qcow2` — every boot disk is qcow2); services created
+    /// before that field existed resolve to the legacy `{name}.qcow2`.
     pub fn disk_path(&self, svc: &Service) -> Utf8PathBuf {
         match &svc.disk {
             Some(file) => self.disks_dir.join(file),
