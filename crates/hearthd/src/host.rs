@@ -316,12 +316,26 @@ async fn systemd_run_chv(service: &Service, argv: Vec<String>) -> Result<()> {
         .arg("--property=StartLimitIntervalSec=300s")
         .arg(format!(
             "--property=MemoryMax={}M",
-            service.memory_mib.saturating_add(512)
+            memory_max_mib(service.memory_mib)
         ))
         .arg("--property=TimeoutStopSec=30s")
         .arg("--")
         .args(argv);
     run_status(cmd, "systemd-run").await
+}
+
+/// The MemoryMax cgroup cap for a VM's cloud-hypervisor process, in MiB.
+///
+/// cloud-hypervisor's host footprint is the guest RAM (fully resident once the
+/// guest touches its pages) plus VMM overhead — device emulation, worker
+/// threads, and tap/vsock buffers the cgroup also charges. A flat +512 MiB of
+/// headroom is too tight: a busy 2 GiB guest pushed the process past
+/// `2048+512` and the kernel OOM-killed it, crash-looping the whole VM. Give
+/// overhead of half the guest RAM (min 512 MiB) so the cap only ever catches a
+/// genuine runaway, not normal operation.
+fn memory_max_mib(memory_mib: u64) -> u64 {
+    let overhead = std::cmp::max(512, memory_mib / 2);
+    memory_mib.saturating_add(overhead)
 }
 
 pub fn cloud_hypervisor_argv(
@@ -690,6 +704,18 @@ mod tests {
     #[test]
     fn short_tap_names_keep_service_name() {
         assert_eq!(tap_name("web"), "hrt-web");
+    }
+
+    #[test]
+    fn memory_max_leaves_headroom_for_vmm_overhead() {
+        // Small guests get a 512 MiB floor; larger guests get 50% headroom, so
+        // cloud-hypervisor's overhead never pushes the process past the cgroup
+        // cap (which would OOM-kill and crash-loop the VM).
+        assert_eq!(memory_max_mib(512), 1024);
+        assert_eq!(memory_max_mib(2048), 3072);
+        assert_eq!(memory_max_mib(4096), 6144);
+        // Always strictly above the guest RAM.
+        assert!(memory_max_mib(8192) > 8192);
     }
 
     #[test]
