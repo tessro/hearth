@@ -113,6 +113,23 @@ sudo systemctl enable --now hearth.service
 hearthctl ping                # "pong — hearthd <version> (pid <n>)"
 ```
 
+### NixOS (or any declaratively-managed systemd)
+
+`/etc/systemd/system` is read-only, so `make install`'s unit copy is skipped
+(it installs the binaries and warns — it does not fail). Deploy the binaries and
+run the unit from `/run` or your system config:
+
+```sh
+sudo make install-bin                       # -> /usr/local/bin/{hearthd,hearthctl}
+sudo cp systemd/hearth.service /run/systemd/system/   # runtime unit (survives until next boot)
+sudo systemctl daemon-reload && sudo systemctl enable --now hearth.service
+# For a persistent setup, add a systemd.services.hearth block to configuration.nix
+# with ExecStart = "/usr/local/bin/hearthd" instead of the /run unit.
+```
+
+A code-only redeploy (e.g. after a daemon fix) is just `sudo make install-bin &&
+sudo systemctl restart hearth` — the unit and paths do not change.
+
 `hearthctl host check` reports each directory, command, the firmware, the guest
 kernel, `/dev/kvm`, the bridge, and the `kvm`/`vhost_vsock` modules. Green there
 means `create`/`start` will not fail on a missing prerequisite. `hearthctl image

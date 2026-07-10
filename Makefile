@@ -10,7 +10,7 @@ INSTALL     ?= install
 
 BUILDAH     ?= buildah
 
-.PHONY: build test clippy dev install uninstall firmware vm-base reload enable start stop restart status logs ping clean
+.PHONY: build test clippy dev install install-bin uninstall firmware vm-base reload enable start stop restart status logs ping clean
 
 build:
 	$(CARGO) build --release
@@ -42,17 +42,26 @@ dev: build
 # commands to run on the target instead. See docs/operations.md.
 DOCDIR ?= $(PREFIX)/share/doc/hearth
 
-install: build
+# Install just the binaries. Use this on NixOS (and anywhere else that manages
+# systemd units declaratively): $(UNITDIR) is read-only there, so `install`'s
+# unit copy fails, but updating hearthd/hearthctl is all a code deploy needs.
+install-bin: build
 	$(INSTALL) -D -m 0755 target/release/hearthd   $(DESTDIR)$(BINDIR)/hearthd
 	$(INSTALL) -D -m 0755 target/release/hearthctl $(DESTDIR)$(BINDIR)/hearthctl
-	$(INSTALL) -D -m 0644 systemd/hearth.service   $(DESTDIR)$(UNITDIR)/hearth.service
-	$(INSTALL) -D -m 0644 docs/operations.md       $(DESTDIR)$(DOCDIR)/operations.md
-	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
-		systemctl daemon-reload; \
-		echo "hearthd installed. Next: hearthctl host check   then   systemctl enable --now hearth.service"; \
+
+install: install-bin
+	$(INSTALL) -D -m 0644 docs/operations.md $(DESTDIR)$(DOCDIR)/operations.md 2>/dev/null || true
+	@if $(INSTALL) -D -m 0644 systemd/hearth.service $(DESTDIR)$(UNITDIR)/hearth.service 2>/dev/null; then \
+		if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi; \
+		echo "Installed hearthd + hearthctl + hearth.service."; \
+		echo "Next: hearthctl host check   then   systemctl enable --now hearth.service"; \
 		echo "Build the guest kernel first if you have not: scripts/build-guest-kernel.sh (see docs/operations.md)."; \
 	else \
-		echo "Staged under '$(DESTDIR)'. On the target: systemctl daemon-reload && systemctl enable --now hearth.service"; \
+		echo "Installed hearthd + hearthctl to $(BINDIR)."; \
+		echo "NOTE: $(UNITDIR) is not writable (read-only — NixOS?); skipped the systemd unit."; \
+		echo "  Run hearthd from a runtime unit that survives until you manage it declaratively:"; \
+		echo "    sudo cp systemd/hearth.service /run/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart hearth"; \
+		echo "  or point configuration.nix at ExecStart=$(BINDIR)/hearthd. See docs/operations.md."; \
 	fi
 
 uninstall:
