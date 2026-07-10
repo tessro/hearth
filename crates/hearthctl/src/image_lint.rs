@@ -45,7 +45,10 @@ const CHECKS: &[Check] = &[
     check_init_exec_form,
     check_udevd_enabled,
     check_network_matches_en,
+    check_agent_account,
     check_sshd_enabled,
+    check_sshd_pubkey_enabled,
+    check_no_baked_authorized_keys,
     check_dbus_enabled,
     check_pam_systemd_present,
     check_serial_getty_masked,
@@ -210,10 +213,101 @@ fn check_sshd_enabled(ctx: &LintCtx) -> Option<Finding> {
     if enabled {
         None
     } else {
-        Some(warn(
+        Some(reject(
             "sshd",
             "no sshd unit enabled — there will be no way to SSH into the VM".to_string(),
         ))
+    }
+}
+
+/// SSH provisioning targets a deliberately fixed guest account so the daemon
+/// can set ownership offline without NSS or name resolution.
+fn check_agent_account(ctx: &LintCtx) -> Option<Finding> {
+    let passwd = fs::read_to_string(under(ctx, "/etc/passwd")).unwrap_or_default();
+    let valid = passwd.lines().any(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        fields.first() == Some(&"agent")
+            && fields.get(2) == Some(&"1000")
+            && fields.get(3) == Some(&"1000")
+            && fields.get(5) == Some(&"/home/agent")
+    });
+    let home_is_real_dir = fs::symlink_metadata(under(ctx, "/home/agent"))
+        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if valid && home_is_real_dir {
+        None
+    } else {
+        Some(reject(
+            "agent-account",
+            "agent must exist with uid=1000 gid=1000 and a real /home/agent directory for managed SSH access".to_string(),
+        ))
+    }
+}
+
+fn check_sshd_pubkey_enabled(ctx: &LintCtx) -> Option<Finding> {
+    let mut configs = vec![under(ctx, "/etc/ssh/sshd_config")];
+    let dropins = under(ctx, "/etc/ssh/sshd_config.d");
+    if let Ok(entries) = fs::read_dir(dropins) {
+        configs.extend(
+            entries
+                .flatten()
+                .map(|entry| Utf8PathBuf::from_path_buf(entry.path()))
+                .filter_map(Result::ok)
+                .filter(|path| path.extension() == Some("conf")),
+        );
+    }
+    let disabled = configs
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .any(|text| {
+            text.lines().any(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return false;
+                }
+                let mut fields = line.split_whitespace();
+                let directive = fields.next().unwrap_or_default();
+                let value = fields.next().unwrap_or_default();
+                if directive.eq_ignore_ascii_case("PubkeyAuthentication") {
+                    return value.eq_ignore_ascii_case("no");
+                }
+                if directive.eq_ignore_ascii_case("AuthorizedKeysFile") {
+                    return !std::iter::once(value).chain(fields).any(|path| {
+                        path.ends_with("/.ssh/authorized_keys") || path == ".ssh/authorized_keys"
+                    });
+                }
+                false
+            })
+        });
+    if disabled {
+        Some(reject(
+            "sshd-pubkey",
+            "sshd configuration disables public-key authorized_keys authentication".to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Per-VM keys belong in provisioning. A shared image carrying authorized_keys
+/// silently grants untracked access to every VM cloned from it.
+fn check_no_baked_authorized_keys(ctx: &LintCtx) -> Option<Finding> {
+    let path = under(ctx, "/home/agent/.ssh/authorized_keys");
+    let has_keys = fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .any(|line| !line.is_empty() && !line.starts_with('#'))
+        })
+        .unwrap_or(false);
+    if has_keys {
+        Some(reject(
+            "baked-authorized-keys",
+            "image contains /home/agent/.ssh/authorized_keys; install keys per VM at create time"
+                .to_string(),
+        ))
+    } else {
+        None
     }
 }
 
@@ -409,6 +503,14 @@ mod tests {
             "/dev/vda / ext4 defaults,x-systemd.growfs 0 1\n",
         )
         .unwrap();
+        fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nagent:x:1000:1000::/home/agent:/bin/bash\n",
+        )
+        .unwrap();
+        fs::create_dir_all(etc.join("ssh")).unwrap();
+        fs::write(etc.join("ssh/sshd_config"), "PubkeyAuthentication yes\n").unwrap();
+        fs::create_dir_all(root.join("home/agent")).unwrap();
 
         let net = etc.join("systemd/network");
         fs::create_dir_all(&net).unwrap();
@@ -551,8 +653,68 @@ mod tests {
         fs::remove_file(root.join("etc/systemd/system/multi-user.target.wants/ssh.service"))
             .unwrap();
         let f = check_sshd_enabled(&ctx(&root)).unwrap();
-        assert_eq!(f.severity, Severity::Warn);
+        assert_eq!(f.severity, Severity::Reject);
         assert_eq!(f.check, "sshd");
+    }
+
+    #[test]
+    fn agent_account_is_fixed_for_offline_provisioning() {
+        let (_dir, root) = tmp();
+        assert!(check_agent_account(&ctx(&root)).is_none());
+        fs::write(
+            root.join("etc/passwd"),
+            "agent:x:1001:1001::/home/agent:/bin/bash\n",
+        )
+        .unwrap();
+        let finding = check_agent_account(&ctx(&root)).unwrap();
+        assert_eq!(finding.severity, Severity::Reject);
+
+        fs::write(
+            root.join("etc/passwd"),
+            "agent:x:1000:1000::/home/agent:/bin/bash\n",
+        )
+        .unwrap();
+        fs::remove_dir(root.join("home/agent")).unwrap();
+        assert!(check_agent_account(&ctx(&root)).is_some());
+    }
+
+    #[test]
+    fn sshd_must_accept_authorized_keys() {
+        let (_dir, root) = tmp();
+        assert!(check_sshd_pubkey_enabled(&ctx(&root)).is_none());
+        fs::write(
+            root.join("etc/ssh/sshd_config"),
+            "PubkeyAuthentication no\n",
+        )
+        .unwrap();
+        assert_eq!(
+            check_sshd_pubkey_enabled(&ctx(&root)).unwrap().severity,
+            Severity::Reject
+        );
+        fs::write(
+            root.join("etc/ssh/sshd_config"),
+            "AuthorizedKeysFile /etc/ssh/operator_keys\n",
+        )
+        .unwrap();
+        assert_eq!(
+            check_sshd_pubkey_enabled(&ctx(&root)).unwrap().severity,
+            Severity::Reject
+        );
+    }
+
+    #[test]
+    fn baked_authorized_keys_are_rejected() {
+        let (_dir, root) = tmp();
+        assert!(check_no_baked_authorized_keys(&ctx(&root)).is_none());
+        let ssh = root.join("home/agent/.ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::write(ssh.join("authorized_keys"), "ssh-ed25519 AAAA bad\n").unwrap();
+        assert_eq!(
+            check_no_baked_authorized_keys(&ctx(&root))
+                .unwrap()
+                .severity,
+            Severity::Reject
+        );
     }
 
     #[test]

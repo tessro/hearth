@@ -55,7 +55,7 @@ EOF
 [ "${1:-}" = "--help" ] && { usage; exit 0; }
 
 require_root
-require_cmd jq curl buildah sed
+require_cmd jq curl buildah sed ssh-keygen
 require_hearthctl
 require_daemon
 
@@ -81,6 +81,8 @@ done
 # never read.
 TMPDIR_ENV="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR_ENV}"' EXIT
+SSH_KEY="${TMPDIR_ENV}/id_ed25519"
+make_test_ssh_key "${SSH_KEY}"
 
 rand_hex() { openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
@@ -114,6 +116,7 @@ fi
 spawn_hermes() {  # spawn_hermes <name> <env-file>
   ctl spawn "$1" \
     --image "${IMAGE_NAME}" \
+    --authorized-keys-file "${SSH_KEY}.pub" \
     --provision-file "source=$2,dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000" \
     --mem "${MEMORY_MIB}" --cpu "${CPUS}" --disk "${SERVICE_DISK_GIB}" >/dev/null
 }

@@ -159,6 +159,7 @@ mac         = "52:54:00:12:34:56"          # generated on create; preserved
 [provision]
 hostname         = "mail"
 reset_machine_id = true
+authorized_keys  = ["ssh-ed25519 AAAA... operator"]
 
 [restart]
 policy      = "on-failure"
@@ -172,10 +173,14 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 
 ### Create
 
-1. Validate name (kebab-case, not already in registry).
+1. Validate name (kebab-case, not already in registry), merge the host recovery
+   keyring with request keys, and reject an empty or malformed effective set
+   unless `allow_no_ssh` is explicit.
 2. Allocate vsock CID (next free integer ≥ 100) and MAC (locally administered range).
 3. Convert `/var/lib/hearth/images/<image>.qcow2` to a sized raw scratch disk.
-4. Apply the per-service provisioning plan (hostname, machine-id, optional files),
+4. Apply the per-service provisioning plan (hostname, machine-id, managed
+   `/home/agent/.ssh/authorized_keys`, optional files), verify SSH file
+   contents/mode/ownership,
    then convert the scratch to `/var/lib/hearth/disks/<name>.qcow2`.
 5. Write `/etc/hearth/services/<name>.toml` with `enabled = false`.
 6. Return; do not boot. `hearthctl start <name>` is a separate step.

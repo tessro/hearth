@@ -58,6 +58,7 @@ per spawn. Two spawns from the same `--image`:
 hearthctl spawn hermes-a \
   --image hermes-vm \
   --dockerfile example/hermes-vm/Dockerfile --context example/hermes-vm \
+  --authorized-keys-file ~/.ssh/id_ed25519.pub \
   --provision-file source=./a.env,dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000 \
   --cpu 4 --mem 4096 --disk 32
 
@@ -65,6 +66,7 @@ hearthctl spawn hermes-a \
 # secret goes into an otherwise identical VM.
 hearthctl spawn hermes-b \
   --image hermes-vm \
+  --authorized-keys-file ~/.ssh/id_ed25519.pub \
   --provision-file source=./b.env,dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000
 ```
 
@@ -73,6 +75,13 @@ daemon only ever sees the file's literal content — never a CLI-relative path.
 Pass `mode=0600` for anything secret (mode/owner default to `0644`/`0:0`). Fields
 are comma-separated, so a `source` path may contain `=` but must not contain a
 comma.
+
+SSH authorized keys are typed provisioning, not generic files. The daemon
+merges per-VM `--ssh-key` / `--authorized-keys-file` inputs with its host-wide
+`/etc/hearth/authorized_keys`, canonicalizes and deduplicates them, and writes
+`/home/agent/.ssh/authorized_keys` with verified `0700`/`0600` directory/file
+modes and UID/GID 1000. If no effective key exists, create fails unless
+`--allow-no-ssh` is explicit.
 
 What differs per VM: the **name** (`hermes-a` vs `hermes-b`), the **hostname**
 (defaults to the name; override with `--hostname`), the regenerated

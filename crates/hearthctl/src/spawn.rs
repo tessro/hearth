@@ -42,6 +42,9 @@ pub struct SpawnOptions {
     pub build_network: BuildNetwork,
     pub build_args: Vec<String>,
     pub provision_file: Vec<String>,
+    pub ssh_key: Vec<String>,
+    pub authorized_keys_file: Vec<Utf8PathBuf>,
+    pub allow_no_ssh: bool,
     pub hostname: Option<String>,
     pub cpu: Option<u32>,
     pub memory_mib: Option<u64>,
@@ -224,6 +227,8 @@ struct CreateInputs<'a> {
     disk_gib: Option<u64>,
     /// Each parsed spec paired with its already-read literal content.
     provision: &'a [(ProvisionFileSpec, String)],
+    authorized_keys: &'a [String],
+    allow_no_ssh: bool,
     publish: &'a [PublishSpec],
     /// Emit `reset_ssh_hostkeys = true` in the provision block.
     reset_ssh_hostkeys: bool,
@@ -250,7 +255,11 @@ fn create_args(inputs: &CreateInputs) -> Map<String, Value> {
     // requested. reset_ssh_hostkeys is only inserted when true so the common
     // (files-only) case keeps the exact `{ "files": [...] }` shape the daemon
     // parsed before, and reset_machine_id keeps its daemon-side default of true.
-    if !inputs.provision.is_empty() || inputs.reset_ssh_hostkeys {
+    if !inputs.provision.is_empty()
+        || !inputs.authorized_keys.is_empty()
+        || inputs.allow_no_ssh
+        || inputs.reset_ssh_hostkeys
+    {
         let files: Vec<Value> = inputs
             .provision
             .iter()
@@ -265,6 +274,12 @@ fn create_args(inputs: &CreateInputs) -> Map<String, Value> {
             .collect();
         let mut provision = Map::new();
         provision.insert("files".to_string(), json!(files));
+        if !inputs.authorized_keys.is_empty() {
+            provision.insert("authorized_keys".to_string(), json!(inputs.authorized_keys));
+        }
+        if inputs.allow_no_ssh {
+            provision.insert("allow_no_ssh".to_string(), json!(true));
+        }
         if inputs.reset_ssh_hostkeys {
             provision.insert("reset_ssh_hostkeys".to_string(), json!(true));
         }
@@ -308,6 +323,8 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
         .iter()
         .map(|v| parse_publish(v))
         .collect::<Result<Vec<_>>>()?;
+    let authorized_keys =
+        crate::read_authorized_key_inputs(&opts.ssh_key, &opts.authorized_keys_file)?;
 
     // Build-if-missing: consult the daemon's image list, then decide.
     let images = hearth_request(socket, Verb::ImageLs, empty_args()).await?;
@@ -377,6 +394,8 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
         memory_mib: opts.memory_mib,
         disk_gib: opts.disk_gib,
         provision: &provision,
+        authorized_keys: &authorized_keys,
+        allow_no_ssh: opts.allow_no_ssh,
         publish: &publishes,
         reset_ssh_hostkeys: opts.reset_ssh_hostkeys,
     });
@@ -402,6 +421,8 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEVBr+XtUOuloYyDWGTcKPPHbVwpSIATl/mJ6RE7gdN hearth-test";
 
     #[test]
     fn build_decision_table() {
@@ -574,6 +595,8 @@ mod tests {
             memory_mib: None,
             disk_gib: None,
             provision: &[],
+            authorized_keys: &[],
+            allow_no_ssh: false,
             publish: &[],
             reset_ssh_hostkeys: false,
         });
@@ -613,6 +636,8 @@ mod tests {
             memory_mib: Some(4096),
             disk_gib: Some(32),
             provision: &provision,
+            authorized_keys: &[TEST_AUTHORIZED_KEY.to_string()],
+            allow_no_ssh: false,
             publish: &publish,
             reset_ssh_hostkeys: false,
         });
@@ -624,6 +649,7 @@ mod tests {
         assert_eq!(
             args.get("provision"),
             Some(&json!({
+                "authorized_keys": [TEST_AUTHORIZED_KEY],
                 "files": [{
                     "from_literal": "TOKEN=secret",
                     "dest": "/home/agent/.hermes/.env",
@@ -645,6 +671,24 @@ mod tests {
     }
 
     #[test]
+    fn create_args_emits_explicit_keyless_escape_hatch() {
+        let args = create_args(&CreateInputs {
+            name: "serial-only",
+            image: "exeuntu",
+            hostname: "serial-only",
+            cpu: None,
+            memory_mib: None,
+            disk_gib: None,
+            provision: &[],
+            authorized_keys: &[],
+            allow_no_ssh: true,
+            publish: &[],
+            reset_ssh_hostkeys: false,
+        });
+        assert_eq!(args["provision"]["allow_no_ssh"], json!(true));
+    }
+
+    #[test]
     fn create_args_publish_omits_bind_when_absent() {
         let publish = vec![PublishSpec {
             host_port: 22,
@@ -660,6 +704,8 @@ mod tests {
             memory_mib: None,
             disk_gib: None,
             provision: &[],
+            authorized_keys: &[],
+            allow_no_ssh: false,
             publish: &publish,
             reset_ssh_hostkeys: false,
         });
@@ -680,6 +726,8 @@ mod tests {
             memory_mib: None,
             disk_gib: None,
             provision: &[],
+            authorized_keys: &[],
+            allow_no_ssh: false,
             publish: &[],
             reset_ssh_hostkeys: true,
         });

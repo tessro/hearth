@@ -1,5 +1,6 @@
 # Copy this file to authorized_keys (gitignored) and put your SSH public key(s)
-# here, one per line. It becomes /home/agent/.ssh/authorized_keys inside the VM.
+# here, one bare OpenSSH public key per line, then pass
+# --authorized-keys-file ./authorized_keys when creating or spawning the VM.
 #
 # SSH is only needed to log in after boot (e.g. to run `hermes setup --portal`
 # or tail logs); the macOS app itself connects over port 9119, not SSH.

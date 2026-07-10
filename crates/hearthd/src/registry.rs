@@ -111,6 +111,15 @@ pub struct Provision {
     pub reset_ssh_hostkeys: bool,
     #[serde(default)]
     pub hostname: String,
+    /// Canonical bare OpenSSH public-key lines installed for the `agent` user.
+    /// Host recovery keys are merged into this list at create time so the
+    /// service record describes what was actually written to its disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_keys: Vec<String>,
+    /// Explicit escape hatch for a keyless VM. This is only persisted as true
+    /// when the effective key list is empty.
+    #[serde(default)]
+    pub allow_no_ssh: bool,
     #[serde(default)]
     pub files: Vec<ProvisionFile>,
 }
@@ -121,6 +130,8 @@ impl Default for Provision {
             reset_machine_id: true,
             reset_ssh_hostkeys: false,
             hostname: String::new(),
+            authorized_keys: Vec::new(),
+            allow_no_ssh: false,
             files: Vec::new(),
         }
     }
@@ -151,7 +162,30 @@ impl Provision {
             "reset_machine_id": self.reset_machine_id,
             "reset_ssh_hostkeys": self.reset_ssh_hostkeys,
             "hostname": self.hostname,
+            "ssh_access": self.ssh_access_state(),
+            "ssh_user": "agent",
+            "ssh_key_fingerprints": self.ssh_key_fingerprints(),
         })
+    }
+
+    pub fn ssh_access_state(&self) -> &'static str {
+        if !self.authorized_keys.is_empty()
+            && self.ssh_key_fingerprints().len() == self.authorized_keys.len()
+        {
+            "configured"
+        } else if self.allow_no_ssh {
+            "intentionally-disabled"
+        } else {
+            "legacy-unknown"
+        }
+    }
+
+    pub fn ssh_key_fingerprints(&self) -> Vec<String> {
+        self.authorized_keys
+            .iter()
+            .filter_map(|line| crate::ssh::parse_authorized_key(line).ok())
+            .map(|key| key.fingerprint)
+            .collect()
     }
 }
 

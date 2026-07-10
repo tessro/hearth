@@ -227,6 +227,31 @@ wait_tcp() {
   return 1
 }
 
+# make_test_ssh_key <private-key-path>: generate a throwaway recovery keypair.
+make_test_ssh_key() {
+  ssh-keygen -q -t ed25519 -N "" -C hearth-acceptance -f "$1"
+}
+
+# wait_ssh_login <host> <private-key> [port] [timeout_s]: prove authenticated
+# agent access, not merely that sshd accepted a TCP connection.
+wait_ssh_login() {
+  local host="$1" key="$2" port="${3:-22}" timeout_s="${4:-30}" deadline
+  deadline=$(( $(now_s) + timeout_s ))
+  while [ "$(now_s)" -lt "${deadline}" ]; do
+    if ssh -i "${key}" -p "${port}" \
+      -o BatchMode=yes \
+      -o ConnectTimeout=2 \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      agent@"${host}" true >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 # http_probe <url> <timeout_s>: retry curl until the port answers HTTP, then
 # print the status code (any 3-digit code — even 401 — proves it answered) and
 # return 0. Returns 1 if it never got an HTTP response.

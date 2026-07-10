@@ -34,10 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN test -n "$HERMES_COMMIT" || { echo 'build with --build-arg HERMES_COMMIT=<sha> (see README)'; exit 1; } \
   && su - agent -c "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup --non-interactive --skip-browser --commit \"$HERMES_COMMIT\""
 
-# hermes.env and authorized_keys are NOT baked in anymore. §3/§10 provision them
-# per-VM at create time: `spawn --provision-file source=./hermes.env,\
-# dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000` (and likewise for
-# authorized_keys). The .example files in this directory show their shape.
+# hermes.env and authorized_keys are NOT baked in anymore. §3/§10 provisions the
+# env through `--provision-file` and SSH through typed
+# `--authorized-keys-file`; the .example files show their shape.
 COPY hermes.service /etc/systemd/system/hermes.service
 COPY hermes-probe.service /etc/systemd/system/hermes-probe.service
 COPY hermes-probe /usr/local/bin/hermes-probe

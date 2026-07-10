@@ -40,6 +40,14 @@ pub struct Config {
     pub run_dir: Utf8PathBuf,
     #[arg(long, env = "HEARTH_LOG_DIR", default_value = "/var/log/hearth")]
     pub log_dir: Utf8PathBuf,
+    /// Host-wide recovery keys added to every VM. A missing file contributes no
+    /// keys; create still requires a per-VM key unless explicitly overridden.
+    #[arg(
+        long,
+        env = "HEARTH_AUTHORIZED_KEYS_FILE",
+        default_value = "/etc/hearth/authorized_keys"
+    )]
+    pub authorized_keys_file: Utf8PathBuf,
     #[arg(
         long,
         env = "HEARTH_GUEST_KERNEL",

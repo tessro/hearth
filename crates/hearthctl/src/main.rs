@@ -51,6 +51,15 @@ enum Command {
         memory_mib: Option<u64>,
         #[arg(long = "disk")]
         disk_gib: Option<u64>,
+        /// Add one bare OpenSSH public key for the agent user's recovery access.
+        #[arg(long)]
+        ssh_key: Vec<String>,
+        /// Read bare OpenSSH public keys from an authorized_keys-shaped file.
+        #[arg(long = "authorized-keys-file")]
+        authorized_keys_file: Vec<Utf8PathBuf>,
+        /// Explicitly permit a VM with no managed SSH authorized keys.
+        #[arg(long)]
+        allow_no_ssh: bool,
         #[arg(long)]
         agent_in_charge: bool,
     },
@@ -84,6 +93,15 @@ enum Command {
         /// comma-separated, so a `source` path may contain `=` but not a comma.
         #[arg(long = "provision-file")]
         provision_file: Vec<String>,
+        /// Add one bare OpenSSH public key for the agent user's recovery access.
+        #[arg(long)]
+        ssh_key: Vec<String>,
+        /// Read bare OpenSSH public keys from an authorized_keys-shaped file.
+        #[arg(long = "authorized-keys-file")]
+        authorized_keys_file: Vec<Utf8PathBuf>,
+        /// Explicitly permit a VM with no managed SSH authorized keys.
+        #[arg(long)]
+        allow_no_ssh: bool,
         /// VM hostname (default: the service name).
         #[arg(long)]
         hostname: Option<String>,
@@ -238,6 +256,21 @@ enum HostCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(
+        &cli.command,
+        Command::Create {
+            allow_no_ssh: true,
+            ..
+        } | Command::Spawn {
+            allow_no_ssh: true,
+            ..
+        }
+    ) {
+        eprintln!(
+            "WARNING: --allow-no-ssh permits a VM with no confirmed SSH recovery path; \
+             serial-console or workload failure may make it unrecoverable"
+        );
+    }
     if let Command::Image {
         command:
             ImageCommand::Build {
@@ -275,6 +308,9 @@ async fn main() -> Result<()> {
         build_network,
         build_arg,
         provision_file,
+        ssh_key,
+        authorized_keys_file,
+        allow_no_ssh,
         hostname,
         cpu,
         memory_mib,
@@ -298,6 +334,9 @@ async fn main() -> Result<()> {
                 build_network: *build_network,
                 build_args: build_arg.clone(),
                 provision_file: provision_file.clone(),
+                ssh_key: ssh_key.clone(),
+                authorized_keys_file: authorized_keys_file.clone(),
+                allow_no_ssh: *allow_no_ssh,
                 hostname: hostname.clone(),
                 cpu: *cpu,
                 memory_mib: *memory_mib,
@@ -352,12 +391,26 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             cpu,
             memory_mib,
             disk_gib,
+            ssh_key,
+            authorized_keys_file,
+            allow_no_ssh,
             agent_in_charge,
         } => {
             let mut args = args([("name", json!(name)), ("image", json!(image))]);
             insert_opt(&mut args, "cpu", cpu.map(|v| json!(v)));
             insert_opt(&mut args, "memory_mib", memory_mib.map(|v| json!(v)));
             insert_opt(&mut args, "disk_gib", disk_gib.map(|v| json!(v)));
+            let authorized_keys = read_authorized_key_inputs(ssh_key, authorized_keys_file)?;
+            if !authorized_keys.is_empty() || *allow_no_ssh {
+                let mut provision = Map::new();
+                if !authorized_keys.is_empty() {
+                    provision.insert("authorized_keys".into(), json!(authorized_keys));
+                }
+                if *allow_no_ssh {
+                    provision.insert("allow_no_ssh".into(), json!(true));
+                }
+                args.insert("provision".into(), Value::Object(provision));
+            }
             if *agent_in_charge {
                 args.insert("is_agent_in_charge".into(), json!(true));
             }
@@ -431,6 +484,28 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             PublishCommand::Ls { service } => (Verb::Status, args([("name", json!(service))])),
         },
     })
+}
+
+pub(crate) fn read_authorized_key_inputs(
+    inline: &[String],
+    files: &[Utf8PathBuf],
+) -> Result<Vec<String>> {
+    let mut keys = inline
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty() && !key.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for path in files {
+        let text = std::fs::read_to_string(path).map_err(|err| anyhow!("read {path}: {err}"))?;
+        keys.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_owned),
+        );
+    }
+    Ok(keys)
 }
 
 async fn round_trip(socket: &Utf8PathBuf, req: &Request) -> Result<Vec<Response>> {
@@ -507,13 +582,14 @@ fn render_ls(result: Option<&Value>) -> Result<()> {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_header([
-        "NAME", "ENABLED", "RUNNING", "IMAGE", "CPU", "MEM", "CID", "ADDRESS",
+        "NAME", "ENABLED", "RUNNING", "SSH", "IMAGE", "CPU", "MEM", "CID", "ADDRESS",
     ]);
     for svc in services {
         table.add_row([
             cell(svc, "name"),
             cell(svc, "enabled"),
             cell(svc, "running"),
+            cell(svc, "ssh_access"),
             cell(svc, "image"),
             cell(svc, "cpu"),
             cell(svc, "memory_mib"),
@@ -597,9 +673,20 @@ fn render_checks(result: Option<&Value>) -> Result<()> {
         .ok_or_else(|| anyhow!("malformed host check response"))?;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(["CHECK", "OK", "PATH"]);
+    table.set_header(["CHECK", "OK", "PATH", "DETAIL"]);
     for check in checks {
-        table.add_row([cell(check, "name"), cell(check, "ok"), cell(check, "path")]);
+        let detail = check
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| check.get("keys").map(|keys| format!("{keys} key(s)")))
+            .unwrap_or_default();
+        table.add_row([
+            cell(check, "name"),
+            cell(check, "ok"),
+            cell(check, "path"),
+            detail,
+        ]);
     }
     println!("{table}");
     Ok(())
@@ -656,6 +743,8 @@ fn insert_opt(args: &mut Map<String, Value>, key: &str, value: Option<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEVBr+XtUOuloYyDWGTcKPPHbVwpSIATl/mJ6RE7gdN hearth-test";
 
     #[test]
     fn pong_includes_daemon_version_and_pid_when_present() {
@@ -788,6 +877,9 @@ mod tests {
             cpu: Some(4),
             memory_mib: Some(4096),
             disk_gib: Some(30),
+            ssh_key: vec![],
+            authorized_keys_file: vec![],
+            allow_no_ssh: true,
             agent_in_charge: true,
         })
         .unwrap();
@@ -798,6 +890,31 @@ mod tests {
         assert_eq!(args.get("memory_mib"), Some(&json!(4096)));
         assert_eq!(args.get("disk_gib"), Some(&json!(30)));
         assert_eq!(args.get("is_agent_in_charge"), Some(&json!(true)));
+        assert_eq!(args["provision"]["allow_no_ssh"], json!(true));
+    }
+
+    #[test]
+    fn create_reads_authorized_keys_file_into_typed_provisioning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().join("authorized_keys")).unwrap();
+        std::fs::write(&path, format!("# recovery\n{TEST_AUTHORIZED_KEY}\n")).unwrap();
+        let (verb, args) = to_request(&Command::Create {
+            name: "web".to_string(),
+            image: "base".to_string(),
+            cpu: None,
+            memory_mib: None,
+            disk_gib: None,
+            ssh_key: vec![],
+            authorized_keys_file: vec![path],
+            allow_no_ssh: false,
+            agent_in_charge: false,
+        })
+        .unwrap();
+        assert_eq!(verb, Verb::Create);
+        assert_eq!(
+            args["provision"]["authorized_keys"],
+            json!([TEST_AUTHORIZED_KEY])
+        );
     }
 
     #[test]

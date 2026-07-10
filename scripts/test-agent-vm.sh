@@ -50,9 +50,14 @@ EOF
 [ "${1:-}" = "--help" ] && { usage; exit 0; }
 
 require_root
-require_cmd jq buildah timeout
+require_cmd jq buildah timeout ssh ssh-keygen
 require_hearthctl
 require_daemon
+
+SSH_TMP="$(mktemp -d)"
+trap 'rm -rf "${SSH_TMP}"' EXIT
+SSH_KEY="${SSH_TMP}/id_ed25519"
+make_test_ssh_key "${SSH_KEY}"
 
 if [ "${CLEAN}" = "1" ]; then
   ctl destroy "${SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -73,6 +78,7 @@ ensure_image "${IMAGE_NAME}" \
 start_s="$(now_s)"
 ctl spawn "${SERVICE_NAME}" \
   --image "${IMAGE_NAME}" \
+  --authorized-keys-file "${SSH_KEY}.pub" \
   --mem "${MEMORY_MIB}" --cpu "${CPUS}" --disk "${SERVICE_DISK_GIB}" >/dev/null
 await_marker "${SERVICE_NAME}" "HEARTH_AGENT_PROBE ok boot_count=1" "${BOOT_BUDGET_S}"
 # vm-base contract: the agent user's systemd session stack (logind, session bus,
@@ -93,8 +99,10 @@ alloc="$(alloc_mac "${SERVICE_NAME}")"
 assert_nonempty "allocations.toml records a MAC" "${alloc}"
 assert_eq "guest MAC matches allocation" "${status_mac}" "${alloc}"
 
-# 5. Reachability: the image's sshd answers on the guest address from the host.
-assert_cmd "sshd reachable on ${addr}:${SSH_PORT}" wait_tcp "${addr}" "${SSH_PORT}" 30
+# 5. Recovery access: authenticate as agent with the key installed at create.
+assert_eq "status confirms managed SSH access" "$(svc_field "${SERVICE_NAME}" .provision.ssh_access)" "configured"
+assert_cmd "authenticated SSH recovery login to ${addr}:${SSH_PORT}" \
+  wait_ssh_login "${addr}" "${SSH_KEY}" "${SSH_PORT}" 30
 
 # 6. Stop/start persistence: the root disk survives, and the boot counter proves
 #    it (a fresh disk would report boot_count=1 again).

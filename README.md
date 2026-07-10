@@ -22,7 +22,10 @@ Install the daemon, CLI, and systemd unit; then build the dedicated guest kernel
 ```sh
 sudo make install                     # /usr/local/bin + hearth.service
 sudo scripts/build-guest-kernel.sh    # /var/lib/hearth/kernels/current/vmlinux
-hearthctl host check                  # verify every prerequisite before starting
+sudo install -d -m 0755 /etc/hearth
+sudo install -m 0644 ~/.ssh/id_ed25519.pub /etc/hearth/authorized_keys
+sudo systemctl enable --now hearth.service
+hearthctl host check                  # verify every host prerequisite
 ```
 
 Host prerequisites, the bridge/dnsmasq contract, and the upgrade rule live in
@@ -40,9 +43,16 @@ hearthctl start dev
 Dockerfile images are VM root filesystem recipes: the resolved OCI
 `ENTRYPOINT + CMD` must be an init-like absolute path and becomes guest PID 1.
 `image build` runs a build-time linter over the unpacked rootfs (rejecting a
-missing init or fstab root entry, warning on missing udev/networkd/sshd) so an
+missing init, fstab root entry, agent account, or usable sshd) so an
 image-content bug fails the build instead of a boot. See
 `docs/dockerfile-images.md`.
+
+Every new VM must have managed SSH recovery access. Hearth merges the host
+keyring at `/etc/hearth/authorized_keys` (override with
+`HEARTH_AUTHORIZED_KEYS_FILE`) with per-VM `--ssh-key` and
+`--authorized-keys-file` values, then installs the result for `agent` while the
+scratch disk is mounted. A keyless create is rejected unless the operator uses
+the deliberately noisy `--allow-no-ssh` escape hatch.
 
 Spawn N VMs from one template, each individually provisioned and reachable, in a
 single command each:
@@ -67,7 +77,7 @@ guest kernel, and `hearth0` DHCP/NAT):
 
 ```sh
 cargo build
-sudo scripts/test-agent-vm.sh      # one VM: address, reachability, MAC==alloc, budget, persistence, cleanup
+sudo scripts/test-agent-vm.sh      # one VM: authenticated SSH, address, MAC==alloc, budget, persistence, cleanup
 sudo scripts/test-spawn-multi.sh   # two VMs from one image: distinct address/MAC/hostname, reachable
 sudo scripts/test-hermes-vm.sh     # the §10 multi-VM story (needs HERMES_COMMIT to build the image)
 ```

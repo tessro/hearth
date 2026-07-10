@@ -79,5 +79,8 @@ session must work for that user — both over SSH and at boot, before any login.
   `spawn --provision-file` / the service TOML `[provision]` block (§3), not
   `COPY`. That keeps credentials out of the shared image and gives each VM its
   own machine-id and SSH host keys.
+- **SSH authorized keys.** Hearth installs its host recovery keyring plus any
+  per-VM `--ssh-key` / `--authorized-keys-file` values during disk provisioning.
+  Workload images must not bake `/home/agent/.ssh/authorized_keys`.
 - **Workload packages and units.** Anything specific to the service — the
   Hermes install, probes, extra apt packages — lives in the workload Dockerfile.

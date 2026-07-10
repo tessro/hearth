@@ -6,6 +6,7 @@ pub mod net;
 pub mod notify;
 pub mod provision;
 pub mod registry;
+pub mod ssh;
 pub mod vsock;
 
 use crate::{
@@ -281,6 +282,8 @@ impl<H: Host + 'static> Daemon<H> {
         // Never echo provisioning literal contents back: replace the serialized
         // provision block with a redacted summary (dest/mode/owner + flags).
         value["provision"] = svc.provision.redacted_summary();
+        value["ssh_access"] = json!(svc.provision.ssh_access_state());
+        value["ssh_key_fingerprints"] = json!(svc.provision.ssh_key_fingerprints());
         // Always surface publishes (even when empty) and the guest address.
         value["publish"] = json!(svc.publish);
         let leases = self.load_leases().await;
@@ -353,6 +356,42 @@ impl<H: Host + 'static> Daemon<H> {
                 .map_err(|e| coded("provision.invalid", format!("invalid provision args: {e}")))?,
             None => Provision::default(),
         };
+        let host_keys = match fs::read_to_string(&self.cfg.authorized_keys_file).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(coded(
+                    "ssh.authorized_keys_unreadable",
+                    format!("read {}: {err}", self.cfg.authorized_keys_file),
+                ))
+            }
+        };
+        let requested_keys = provisioning.authorized_keys.join("\n");
+        let merged_keys = crate::ssh::merge_authorized_keys([
+            (self.cfg.authorized_keys_file.as_str(), host_keys.as_str()),
+            ("create request", requested_keys.as_str()),
+        ])
+        .map_err(|err| coded("ssh.authorized_keys_invalid", format!("{err:#}")))?;
+        provisioning.authorized_keys = merged_keys
+            .iter()
+            .map(|key| key.canonical.clone())
+            .collect();
+        if provisioning.authorized_keys.is_empty() && !provisioning.allow_no_ssh {
+            return Err(coded(
+                "ssh.authorized_keys_required",
+                format!(
+                    "refusing to create VM without SSH recovery access; configure {}, pass \
+                     --ssh-key/--authorized-keys-file, or explicitly pass --allow-no-ssh",
+                    self.cfg.authorized_keys_file
+                ),
+            ));
+        }
+        if provisioning.authorized_keys.is_empty() {
+            warn!(service = %name, "creating VM with SSH recovery access explicitly disabled");
+        } else {
+            // The escape hatch only describes a genuinely keyless service.
+            provisioning.allow_no_ssh = false;
+        }
         let hostname_arg = optional_str(&args, "hostname").map(str::to_string);
         // Resolve the hostname: an explicit --hostname wins, then a hostname set
         // inside the provision block, then the service name.
@@ -447,6 +486,13 @@ impl<H: Host + 'static> Daemon<H> {
     async fn start_unlocked(&self, name: &str) -> Result<Value> {
         let mut reg = self.registry().await?;
         let mut svc = reg.get(name)?.clone();
+        if svc.provision.ssh_access_state() != "configured" {
+            warn!(
+                service = %name,
+                ssh_access = svc.provision.ssh_access_state(),
+                "starting VM without confirmed SSH recovery access"
+            );
+        }
         if !self.is_running(name).await {
             let image_metadata = image::load(&self.cfg, &svc.image).await?;
             validate_boot_prerequisites(&self.cfg, &image_metadata).await?;
@@ -875,6 +921,7 @@ impl<H: Host + 'static> Daemon<H> {
             check_path("run_dir", &self.cfg.run_dir, true),
             check_path("log_dir", &self.cfg.log_dir, true),
             check_path("guest_kernel", &self.cfg.guest_kernel, false),
+            check_authorized_keys_file(&self.cfg.authorized_keys_file).await,
             check_path("kvm_device", &Utf8PathBuf::from("/dev/kvm"), false),
             check_path(
                 "bridge",
@@ -1028,7 +1075,34 @@ fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Val
         "mac": svc.mac,
         "address": address,
         "is_agent_in_charge": svc.is_agent_in_charge,
+        "ssh_access": svc.provision.ssh_access_state(),
+        "ssh_key_fingerprints": svc.provision.ssh_key_fingerprints(),
     })
+}
+
+async fn check_authorized_keys_file(path: &Utf8PathBuf) -> Value {
+    match fs::read_to_string(path).await {
+        Ok(text) => match crate::ssh::parse_authorized_keys(&text, path.as_str()) {
+            Ok(keys) => json!({
+                "name": "authorized_keys",
+                "path": path,
+                "ok": !keys.is_empty(),
+                "keys": keys.len(),
+            }),
+            Err(err) => json!({
+                "name": "authorized_keys",
+                "path": path,
+                "ok": false,
+                "error": format!("{err:#}"),
+            }),
+        },
+        Err(err) => json!({
+            "name": "authorized_keys",
+            "path": path,
+            "ok": false,
+            "error": err.to_string(),
+        }),
+    }
 }
 
 fn required_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
@@ -1469,6 +1543,8 @@ mod tests {
     use clap::Parser;
     use std::sync::Mutex as StdMutex;
 
+    const TEST_AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEVBr+XtUOuloYyDWGTcKPPHbVwpSIATl/mJ6RE7gdN hearth-test";
+
     #[test]
     fn image_argv_uses_direct_kernel_boot() {
         let cfg = Config::parse_from([
@@ -1769,6 +1845,136 @@ backoff_sec = 10
         assert_eq!(dev.disk_gib, 40);
         assert_eq!(dev.disk.as_deref(), Some("dev.qcow2"));
         assert_eq!(dev.provision.hostname, "dev");
+        assert_eq!(dev.provision.ssh_access_state(), "configured");
+        assert_eq!(dev.provision.authorized_keys, vec![TEST_AUTHORIZED_KEY]);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_keyless_vm_before_disk_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::remove_file(&cfg.authorized_keys_file)
+            .await
+            .unwrap();
+        write_test_image(&cfg, "base").await;
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Create, create_args("keyless")))
+            .await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(
+            responses[0].error.as_ref().unwrap().code,
+            "ssh.authorized_keys_required"
+        );
+        assert!(!state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| call.starts_with("build-vm-disk ")));
+    }
+
+    #[tokio::test]
+    async fn create_explicit_no_ssh_is_persisted_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::remove_file(&cfg.authorized_keys_file)
+            .await
+            .unwrap();
+        write_test_image(&cfg, "base").await;
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+        let mut args = create_args("keyless");
+        args.insert("provision".into(), json!({ "allow_no_ssh": true }));
+
+        let responses = daemon.handle(Request::new("1", Verb::Create, args)).await;
+
+        assert!(responses[0].ok);
+        assert_eq!(
+            responses[0].result.as_ref().unwrap()["created"]["ssh_access"],
+            json!("intentionally-disabled")
+        );
+        let registry = Registry::load(&cfg).await.unwrap();
+        assert!(registry.get("keyless").unwrap().provision.allow_no_ssh);
+    }
+
+    #[tokio::test]
+    async fn create_merges_and_deduplicates_host_and_request_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        write_test_image(&cfg, "base").await;
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+        let mut args = create_args("deduped");
+        args.insert(
+            "provision".into(),
+            json!({
+                "authorized_keys": [TEST_AUTHORIZED_KEY.replace("hearth-test", "request-comment")],
+                "allow_no_ssh": true,
+            }),
+        );
+
+        let responses = daemon.handle(Request::new("1", Verb::Create, args)).await;
+
+        assert!(responses[0].ok);
+        let registry = Registry::load(&cfg).await.unwrap();
+        let provision = &registry.get("deduped").unwrap().provision;
+        assert_eq!(provision.authorized_keys, vec![TEST_AUTHORIZED_KEY]);
+        assert!(!provision.allow_no_ssh);
+        assert_eq!(provision.ssh_key_fingerprints().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_malformed_request_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        write_test_image(&cfg, "base").await;
+        let daemon = Daemon::new(cfg, FakeHost::default());
+        let mut args = create_args("invalid-key");
+        args.insert(
+            "provision".into(),
+            json!({ "authorized_keys": ["ssh-ed25519 not-base64"] }),
+        );
+
+        let responses = daemon.handle(Request::new("1", Verb::Create, args)).await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(
+            responses[0].error.as_ref().unwrap().code,
+            "ssh.authorized_keys_invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_check_reports_missing_recovery_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::remove_file(&cfg.authorized_keys_file)
+            .await
+            .unwrap();
+        let daemon = Daemon::new(cfg, FakeHost::default());
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::HostCheck, Map::new()))
+            .await;
+
+        assert!(responses[0].ok);
+        let checks = responses[0].result.as_ref().unwrap()["checks"]
+            .as_array()
+            .unwrap();
+        let keys = checks
+            .iter()
+            .find(|check| check["name"] == "authorized_keys")
+            .unwrap();
+        assert_eq!(keys["ok"], json!(false));
+        assert!(keys["error"].as_str().unwrap().contains("No such file"));
     }
 
     #[tokio::test]
@@ -2950,6 +3156,8 @@ backoff_sec = 10
     }
 
     fn test_config(root: &Utf8Path) -> Config {
+        let authorized_keys = root.join("authorized_keys");
+        std::fs::write(&authorized_keys, format!("{TEST_AUTHORIZED_KEY}\n")).unwrap();
         Config::parse_from([
             "hearthd",
             "--socket",
@@ -2968,6 +3176,8 @@ backoff_sec = 10
             root.join("run").as_str(),
             "--log-dir",
             root.join("log").as_str(),
+            "--authorized-keys-file",
+            authorized_keys.as_str(),
             "--guest-kernel",
             root.join("kernels/current/vmlinux").as_str(),
             "--lease-file",

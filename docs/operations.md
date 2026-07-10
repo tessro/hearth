@@ -42,6 +42,26 @@ binaries and are called out as such.
 preflights these and fails with the exact `install <pkg>` hint if one is missing,
 before the ~10-minute build, not after.
 
+### SSH recovery keyring
+
+Every VM create must resolve at least one authorized key. Install the host-wide
+recovery keyring before creating VMs:
+
+```sh
+sudo install -d -m 0755 /etc/hearth
+sudo install -m 0644 ~/.ssh/id_ed25519.pub /etc/hearth/authorized_keys
+```
+
+The file accepts bare OpenSSH public-key lines plus blank lines and comments.
+AuthorizedKeys options are intentionally rejected. Override its location with
+`HEARTH_AUTHORIZED_KEYS_FILE`; hearthd reads it on every create, so new keys do
+not require a daemon restart. Per-VM `--ssh-key` and `--authorized-keys-file`
+values are additive. If the host file and request are both empty, create fails
+before allocating or forming a disk unless `--allow-no-ssh` is explicit.
+`hearthctl ls` and `status` report `configured`, `intentionally-disabled`, or
+`legacy-unknown`; pre-feature service records remain bootable but warn as
+`legacy-unknown` because Hearth cannot prove what their existing disks contain.
+
 ### Guest kernel — `scripts/build-guest-kernel.sh` needs these
 
 Ordinary kernel build tools. The script preflights them and prints the same
@@ -92,18 +112,20 @@ sudo make install
 #    -> /etc/systemd/system/hearth.service
 #    -> /usr/local/share/doc/hearth/operations.md
 
-# 2. Build the dedicated guest kernel (vanilla kernel.org, no Nix). Installs
+# 2. Install at least one host-wide SSH recovery key.
+sudo install -d -m 0755 /etc/hearth
+sudo install -m 0644 ~/.ssh/id_ed25519.pub /etc/hearth/authorized_keys
+
+# 3. Build the dedicated guest kernel (vanilla kernel.org, no Nix). Installs
 #    /var/lib/hearth/kernels/<version>/vmlinux and a `current` symlink, which is
 #    the hearthd default. Rerun only to bump the pinned version, never for a host
 #    kernel change.
 sudo scripts/build-guest-kernel.sh
 
-# 3. Verify every prerequisite before starting anything.
-hearthctl host check          # table of paths/commands/modules, ok=true each
-
-# 4. Start the daemon.
+# 4. Start the daemon, then ask it to verify every host prerequisite.
 sudo systemctl enable --now hearth.service
 hearthctl ping                # "pong — hearthd <version> (pid <n>)"
+hearthctl host check          # paths/commands/modules/keyring, ok=true each
 ```
 
 ### NixOS (or any declaratively-managed systemd)

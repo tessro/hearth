@@ -46,9 +46,14 @@ EOF
 [ "${1:-}" = "--help" ] && { usage; exit 0; }
 
 require_root
-require_cmd jq buildah timeout
+require_cmd jq buildah timeout ssh ssh-keygen
 require_hearthctl
 require_daemon
+
+SSH_TMP="$(mktemp -d)"
+trap 'rm -rf "${SSH_TMP}"' EXIT
+SSH_KEY="${SSH_TMP}/id_ed25519"
+make_test_ssh_key "${SSH_KEY}"
 
 if [ "${NAME_A}" = "${NAME_B}" ]; then
   echo "error: NAME_A and NAME_B must differ (got '${NAME_A}')." >&2
@@ -77,6 +82,7 @@ ensure_image "${IMAGE_NAME}" \
 spawn_agent() {  # spawn_agent <name>
   ctl spawn "$1" \
     --image "${IMAGE_NAME}" \
+    --authorized-keys-file "${SSH_KEY}.pub" \
     --hostname "$1" \
     --mem "${MEMORY_MIB}" --cpu "${CPUS}" --disk "${SERVICE_DISK_GIB}" >/dev/null
 }
@@ -112,9 +118,11 @@ assert_ne "distinct hostnames" "${host_a}" "${host_b}"
 assert_eq "${NAME_A} hostname honored" "${host_a}" "${NAME_A}"
 assert_eq "${NAME_B} hostname honored" "${host_b}" "${NAME_B}"
 
-# 6. Each guest's sshd answers on its own address from the host.
-assert_cmd "${NAME_A} sshd reachable on ${addr_a}:${SSH_PORT}" wait_tcp "${addr_a}" "${SSH_PORT}" 30
-assert_cmd "${NAME_B} sshd reachable on ${addr_b}:${SSH_PORT}" wait_tcp "${addr_b}" "${SSH_PORT}" 30
+# 6. The managed recovery key authenticates to both independently-created VMs.
+assert_cmd "${NAME_A} authenticated SSH recovery login" \
+  wait_ssh_login "${addr_a}" "${SSH_KEY}" "${SSH_PORT}" 30
+assert_cmd "${NAME_B} authenticated SSH recovery login" \
+  wait_ssh_login "${addr_b}" "${SSH_KEY}" "${SSH_PORT}" 30
 
 # 7. Tear both down and confirm cleanup.
 for name in "${NAME_A}" "${NAME_B}"; do

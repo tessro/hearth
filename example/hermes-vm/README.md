@@ -23,7 +23,7 @@ image qcow2.
 ```sh
 cd example/hermes-vm
 cp hermes.env.example hermes.env
-cp authorized_keys.example authorized_keys   # optional; may stay empty
+cp authorized_keys.example authorized_keys   # needed if the host keyring is empty
 ```
 
 Edit `hermes.env`:
@@ -35,7 +35,9 @@ Edit `hermes.env`:
 - Set at least one model-provider key (e.g. `OPENROUTER_API_KEY`), **or** leave
   them blank and run `hermes setup --portal` over SSH after first boot.
 
-Put your Mac's SSH public key in `authorized_keys` if you want to log in.
+Put your Mac's SSH public key in `authorized_keys`, or configure the host-wide
+`/etc/hearth/authorized_keys`. Hearth requires at least one effective recovery
+key for every VM unless `--allow-no-ssh` is explicit.
 
 ## 2. Build the base, then the image
 
@@ -57,10 +59,10 @@ hearthctl image build --name hermes-vm --dockerfile example/hermes-vm/Dockerfile
 > launcher fails the build here, not on first boot.
 
 `image build` runs a build-time linter over the unpacked rootfs before it makes
-the disk (§2.2): it rejects an image whose init is missing or whose fstab has no
-root entry, and warns about a missing udev/`.network`/sshd or an unmasked
-serial getty. Pass `--skip-lint` only for an image that boots something other
-than systemd.
+the disk (§2.2): it rejects an image whose init, fstab root entry, fixed
+`agent:1000:1000` account, or public-key-capable sshd is missing, and rejects
+baked authorized keys. Pass `--skip-lint` only for an image that boots something
+other than systemd.
 
 ## 3. Boot and provision
 
@@ -72,7 +74,7 @@ Dockerfile:
 hearthctl spawn hermes \
   --image hermes-vm \
   --provision-file source=./hermes.env,dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000 \
-  --provision-file source=./authorized_keys,dest=/home/agent/.ssh/authorized_keys,mode=0600,owner=1000:1000 \
+  --authorized-keys-file ./authorized_keys \
   --mem 4096 --cpu 4 --disk 32
 hearthctl logs hermes --follow      # watch for HERMES_PROBE ok
 ```
