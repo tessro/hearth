@@ -1,9 +1,8 @@
-use crate::{
-    config::Config, error::coded, image::ImageMetadata, provision::ProvisionPlan, registry::Service,
-};
+use crate::{config::Config, error::coded, provision::ProvisionPlan, registry::Service};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use camino::Utf8Path;
+use hearth_proto::ImageManifest;
 use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::{
@@ -17,7 +16,7 @@ use tokio::{
 /// Output format for a standalone per-VM disk built from a qcow2 base. All boot
 /// disks are qcow2 (CHV's raw write path fails on some host FSes, e.g. ZFS);
 /// `Raw` is used only for the transient, loop-mountable provisioning scratch in
-/// [`Host::build_docker_disk`].
+/// [`Host::build_vm_disk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskFormat {
     Qcow2,
@@ -45,7 +44,7 @@ pub trait Host: Send + Sync {
         &self,
         cfg: &Config,
         service: &Service,
-        image: &ImageMetadata,
+        image: &ImageManifest,
     ) -> Result<()>;
     async fn systemd_restore_vm(
         &self,
@@ -62,28 +61,20 @@ pub trait Host: Send + Sync {
         disk_gib: u64,
         format: DiskFormat,
     ) -> Result<()>;
-    /// Loop-mount a raw per-VM disk and apply `plan`, then unmount. Docker-rootfs
-    /// only; called once at create time.
-    /// Build a docker-rootfs per-VM boot disk: convert the qcow2 base into a raw
+    /// Build a per-VM boot disk: convert the qcow2 base into a raw
     /// scratch copy, apply `plan` to it via a loop mount, then convert the
     /// provisioned scratch into the final qcow2 boot disk at `disk` and remove
-    /// the scratch. docker-rootfs VMs boot from qcow2, not raw: Cloud
+    /// the scratch. VMs boot from qcow2, not raw: Cloud
     /// Hypervisor's raw write path triggers guest EXT4 I/O errors on some host
     /// filesystems (notably ZFS). A bare-ext4 raw image is used only as the
     /// intermediate because qcow2 is not loop-mountable for provisioning.
-    async fn build_docker_disk(
+    async fn build_vm_disk(
         &self,
         backing: &Utf8Path,
         disk: &Utf8Path,
         scratch: &Utf8Path,
         disk_gib: u64,
         plan: &ProvisionPlan,
-    ) -> Result<()>;
-    async fn cloud_localds(
-        &self,
-        seed: &Utf8Path,
-        user_data: &Utf8Path,
-        meta_data: &Utf8Path,
     ) -> Result<()>;
     async fn chv_get(&self, socket: &Utf8Path, path: &str) -> Result<Value>;
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value>;
@@ -107,7 +98,7 @@ impl Host for RealHost {
         &self,
         cfg: &Config,
         service: &Service,
-        image: &ImageMetadata,
+        image: &ImageManifest,
     ) -> Result<()> {
         fs::create_dir_all(cfg.run_dir.join("vms")).await?;
         fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
@@ -176,7 +167,7 @@ impl Host for RealHost {
         run_status(resize, "qemu-img resize").await
     }
 
-    async fn build_docker_disk(
+    async fn build_vm_disk(
         &self,
         backing: &Utf8Path,
         disk: &Utf8Path,
@@ -211,20 +202,6 @@ impl Host for RealHost {
         let converted = run_status(convert, "qemu-img convert raw->qcow2").await;
         let _ = fs::remove_file(scratch.as_str()).await;
         converted
-    }
-
-    async fn cloud_localds(
-        &self,
-        seed: &Utf8Path,
-        user_data: &Utf8Path,
-        meta_data: &Utf8Path,
-    ) -> Result<()> {
-        if let Some(parent) = seed.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let mut cmd = Command::new("cloud-localds");
-        cmd.args([seed.as_str(), user_data.as_str(), meta_data.as_str()]);
-        run_status(cmd, "cloud-localds").await
     }
 
     async fn chv_get(&self, socket: &Utf8Path, path: &str) -> Result<Value> {
@@ -356,41 +333,12 @@ fn memory_max_mib(memory_mib: u64) -> u64 {
 pub fn cloud_hypervisor_argv(
     cfg: &Config,
     service: &Service,
-    image: &ImageMetadata,
+    manifest: &ImageManifest,
 ) -> Vec<String> {
-    match image {
-        ImageMetadata::CloudImage => cloud_image_argv(cfg, service),
-        ImageMetadata::DockerRootfs(manifest) => docker_rootfs_argv(cfg, service, manifest),
-    }
+    image_argv(cfg, service, manifest)
 }
 
-fn cloud_image_argv(cfg: &Config, service: &Service) -> Vec<String> {
-    let mut args = vec![
-        "cloud-hypervisor".to_string(),
-        "--api-socket".to_string(),
-        cfg.vm_socket(&service.name).to_string(),
-        "--kernel".to_string(),
-        cfg.firmware.to_string(),
-        "--disk".to_string(),
-        format!("path={}", cfg.disk_path(service)),
-        "--disk".to_string(),
-        format!("path={},readonly=on", cfg.seed_path(&service.name)),
-        "--net".to_string(),
-        format!("tap={},mac={}", tap_name(&service.name), service.mac),
-        "--serial".to_string(),
-        format!("file={}", cfg.console_path(&service.name)),
-        "--console".to_string(),
-        "off".to_string(),
-        "--cpus".to_string(),
-        format!("boot={}", service.cpu),
-        "--memory".to_string(),
-        format!("size={}M", service.memory_mib),
-    ];
-    append_vsock(&mut args, cfg, service);
-    args
-}
-
-fn docker_rootfs_argv(
+fn image_argv(
     cfg: &Config,
     service: &Service,
     manifest: &hearth_proto::ImageManifest,
@@ -410,7 +358,7 @@ fn docker_rootfs_argv(
         "--disk".to_string(),
         format!("path={}", cfg.disk_path(service)),
         "--cmdline".to_string(),
-        docker_rootfs_cmdline(manifest),
+        kernel_cmdline(manifest),
         "--net".to_string(),
         format!("tap={},mac={}", tap_name(&service.name), service.mac),
     ]);
@@ -439,7 +387,7 @@ fn append_vsock(args: &mut Vec<String>, cfg: &Config, service: &Service) {
     ]);
 }
 
-fn docker_rootfs_cmdline(manifest: &hearth_proto::ImageManifest) -> String {
+fn kernel_cmdline(manifest: &hearth_proto::ImageManifest) -> String {
     format!(
         "console=ttyS0 root={} rootfstype={} rw init={}",
         manifest.root_device, manifest.root_fstype, manifest.init
@@ -705,11 +653,6 @@ async fn delete_tap_device(tap: &str) -> Result<()> {
     let mut cmd = Command::new("ip");
     cmd.args(["link", "del", tap]);
     run_status(cmd, "ip link del").await
-}
-
-pub fn sanitize_image_name(url: &str) -> String {
-    let tail = url.rsplit('/').next().unwrap_or("image.qcow2");
-    tail.strip_suffix(".qcow2").unwrap_or(tail).to_string()
 }
 
 #[cfg(test)]

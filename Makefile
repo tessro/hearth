@@ -1,8 +1,6 @@
 PREFIX      ?= /usr/local
 BINDIR      ?= $(PREFIX)/bin
 UNITDIR     ?= /etc/systemd/system
-FIRMWAREDIR ?= /var/lib/hearth/firmware
-FIRMWARE_URL ?= https://github.com/cloud-hypervisor/edk2/releases/download/ch-1e1b96f126/CLOUDHV.fd
 BRIDGE      ?= hearth0
 
 CARGO       ?= cargo
@@ -10,7 +8,7 @@ INSTALL     ?= install
 
 BUILDAH     ?= buildah
 
-.PHONY: build test clippy dev install install-bin uninstall firmware vm-base reload enable start stop restart status logs ping clean
+.PHONY: build test clippy dev install install-bin uninstall vm-base reload enable start stop restart status logs ping clean
 
 build:
 	$(CARGO) build --release
@@ -33,7 +31,7 @@ clippy:
 # Run hearthd in the foreground out of target/release. Override BRIDGE for a
 # different bridge name.
 dev: build
-	sudo HEARTH_FIRMWARE=$(FIRMWAREDIR)/CLOUDHV.fd HEARTH_BRIDGE=$(BRIDGE) \
+	sudo HEARTH_BRIDGE=$(BRIDGE) \
 		./target/release/hearthd
 
 # Install the release binaries and the systemd unit. `install -D` creates parent
@@ -71,16 +69,6 @@ uninstall:
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
 		systemctl daemon-reload; \
 	fi
-
-# hearthd runs as root (systemd unit sets no User=), and the shipped install
-# path creates no `hearth` user, so install the firmware root:root — owning it to
-# a nonexistent `hearth` user would abort with `invalid user 'hearth'` on a fresh
-# host. 0750/0640 keeps it root-only.
-firmware:
-	$(INSTALL) -d -m 0750 $(FIRMWAREDIR)
-	curl -fsSL -o $(FIRMWAREDIR)/CLOUDHV.fd.tmp $(FIRMWARE_URL)
-	$(INSTALL) -m 0640 $(FIRMWAREDIR)/CLOUDHV.fd.tmp $(FIRMWAREDIR)/CLOUDHV.fd
-	rm -f $(FIRMWAREDIR)/CLOUDHV.fd.tmp
 
 reload:
 	systemctl daemon-reload

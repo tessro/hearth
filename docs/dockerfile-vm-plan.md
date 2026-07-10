@@ -93,7 +93,6 @@ Initial manifest shape:
 
 ```toml
 version = 1
-kind = "docker-rootfs"
 root_device = "/dev/vda"
 root_fstype = "ext4"
 init = "/usr/local/bin/init"
@@ -104,8 +103,7 @@ cwd = "/home/exedev"
 env = ["EXEUNTU=1"]
 ```
 
-Images without a sidecar manifest are treated as today's cloud-image qcow2
-format during the transition.
+Images without a sidecar manifest are invalid.
 
 ## CLI Shape
 
@@ -145,8 +143,7 @@ hearthctl logs dev --follow
 
 Add image metadata loading in `hearthd`:
 
-- If the image has no sidecar manifest, boot as today's cloud image.
-- If `kind = "docker-rootfs"`, use direct-kernel boot.
+- Require a valid sidecar manifest and use direct-kernel boot.
 
 The direct-kernel Cloud Hypervisor args should look conceptually like:
 
@@ -238,14 +235,11 @@ because it installs Docker inside the guest and writes `/etc/fstab` for:
 
 ## First-Boot Policy
 
-Do not depend on cloud-init for Dockerfile-defined VMs.
-
 For the first implementation:
 
 - Hearth should boot the image exactly as built.
 - Hostname, users, SSH keys, and service-specific customization are the image
   author's responsibility.
-- Existing `cloud_init` fields can remain for cloud-image services.
 
 Later, add an offline customization step for Dockerfile images if needed:
 
@@ -280,8 +274,7 @@ That should be explicit Hearth VM customization, not hidden Docker compatibility
 
 - Add a protocol verb for image import.
 - Copy qcow2 and manifest into `images_dir` atomically.
-- Extend `image ls` to show image kind.
-- Keep current `.qcow2` listing behavior for cloud-image compatibility.
+- Require the qcow2 and manifest pair in `image ls`.
 
 ### 4. Boot Dockerfile Images As Managed VMs
 
@@ -319,7 +312,6 @@ That should be explicit Hearth VM customization, not hidden Docker compatibility
   container exit-code semantics.
 - Supporting Dockerfile `CMD` that is not a VM init.
 - Streaming build contexts through the line-JSON protocol in the first version.
-- Making cloud-init a requirement for Dockerfile-defined VMs.
 
 ## Open Questions
 

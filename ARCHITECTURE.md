@@ -63,7 +63,7 @@ Long-running Rust daemon. Itself a systemd unit (`hearth.service`). Responsibili
 - Accepts line-delimited JSON requests; validates against a verb allowlist; dispatches to:
   - `systemd-run` for VM process lifecycle (start/stop the CHV process itself).
   - The per-VM Cloud Hypervisor HTTP API over its unix socket for runtime ops (`vm.boot`, `vm.shutdown`, `vm.reboot`, `vm.info`, `vm.snapshot`, `vm.restore`, `vm.resize`).
-  - The host filesystem for image and disk operations (copy, qcow2 backing files, cloud-init seed ISO generation).
+  - The host filesystem for image import and per-VM disk provisioning.
 - Writes a structured audit log to journald: every request, who, when, args, result.
 - On startup, reconciles desired state (services marked `enabled = true`) with runtime state (which CHV processes are running).
 
@@ -79,8 +79,8 @@ Verbs (initial set):
 ```
 hearthctl ls                              # list services + state
 hearthctl status <name>                   # detailed status of one service
-hearthctl create <name> [--from <image>]  # provision new VM
-hearthctl destroy <name>                  # stop and remove VM, disk, seed, config
+hearthctl create <name> --from <image>    # provision new VM
+hearthctl destroy <name>                  # stop and remove VM, disk, config
 hearthctl start <name>                    # boot VM (idempotent)
 hearthctl stop <name>                     # graceful shutdown
 hearthctl restart <name>                  # graceful restart
@@ -91,7 +91,6 @@ hearthctl resize <name> [--cpu N] [--mem M]  # live resize via CHV API
 hearthctl logs <name> [--follow]          # serial-console output
 hearthctl image ls                        # list base images
 hearthctl image build --name n --dockerfile ./Dockerfile --context . --disk 40
-hearthctl image pull <url>                # download base image
 hearthctl image rm <name>                 # remove base image
 ```
 
@@ -101,12 +100,10 @@ One `cloud-hypervisor` process per VM, supervised by systemd as a transient unit
 
 - An API socket at `/run/hearth/vms/<name>.sock`.
 - A vsock CID assigned by hearth.
-- A disk (qcow2 with a base-image backing file, by default).
-- For cloud images, a cloud-init seed ISO at `/var/lib/hearth/seeds/<name>.iso`.
+- A standalone qcow2 disk provisioned from the base image at create time.
 - Serial console redirected to a file at `/var/log/hearth/<name>.console` (this is what `hearthctl logs` tails).
-- Boot mode depends on image kind:
-  - Cloud qcow2 images use `rust-hypervisor-firmware`, which loads stock Debian Cloud images directly without kernel extraction.
-  - Dockerfile rootfs images use direct-kernel boot with `root=/dev/vda` and `init=<resolved OCI command>`.
+- Direct-kernel boot with the shared Hearth guest kernel, `root=/dev/vda`, and
+  `init=<resolved OCI command>` from the image manifest.
 
 ### Agent-in-charge vsock proxy
 
@@ -152,17 +149,16 @@ A service is a VM. Defined by a TOML file in `/etc/hearth/services/<name>.toml`:
 ```toml
 name        = "mail"
 enabled     = true
-image       = "debian-12-cloud-amd64"     # base image, lives in /var/lib/hearth/images/
+image       = "mail-vm"                   # image + manifest live in /var/lib/hearth/images/
 cpu         = 2
 memory_mib  = 2048
 disk_gib    = 20
 vsock_cid   = 100                          # assigned by hearth on create; preserved across reboots
 mac         = "52:54:00:12:34:56"          # generated on create; preserved
 
-[cloud_init]
-hostname    = "mail"
-ssh_keys    = ["ssh-ed25519 AAAA..."]
-user        = "agent"
+[provision]
+hostname         = "mail"
+reset_machine_id = true
 
 [restart]
 policy      = "on-failure"
@@ -178,15 +174,16 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 
 1. Validate name (kebab-case, not already in registry).
 2. Allocate vsock CID (next free integer ≥ 100) and MAC (locally administered range).
-3. Allocate disk by copying `/var/lib/hearth/images/<image>.qcow2` into `/var/lib/hearth/disks/<name>.qcow2` and resizing it to `<disk_gib>G`.
-4. For cloud images, generate cloud-init seed: `cloud-localds /var/lib/hearth/seeds/<name>.iso user-data meta-data`. Dockerfile rootfs images boot exactly as built and skip this step.
+3. Convert `/var/lib/hearth/images/<image>.qcow2` to a sized raw scratch disk.
+4. Apply the per-service provisioning plan (hostname, machine-id, optional files),
+   then convert the scratch to `/var/lib/hearth/disks/<name>.qcow2`.
 5. Write `/etc/hearth/services/<name>.toml` with `enabled = false`.
 6. Return; do not boot. `hearthctl start <name>` is a separate step.
 
 ### Boot (start)
 
 1. Read service config.
-2. Pre-create the per-VM tap (`ip tuntap add dev hrt-<name> mode tap`, then attach to `hearth0` and set up), then `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /var/lib/hearth/firmware/CLOUDHV.fd --disk path=<disk>.qcow2 --disk path=<seed>.iso,readonly=on --net tap=hrt-<name>,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M`.
+2. Pre-create the per-VM tap (`ip tuntap add dev hrt-<name> mode tap`, then attach to `hearth0` and set up), then `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /var/lib/hearth/kernels/current/vmlinux --disk path=<disk>.qcow2 --cmdline "console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=<manifest-init>" --net tap=hrt-<name>,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M`.
 3. Wait for CHV API socket to be ready (poll with timeout).
 4. Mark `enabled = true` in registry (so reboot survives host restart).
 5. Return current status.
@@ -213,7 +210,7 @@ CHV's `vm.snapshot` produces a directory with memory state + disk metadata. Hear
 ### Destroy
 
 1. Stop if running.
-2. Remove disk, seed ISO, snapshot directory, console log.
+2. Remove disk, snapshot directory, console log.
 3. Remove `/etc/hearth/services/<name>.toml`.
 4. Free vsock CID and MAC in the registry's allocation map.
 
@@ -223,7 +220,8 @@ One host bridge `hearth0` carries all VM traffic. Hearth does not manage the bri
 
 Each VM gets a persistent tap named `hrt-<service>`, created by hearthd at start time and attached to `hearth0`. The tap is named explicitly rather than letting CHV pick — CHV's `--net` doesn't accept `bridge=`, so the bridge attachment happens outside CHV before launch.
 
-Guest network configuration is the guest's problem: cloud-init sets DHCP by default. The dnsmasq instance on `hearth0` answers; Hearth itself does not run dnsmasq, does not assign IPs, does not manage DNS.
+Guest network configuration is part of the image contract; the standard base
+uses systemd-networkd with DHCP. The dnsmasq instance on `hearth0` answers.
 
 ## Storage
 
@@ -234,12 +232,11 @@ Guest network configuration is the guest's problem: cloud-init sets DHCP by defa
     web.toml
   allocations.toml          # vsock CID + MAC allocations
 /var/lib/hearth/
-  images/                   # base cloud images, content-addressed by filename
-    debian-12-cloud-amd64.qcow2
-  disks/                    # per-VM disks, qcow2 with backing-file → images/
+  images/                   # immutable image disks plus required manifests
+    mail-vm.qcow2
+    mail-vm.hearth.toml
+  disks/                    # standalone per-VM qcow2 disks
     mail.qcow2
-  seeds/                    # per-VM cloud-init seed ISOs
-    mail.iso
   snapshots/
     mail/
       <tag>/                # CHV snapshot directory
@@ -299,7 +296,6 @@ This is the only systemd config that lives on disk for hearth-related VM managem
 
 ## Open questions
 
-- **Image acquisition**: should `hearthctl image pull <url>` verify checksums against a known list, or just fetch what the user asks for?
 - **Snapshot retention**: explicit only, or auto-prune by count/age?
 - **`hearthctl exec`**: a verb for running commands inside guests was deferred. Likely belongs in a per-guest agent, not hearthd.
 - **Resource limits beyond CHV's**: should hearth set systemd `MemoryMax`/`CPUQuota` on the transient unit as a belt-and-suspenders bound? Probably yes for `MemoryMax`.

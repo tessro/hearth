@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the dedicated Hearth guest kernel from vanilla kernel.org sources.
 #
-# Hearth docker-rootfs VMs boot a raw `vmlinux` ELF directly through Cloud
+# Hearth VMs boot a raw `vmlinux` ELF directly through Cloud
 # Hypervisor's PVH entry point: no bootloader, no bzImage, no initramfs. That
 # only works if every driver the guest needs (virtio_blk for root, ext4,
 # virtio_net, vsock, af_packet, ...) is compiled *in*, so this script pins an

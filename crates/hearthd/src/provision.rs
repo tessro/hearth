@@ -1,5 +1,5 @@
 //! Offline per-VM provisioning (REFACTOR_PROPOSAL.md §3). The daemon mounts a
-//! docker-rootfs VM's raw disk once at create time and applies a [`ProvisionPlan`]:
+//! VM's raw disk once at create time and applies a [`ProvisionPlan`]:
 //! write secret/config files, reset machine-id and SSH host keys, set hostname.
 //!
 //! Plan *construction* ([`ProvisionPlan::from_provision`]) is a pure function,

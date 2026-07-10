@@ -44,17 +44,13 @@ enum Command {
     Create {
         name: String,
         #[arg(long = "from")]
-        image: Option<String>,
+        image: String,
         #[arg(long)]
         cpu: Option<u32>,
         #[arg(long = "mem")]
         memory_mib: Option<u64>,
         #[arg(long = "disk")]
         disk_gib: Option<u64>,
-        #[arg(long)]
-        ssh_key: Vec<String>,
-        #[arg(long = "authorized-keys-file")]
-        authorized_keys_file: Vec<Utf8PathBuf>,
         #[arg(long)]
         agent_in_charge: bool,
     },
@@ -229,11 +225,6 @@ enum ImageCommand {
         #[arg(long = "skip-lint")]
         skip_lint: bool,
     },
-    Pull {
-        url: String,
-        #[arg(long)]
-        name: Option<String>,
-    },
     Rm {
         name: String,
     },
@@ -349,14 +340,6 @@ async fn main() -> Result<()> {
     render(&cli.command, responses)
 }
 
-fn read_authorized_keys(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
-}
-
 fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
     Ok(match command {
         Command::Ping => (Verb::Ping, empty_args()),
@@ -369,24 +352,12 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             cpu,
             memory_mib,
             disk_gib,
-            ssh_key,
-            authorized_keys_file,
             agent_in_charge,
         } => {
-            let mut args = args([("name", json!(name))]);
-            insert_opt(&mut args, "image", image.as_ref().map(|v| json!(v)));
+            let mut args = args([("name", json!(name)), ("image", json!(image))]);
             insert_opt(&mut args, "cpu", cpu.map(|v| json!(v)));
             insert_opt(&mut args, "memory_mib", memory_mib.map(|v| json!(v)));
             insert_opt(&mut args, "disk_gib", disk_gib.map(|v| json!(v)));
-            let mut keys: Vec<String> = ssh_key.clone();
-            for path in authorized_keys_file {
-                let text =
-                    std::fs::read_to_string(path).map_err(|e| anyhow!("read {path}: {e}"))?;
-                keys.extend(read_authorized_keys(&text));
-            }
-            if !keys.is_empty() {
-                args.insert("ssh_keys".into(), json!(keys));
-            }
             if *agent_in_charge {
                 args.insert("is_agent_in_charge".into(), json!(true));
             }
@@ -425,11 +396,6 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
         Command::Image { command } => match command {
             ImageCommand::Ls => (Verb::ImageLs, empty_args()),
             ImageCommand::Build { .. } => return Err(anyhow!("image build is handled locally")),
-            ImageCommand::Pull { url, name } => {
-                let mut args = args([("url", json!(url))]);
-                insert_opt(&mut args, "name", name.as_ref().map(|v| json!(v)));
-                (Verb::ImagePull, args)
-            }
             ImageCommand::Rm { name } => (Verb::ImageRm, args([("name", json!(name))])),
         },
         Command::Host { command } => match command {
@@ -566,11 +532,10 @@ fn render_images(result: Option<&Value>) -> Result<()> {
         .ok_or_else(|| anyhow!("malformed image ls response"))?;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(["NAME", "KIND", "BYTES", "SHA256"]);
+    table.set_header(["NAME", "BYTES", "SHA256"]);
     for image in images {
         table.add_row([
             cell(image, "name"),
-            cell(image, "kind"),
             cell(image, "bytes"),
             cell(image, "sha256"),
         ]);
@@ -718,23 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn image_pull_maps_url_and_optional_name() {
-        let (verb, args) = to_request(&Command::Image {
-            command: ImageCommand::Pull {
-                url: "https://example.invalid/debian.qcow2".to_string(),
-                name: Some("debian".to_string()),
-            },
-        })
-        .unwrap();
-        assert_eq!(verb, Verb::ImagePull);
-        assert_eq!(
-            args.get("url"),
-            Some(&json!("https://example.invalid/debian.qcow2"))
-        );
-        assert_eq!(args.get("name"), Some(&json!("debian")));
-    }
-
-    #[test]
     fn image_build_is_local_only() {
         let err = to_request(&Command::Image {
             command: ImageCommand::Build {
@@ -836,12 +784,10 @@ mod tests {
     fn create_maps_resource_arguments() {
         let (verb, args) = to_request(&Command::Create {
             name: "web".to_string(),
-            image: Some("debian".to_string()),
+            image: "debian".to_string(),
             cpu: Some(4),
             memory_mib: Some(4096),
             disk_gib: Some(30),
-            ssh_key: vec!["ssh-ed25519 AAAA test".to_string()],
-            authorized_keys_file: vec![],
             agent_in_charge: true,
         })
         .unwrap();
@@ -851,10 +797,6 @@ mod tests {
         assert_eq!(args.get("cpu"), Some(&json!(4)));
         assert_eq!(args.get("memory_mib"), Some(&json!(4096)));
         assert_eq!(args.get("disk_gib"), Some(&json!(30)));
-        assert_eq!(
-            args.get("ssh_keys"),
-            Some(&json!(["ssh-ed25519 AAAA test"]))
-        );
         assert_eq!(args.get("is_agent_in_charge"), Some(&json!(true)));
     }
 

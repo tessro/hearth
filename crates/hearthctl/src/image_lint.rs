@@ -379,7 +379,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn manifest() -> ImageManifest {
-        ImageManifest::docker_rootfs(OciProcess {
+        ImageManifest::from_oci_process(OciProcess {
             args: vec!["/usr/local/bin/init".to_string()],
             env: vec![],
             cwd: "/".to_string(),
@@ -503,7 +503,7 @@ mod tests {
         assert!(check_init_exec_form(&ctx(&root)).is_none());
 
         // Shell-form init (relative args[0]) is rejected. Built by hand because
-        // ImageManifest::docker_rootfs refuses to construct a relative init.
+        // ImageManifest::from_oci_process refuses to construct a relative init.
         let mut c = ctx(&root);
         c.manifest.oci.args = vec!["python3".to_string()];
         let f = check_init_exec_form(&c).unwrap();

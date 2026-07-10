@@ -42,8 +42,8 @@ hearthctl start dev
 hearthctl logs dev --follow
 ```
 
-Images without a `.hearth.toml` sidecar are treated as traditional cloud qcow2
-images and still use the firmware plus cloud-init seed boot path.
+Every image requires a `.hearth.toml` sidecar. A qcow2 without a valid manifest
+is not a Hearth image and cannot be listed, created, or started.
 
 ## Spawning multiple VMs from one template
 
@@ -88,7 +88,7 @@ boot; rerun `hearthctl status <name>` once the lease lands.
 
 ## Guest Kernel
 
-docker-rootfs images boot a dedicated Hearth guest kernel directly through Cloud
+Hearth images boot a dedicated guest kernel directly through Cloud
 Hypervisor's PVH entry point — no bootloader and **no initramfs**. The kernel is
 a pinned vanilla kernel.org LTS build with the VM driver contract (virtio, ext4,
 vsock, af_packet, overlayfs, cgroup v2, Docker-in-guest netfilter) compiled in;
@@ -108,7 +108,7 @@ That downloads the pinned source, verifies its sha256, applies
 Run with `--install-dir ~/.local/share/hearth/kernels` to build without root, or
 `--help` for all options.
 
-If the guest kernel is missing, `hearthd` refuses to `start` a docker-rootfs
+If the guest kernel is missing, `hearthd` refuses to `start` a
 service with a `kernel.not_found` error naming this script, rather than panicking
 on the serial console. Each image can also declare `min_kernel_contract` in its
 `.hearth.toml`; a kernel older than an image requires is rejected at start with

@@ -1,35 +1,17 @@
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
-use hearth_proto::{ImageKind, ImageManifest};
+use hearth_proto::ImageManifest;
 use tokio::fs;
 
-pub const CLOUD_IMAGE_KIND: &str = "cloud-image";
-pub const DOCKER_ROOTFS_KIND: &str = "docker-rootfs";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImageMetadata {
-    CloudImage,
-    DockerRootfs(ImageManifest),
-}
-
-impl ImageMetadata {
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::CloudImage => CLOUD_IMAGE_KIND,
-            Self::DockerRootfs(_) => DOCKER_ROOTFS_KIND,
-        }
-    }
-}
-
-pub async fn load(cfg: &Config, image: &str) -> Result<ImageMetadata> {
+pub async fn load(cfg: &Config, image: &str) -> Result<ImageManifest> {
     let manifest_path = cfg.image_manifest_path(image);
     if !manifest_path.exists() {
-        return Ok(ImageMetadata::CloudImage);
+        return Err(anyhow!(
+            "image {image} has no Hearth manifest at {manifest_path}"
+        ));
     }
-    read_manifest(&manifest_path)
-        .await
-        .map(ImageMetadata::DockerRootfs)
+    read_manifest(&manifest_path).await
 }
 
 pub async fn read_manifest(path: &Utf8Path) -> Result<ImageManifest> {
@@ -41,9 +23,7 @@ pub async fn read_manifest(path: &Utf8Path) -> Result<ImageManifest> {
     manifest
         .validate()
         .map_err(|message| anyhow!("invalid image manifest {path}: {message}"))?;
-    match manifest.kind {
-        ImageKind::DockerRootfs => Ok(manifest),
-    }
+    Ok(manifest)
 }
 
 /// Parse the contents of a kernel `contract` file. A missing file (`None`)
@@ -97,7 +77,7 @@ mod tests {
     // ordering so min_kernel_contract stays a top-level scalar.
     #[test]
     fn manifest_serializes_to_toml_and_round_trips() {
-        let mut manifest = ImageManifest::docker_rootfs(hearth_proto::OciProcess {
+        let mut manifest = ImageManifest::from_oci_process(hearth_proto::OciProcess {
             args: vec!["/usr/local/bin/init".to_string()],
             env: vec!["EXEUNTU=1".to_string()],
             cwd: "/home/exedev".to_string(),

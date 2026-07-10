@@ -17,7 +17,7 @@ cargo build
 ```
 
 Install the daemon, CLI, and systemd unit; then build the dedicated guest kernel
-(vanilla kernel.org sources, no Nix) that docker-rootfs VMs boot directly:
+(vanilla kernel.org sources, no Nix) that Hearth VMs boot directly:
 
 ```sh
 sudo make install                     # /usr/local/bin + hearth.service
@@ -79,18 +79,16 @@ environment.
 Local smoke test without touching `/etc` or `/var`:
 
 ```sh
-mkdir -p /tmp/hearth-smoke/{services,images,disks,seeds,snapshots,run,log}
+mkdir -p /tmp/hearth-smoke/{services,images,disks,snapshots,run,log}
 target/debug/hearthd \
   --socket /tmp/hearth-smoke/hearth.sock \
   --services-dir /tmp/hearth-smoke/services \
   --allocations /tmp/hearth-smoke/allocations.toml \
   --images-dir /tmp/hearth-smoke/images \
   --disks-dir /tmp/hearth-smoke/disks \
-  --seeds-dir /tmp/hearth-smoke/seeds \
   --snapshots-dir /tmp/hearth-smoke/snapshots \
   --run-dir /tmp/hearth-smoke/run \
   --log-dir /tmp/hearth-smoke/log \
-  --firmware /tmp/hearth-smoke/CLOUDHV.fd \
   --disable-vsock
 
 target/debug/hearthctl --socket /tmp/hearth-smoke/hearth.sock ping
@@ -99,7 +97,7 @@ target/debug/hearthctl --socket /tmp/hearth-smoke/hearth.sock ls
 
 Production defaults follow `ARCHITECTURE.md`: `/run/hearth.sock`,
 `/etc/hearth/services`, `/etc/hearth/allocations.toml`,
-`/var/lib/hearth/{images,disks,seeds,snapshots}`, `/run/hearth/{vms,vsock}`,
+`/var/lib/hearth/{images,disks,snapshots}`, `/run/hearth/{vms,vsock}`,
 and `/var/log/hearth`.
 
 When a service is marked `is_agent_in_charge = true`, `hearthd` also starts a

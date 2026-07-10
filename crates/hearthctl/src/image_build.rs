@@ -114,7 +114,7 @@ pub async fn build(opts: BuildOptions) -> Result<()> {
     .await?;
 
     let process = read_oci_process(&paths.bundle)?;
-    let manifest = ImageManifest::docker_rootfs(process).map_err(|message| anyhow!(message))?;
+    let manifest = ImageManifest::from_oci_process(process).map_err(|message| anyhow!(message))?;
 
     // Validate the unpacked tree before we spend minutes turning it into a disk
     // (§2.2). Runs after umoci unpack, before mkfs.

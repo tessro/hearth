@@ -1,4 +1,3 @@
-pub mod cloud_init;
 pub mod config;
 pub mod error;
 pub mod host;
@@ -12,21 +11,15 @@ pub mod vsock;
 use crate::{
     config::Config,
     error::{code_of, coded},
-    host::{
-        boot_config_status, cloud_hypervisor_argv, sanitize_image_name, unit_name,
-        wait_for_inactive, DiskFormat, Host,
-    },
-    image::ImageMetadata,
+    host::{boot_config_status, cloud_hypervisor_argv, unit_name, wait_for_inactive, Host},
     net::PublishTarget,
     provision::ProvisionPlan,
-    registry::{
-        validate_name, Allocations, CloudInit, Provision, Publish, Registry, RestartPolicy, Service,
-    },
+    registry::{validate_name, Allocations, Provision, Publish, Registry, RestartPolicy, Service},
 };
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use chrono::Utc;
-use hearth_proto::{version_result, Request, Response, Verb};
+use hearth_proto::{version_result, ImageManifest, Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc, time::Instant};
@@ -239,7 +232,6 @@ impl<H: Host + 'static> Daemon<H> {
             Verb::Resize => self.resize(req.args).await.map(Dispatch::One),
             Verb::Logs => self.logs(req.args).await,
             Verb::ImageLs => self.image_ls().await.map(Dispatch::One),
-            Verb::ImagePull => self.image_pull(req.args).await.map(Dispatch::One),
             Verb::ImageImport => self.image_import(req.args).await.map(Dispatch::One),
             Verb::ImageRm => self
                 .image_rm(required_str(&req.args, "name")?)
@@ -330,9 +322,7 @@ impl<H: Host + 'static> Daemon<H> {
                 format!("service {name} already exists"),
             ));
         }
-        let image = optional_str(&args, "image")
-            .unwrap_or("debian-12-cloud-amd64")
-            .to_string();
+        let image = required_str(&args, "image")?.to_string();
         let cpu = optional_u64(&args, "cpu").unwrap_or(2) as u32;
         let memory_mib = optional_u64(&args, "memory_mib")
             .or_else(|| optional_u64(&args, "mem"))
@@ -347,8 +337,7 @@ impl<H: Host + 'static> Daemon<H> {
                 format!("base image not found: {image_path}"),
             ));
         }
-        let image_metadata = image::load(&self.cfg, &image).await?;
-        let is_docker = matches!(image_metadata, ImageMetadata::DockerRootfs(_));
+        let _manifest = image::load(&self.cfg, &image).await?;
         let is_agent_in_charge = optional_bool(&args, "is_agent_in_charge").unwrap_or(false);
         if is_agent_in_charge && reg.services.values().any(|svc| svc.is_agent_in_charge) {
             return Err(coded(
@@ -365,19 +354,6 @@ impl<H: Host + 'static> Daemon<H> {
             None => Provision::default(),
         };
         let hostname_arg = optional_str(&args, "hostname").map(str::to_string);
-        // Provisioning is docker-rootfs only; cloud images keep cloud-init.
-        let wants_provision = !provisioning.files.is_empty()
-            || provisioning.reset_ssh_hostkeys
-            || !provisioning.hostname.is_empty();
-        if !is_docker && wants_provision {
-            return Err(coded(
-                "provision.unsupported_image",
-                format!(
-                    "service {name} uses a cloud image; per-service provisioning is only \
-                     supported for docker-rootfs images (cloud images use cloud-init)"
-                ),
-            ));
-        }
         // Resolve the hostname: an explicit --hostname wins, then a hostname set
         // inside the provision block, then the service name.
         let hostname = hostname_arg
@@ -385,19 +361,11 @@ impl<H: Host + 'static> Daemon<H> {
             .filter(|h| !h.is_empty())
             .or_else(|| Some(provisioning.hostname.clone()).filter(|h| !h.is_empty()))
             .unwrap_or_else(|| name.to_string());
-        let plan = if is_docker {
-            provisioning.hostname = hostname.clone();
-            // Build (and validate) the plan before any disk work so bad
-            // provision args fail with no side effects.
-            Some(
-                ProvisionPlan::from_provision(&provisioning)
-                    .map_err(|e| coded("provision.invalid", format!("{e:#}")))?,
-            )
-        } else {
-            // Cloud images do not persist a provision block.
-            provisioning = Provision::default();
-            None
-        };
+        provisioning.hostname = hostname;
+        // Build (and validate) the plan before any disk work so bad provision
+        // args fail with no side effects.
+        let plan = ProvisionPlan::from_provision(&provisioning)
+            .map_err(|e| coded("provision.invalid", format!("{e:#}")))?;
 
         // Managed publishes mirror the [[publish]] TOML shape. Validate every
         // entry before any disk work so bad ports/protocols fail cleanly.
@@ -416,9 +384,9 @@ impl<H: Host + 'static> Daemon<H> {
             reg.allocate(name, self.cfg.dhcp_static_start, self.cfg.dhcp_static_count);
         // Every per-VM boot disk is a standalone qcow2 (no backing chain, which
         // CHV rejects, and qcow2 avoids the raw write-path failures CHV hits on
-        // some host filesystems such as ZFS). docker-rootfs images are
-        // provisioned on a raw scratch and converted to qcow2; see
-        // Host::build_docker_disk.
+        // some host filesystems such as ZFS). Images are provisioned on a raw
+        // scratch and converted to qcow2; see
+        // Host::build_vm_disk.
         let disk_filename = format!("{name}.qcow2");
         let svc = Service {
             name: name.to_string(),
@@ -432,69 +400,27 @@ impl<H: Host + 'static> Daemon<H> {
             is_agent_in_charge,
             disk: Some(disk_filename.clone()),
             publish,
-            cloud_init: CloudInit {
-                hostname: hostname.clone(),
-                ssh_keys: optional_array_str(&args, "ssh_keys"),
-                user: optional_str(&args, "user").unwrap_or("agent").to_string(),
-            },
             provision: provisioning,
             restart: RestartPolicy::default(),
         };
         let disk_path = self.cfg.disks_dir.join(&disk_filename);
-        let seed_path = self.cfg.seed_path(name);
-        // docker-rootfs (plan = Some) provisions a raw scratch and boots the
-        // resulting qcow2; cloud images (plan = None) get a qcow2 disk plus a
-        // cloud-init seed. On failure, clean up exactly like the other create()
-        // error paths.
-        match &plan {
-            Some(plan) => {
-                let scratch = self.cfg.disk_path_ext(name, "raw");
-                if let Err(err) = self
-                    .host
-                    .build_docker_disk(&image_path, &disk_path, &scratch, disk_gib, plan)
-                    .await
-                {
-                    let _ = remove_path_file(scratch).await;
-                    let _ = remove_path_file(disk_path).await;
-                    reg.free(name);
-                    return Err(err);
-                }
-            }
-            None => {
-                if let Err(err) = self
-                    .host
-                    .qemu_img_create(&image_path, &disk_path, disk_gib, DiskFormat::Qcow2)
-                    .await
-                {
-                    reg.free(name);
-                    return Err(err);
-                }
-                let tmp = tempfile::tempdir()?;
-                let user_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("user-data"))
-                    .map_err(|_| anyhow!("non-utf8 temp path"))?;
-                let meta_data_path = Utf8PathBuf::from_path_buf(tmp.path().join("meta-data"))
-                    .map_err(|_| anyhow!("non-utf8 temp path"))?;
-                fs::write(&user_data_path, cloud_init::user_data(&svc)).await?;
-                fs::write(&meta_data_path, cloud_init::meta_data(&svc)).await?;
-                if let Err(err) = self
-                    .host
-                    .cloud_localds(&seed_path, &user_data_path, &meta_data_path)
-                    .await
-                {
-                    let _ = remove_path_file(disk_path).await;
-                    reg.free(name);
-                    return Err(err);
-                }
-            }
+        let scratch = self.cfg.disk_path_ext(name, "raw");
+        if let Err(err) = self
+            .host
+            .build_vm_disk(&image_path, &disk_path, &scratch, disk_gib, &plan)
+            .await
+        {
+            let _ = remove_path_file(scratch).await;
+            let _ = remove_path_file(disk_path).await;
+            reg.free(name);
+            return Err(err);
         }
         if let Err(err) = Registry::write_allocations(&self.cfg, &reg.allocations).await {
             let _ = remove_path_file(disk_path).await;
-            let _ = remove_path_file(seed_path).await;
             return Err(err);
         }
         if let Err(err) = Registry::write_service(&self.cfg, &svc).await {
             let _ = remove_path_file(disk_path).await;
-            let _ = remove_path_file(seed_path).await;
             reg.free(name);
             let _ = Registry::write_allocations(&self.cfg, &reg.allocations).await;
             return Err(err);
@@ -608,11 +534,9 @@ impl<H: Host + 'static> Daemon<H> {
         self.stop_unlocked(name).await?;
         let _registry_guard = self.registry_lock.lock().await;
         let mut reg = self.registry().await?;
-        // The per-VM disk is raw (docker-rootfs) or qcow2 (cloud image / legacy
-        // services). Remove whichever exists.
+        // Remove the qcow2 boot disk and any interrupted provisioning scratch.
         remove_path_file(self.cfg.disk_path_ext(name, "raw")).await?;
         remove_path_file(self.cfg.disk_path_ext(name, "qcow2")).await?;
-        remove_path_file(self.cfg.seed_path(name)).await?;
         remove_path_file(self.cfg.console_path(name)).await?;
         remove_path_dir(self.cfg.snapshots_dir.join(name)).await?;
         self.host.delete_tap(&host::tap_name(name)).await?;
@@ -744,49 +668,6 @@ impl<H: Host + 'static> Daemon<H> {
         Ok(json!({ "images": images }))
     }
 
-    async fn image_pull(&self, args: Map<String, Value>) -> Result<Value> {
-        let url = required_str(&args, "url")?;
-        let name = optional_str(&args, "name")
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| sanitize_image_name(url));
-        validate_name(&name)?;
-        fs::create_dir_all(&self.cfg.images_dir).await?;
-        let dest = self.cfg.image_path(&name);
-        if dest.exists() || self.cfg.image_manifest_path(&name).exists() {
-            return Err(coded(
-                "image.exists",
-                format!("image {name} already exists"),
-            ));
-        }
-        let tmp = self
-            .cfg
-            .images_dir
-            .join(format!(".{name}.tmp-{}", std::process::id()));
-        let mut response = reqwest::get(url).await?.error_for_status()?;
-        let mut file = fs::File::create(&tmp).await?;
-        let mut hasher = Sha256::new();
-        let mut total: u64 = 0;
-        while let Some(chunk) = response.chunk().await? {
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-            total += chunk.len() as u64;
-        }
-        file.flush().await?;
-        drop(file);
-        if let Err(err) = fs::rename(&tmp, &dest).await {
-            let _ = fs::remove_file(&tmp).await;
-            return Err(err.into());
-        }
-        let sha256 = hex::encode(hasher.finalize());
-        Ok(json!({
-            "name": name,
-            "kind": image::CLOUD_IMAGE_KIND,
-            "path": dest,
-            "bytes": total,
-            "sha256": sha256
-        }))
-    }
-
     async fn image_import(&self, args: Map<String, Value>) -> Result<Value> {
         let name = required_str(&args, "name")?;
         validate_name(name)?;
@@ -869,10 +750,9 @@ impl<H: Host + 'static> Daemon<H> {
         let path = self.cfg.image_path(name);
         let metadata = fs::metadata(&path).await?;
         let sha256 = sha256_file(&path).await?;
-        let image_metadata = image::load(&self.cfg, name).await?;
+        image::load(&self.cfg, name).await?;
         Ok(json!({
             "name": name,
-            "kind": image_metadata.kind(),
             "path": path,
             "bytes": metadata.len(),
             "sha256": sha256,
@@ -991,11 +871,9 @@ impl<H: Host + 'static> Daemon<H> {
             check_path("services_dir", &self.cfg.services_dir, true),
             check_path("images_dir", &self.cfg.images_dir, true),
             check_path("disks_dir", &self.cfg.disks_dir, true),
-            check_path("seeds_dir", &self.cfg.seeds_dir, true),
             check_path("snapshots_dir", &self.cfg.snapshots_dir, true),
             check_path("run_dir", &self.cfg.run_dir, true),
             check_path("log_dir", &self.cfg.log_dir, true),
-            check_path("firmware", &self.cfg.firmware, false),
             check_path("guest_kernel", &self.cfg.guest_kernel, false),
             check_path("kvm_device", &Utf8PathBuf::from("/dev/kvm"), false),
             check_path(
@@ -1005,7 +883,6 @@ impl<H: Host + 'static> Daemon<H> {
             ),
             check_command("cloud-hypervisor"),
             check_command("qemu-img"),
-            check_command("cloud-localds"),
             check_command("socat"),
             check_command("nft"),
             check_kernel_module("kvm").await?,
@@ -1185,19 +1062,6 @@ fn optional_bool(args: &Map<String, Value>, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
 
-fn optional_array_str(args: &Map<String, Value>, key: &str) -> Vec<String> {
-    args.get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn image_base_name(name: &str) -> Result<&str> {
     let base = name.strip_suffix(".qcow2").unwrap_or(name);
     if base.is_empty() || base.contains('/') {
@@ -1344,15 +1208,11 @@ fn set_socket_permissions(path: &camino::Utf8Path) -> Result<()> {
     Ok(())
 }
 
-/// Fail fast, daemon-side and before CHV is spawned, if a docker-rootfs image
-/// cannot boot with the configured guest kernel. A clear `start` error beats a
-/// kernel panic (`Unable to mount root fs`) or a busybox shell on serial. Cloud
-/// images boot firmware and skip this. Lives here (not in RealHost) so FakeHost
-/// tests exercise it.
-pub async fn validate_boot_prerequisites(cfg: &Config, image: &ImageMetadata) -> Result<()> {
-    let ImageMetadata::DockerRootfs(manifest) = image else {
-        return Ok(());
-    };
+/// Fail fast, daemon-side and before CHV is spawned, if an image cannot boot
+/// with the configured guest kernel. A clear `start` error beats a kernel panic
+/// (`Unable to mount root fs`) or a busybox shell on serial. Lives here (not in
+/// RealHost) so FakeHost tests exercise it.
+pub async fn validate_boot_prerequisites(cfg: &Config, manifest: &ImageManifest) -> Result<()> {
     if !cfg.guest_kernel.exists() {
         return Err(coded(
             "kernel.not_found",
@@ -1582,7 +1442,6 @@ pub async fn ensure_dirs(cfg: &Config) -> Result<()> {
         &cfg.services_dir,
         &cfg.images_dir,
         &cfg.disks_dir,
-        &cfg.seeds_dir,
         &cfg.snapshots_dir,
         &cfg.run_dir,
         &cfg.log_dir,
@@ -1603,7 +1462,6 @@ mod tests {
     use crate::host::cloud_hypervisor_restore_argv;
     use crate::host::DiskFormat;
     use crate::host::Host;
-    use crate::image::ImageMetadata;
     use crate::provision::ProvisionPlan;
     use anyhow::Result;
     use async_trait::async_trait;
@@ -1612,36 +1470,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     #[test]
-    fn cloud_hypervisor_argv_contains_documented_flags() {
-        let cfg = Config::parse_from(["hearthd"]);
-        let svc = Service {
-            name: "mail".into(),
-            enabled: false,
-            image: "debian".into(),
-            cpu: 2,
-            memory_mib: 2048,
-            disk_gib: 20,
-            vsock_cid: 100,
-            mac: "52:54:00:12:34:56".into(),
-            is_agent_in_charge: false,
-            disk: None,
-            publish: Vec::new(),
-            cloud_init: CloudInit::default(),
-            provision: Provision::default(),
-            restart: RestartPolicy::default(),
-        };
-        let argv = cloud_hypervisor_argv(&cfg, &svc, &ImageMetadata::CloudImage).join(" ");
-        assert!(argv.contains("--api-socket /run/hearth/vms/mail.sock"));
-        assert!(argv.contains("--vsock cid=100,socket=/run/hearth/vsock/mail.sock"));
-        assert!(argv.contains("--cpus boot=2"));
-        assert!(argv.contains("--memory size=2048M"));
-        // CHV does not accept `bridge=...`; we pre-create the tap and pass it by name.
-        assert!(argv.contains("--net tap=hrt-mail,mac=52:54:00:12:34:56"));
-        assert!(!argv.contains("bridge="));
-    }
-
-    #[test]
-    fn docker_rootfs_argv_uses_direct_kernel_boot() {
+    fn image_argv_uses_direct_kernel_boot() {
         let cfg = Config::parse_from([
             "hearthd",
             "--guest-kernel",
@@ -1661,28 +1490,25 @@ mod tests {
             is_agent_in_charge: false,
             disk: Some("dev.qcow2".into()),
             publish: Vec::new(),
-            cloud_init: CloudInit::default(),
             provision: Provision::default(),
             restart: RestartPolicy::default(),
         };
-        let manifest = hearth_proto::ImageManifest::docker_rootfs(hearth_proto::OciProcess {
+        let manifest = hearth_proto::ImageManifest::from_oci_process(hearth_proto::OciProcess {
             args: vec!["/usr/local/bin/init".to_string()],
             env: vec!["EXEUNTU=1".to_string()],
             cwd: "/home/exedev".to_string(),
         })
         .unwrap();
-        let argv =
-            cloud_hypervisor_argv(&cfg, &svc, &ImageMetadata::DockerRootfs(manifest)).join(" ");
+        let argv = cloud_hypervisor_argv(&cfg, &svc, &manifest).join(" ");
 
         assert!(argv.contains("--kernel /run/booted-system/kernel"));
         assert!(argv.contains("--initramfs /var/lib/hearth/initramfs.cpio.gz"));
-        // docker-rootfs boots from the standalone qcow2 disk (provisioned via a
-        // raw scratch at create time), and the filename must not lie.
+        // The standalone qcow2 disk is provisioned via a raw scratch at create
+        // time, and the filename must not lie.
         assert!(argv.contains("--disk path=/var/lib/hearth/disks/dev.qcow2"));
         assert!(argv.contains(
             "--cmdline console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init"
         ));
-        assert!(!argv.contains("/var/lib/hearth/seeds/dev.iso"));
     }
 
     #[test]
@@ -1700,7 +1526,6 @@ mod tests {
             is_agent_in_charge: false,
             disk: None,
             publish: Vec::new(),
-            cloud_init: CloudInit::default(),
             provision: Provision::default(),
             restart: RestartPolicy::default(),
         };
@@ -1723,17 +1548,15 @@ mod tests {
             r#"
 name = "mail"
 enabled = true
-image = "debian-12-cloud-amd64"
+image = "base"
 cpu = 2
 memory_mib = 2048
 disk_gib = 20
 vsock_cid = 100
 mac = "52:54:00:12:34:56"
 
-[cloud_init]
+[provision]
 hostname = "mail"
-ssh_keys = []
-user = "agent"
 
 [restart]
 policy = "on-failure"
@@ -1902,56 +1725,7 @@ backoff_sec = 10
     }
 
     #[tokio::test]
-    async fn create_allocates_disk_seed_registry_and_allocations_without_starting() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
-        let host = FakeHost::default();
-        let state = host.state.clone();
-        let daemon = Daemon::new(cfg.clone(), host);
-        let req = Request::new(
-            "1",
-            Verb::Create,
-            Map::from_iter([
-                ("name".into(), json!("web")),
-                ("cpu".into(), json!(4)),
-                ("memory_mib".into(), json!(4096)),
-                ("disk_gib".into(), json!(30)),
-                ("ssh_keys".into(), json!(["ssh-ed25519 AAAA test"])),
-            ]),
-        );
-
-        let responses = daemon.handle(req).await;
-
-        assert!(responses[0].ok);
-        let calls = state.lock().unwrap().calls.clone();
-        // Cloud images get a qcow2 per-VM disk and a cloud-init seed, and are
-        // never provisioned via loop-mount.
-        assert!(calls
-            .iter()
-            .any(|call| call.starts_with("qemu-img create ") && call.ends_with(" qcow2")));
-        assert!(calls.iter().any(|call| call.starts_with("cloud-localds ")));
-        assert!(!calls
-            .iter()
-            .any(|call| call.starts_with("build-docker-disk ")));
-        assert!(!calls.iter().any(|call| call.starts_with("systemd-run ")));
-        let registry = Registry::load(&cfg).await.unwrap();
-        let web = registry.get("web").unwrap();
-        assert!(!web.enabled);
-        assert_eq!(web.cpu, 4);
-        assert_eq!(web.memory_mib, 4096);
-        assert_eq!(web.disk_gib, 30);
-        assert_eq!(web.disk.as_deref(), Some("web.qcow2"));
-        assert_eq!(registry.allocations.vsock_cids.get("web"), Some(&100));
-        assert!(registry.allocations.macs.contains_key("web"));
-    }
-
-    #[tokio::test]
-    async fn create_from_docker_rootfs_image_skips_cloud_init_seed() {
+    async fn create_from_image_builds_provisioned_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
@@ -1959,7 +1733,7 @@ backoff_sec = 10
         tokio::fs::write(cfg.image_path("exeuntu"), b"base")
             .await
             .unwrap();
-        tokio::fs::write(cfg.image_manifest_path("exeuntu"), docker_manifest_toml())
+        tokio::fs::write(cfg.image_manifest_path("exeuntu"), image_manifest_toml())
             .await
             .unwrap();
         let host = FakeHost::default();
@@ -1979,12 +1753,10 @@ backoff_sec = 10
 
         assert!(responses[0].ok);
         let calls = state.lock().unwrap().calls.clone();
-        // docker-rootfs builds its qcow2 boot disk via a provisioned raw
-        // scratch, with no cloud-init seed. Provisioning defaults apply (hostname
-        // = service name, machine-id reset).
-        assert!(!calls.iter().any(|call| call.starts_with("cloud-localds ")));
+        // The qcow2 boot disk is built via a provisioned raw scratch.
+        // Provisioning defaults apply (hostname = service name, machine-id reset).
         assert!(calls.iter().any(|call| {
-            call.starts_with("build-docker-disk ")
+            call.starts_with("build-vm-disk ")
                 && call.contains("dev.qcow2")
                 && call.contains("scratch=")
                 && call.contains("dev.raw")
@@ -2000,7 +1772,7 @@ backoff_sec = 10
     }
 
     #[tokio::test]
-    async fn create_docker_rootfs_applies_provision_files_and_hostname() {
+    async fn create_applies_provision_files_and_hostname() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
@@ -2008,7 +1780,7 @@ backoff_sec = 10
         tokio::fs::write(cfg.image_path("exeuntu"), b"base")
             .await
             .unwrap();
-        tokio::fs::write(cfg.image_manifest_path("exeuntu"), docker_manifest_toml())
+        tokio::fs::write(cfg.image_manifest_path("exeuntu"), image_manifest_toml())
             .await
             .unwrap();
         let host = FakeHost::default();
@@ -2042,8 +1814,8 @@ backoff_sec = 10
         let calls = state.lock().unwrap().calls.clone();
         let provision_call = calls
             .iter()
-            .find(|call| call.starts_with("build-docker-disk "))
-            .expect("build-docker-disk call recorded");
+            .find(|call| call.starts_with("build-vm-disk "))
+            .expect("build-vm-disk call recorded");
         assert!(provision_call.contains("/home/agent/.hermes/.env<-<literal>:0600:1000:1000"));
         assert!(provision_call.contains("reset_ssh_hostkeys=true"));
         assert!(provision_call.contains("hostname=hermes-a"));
@@ -2069,54 +1841,6 @@ backoff_sec = 10
         assert!(!rendered.contains("TOKEN=secret"));
     }
 
-    #[tokio::test]
-    async fn create_cloud_image_rejects_provision_args() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
-        let host = FakeHost::default();
-        let state = host.state.clone();
-        let daemon = Daemon::new(cfg.clone(), host);
-        let req = Request::new(
-            "1",
-            Verb::Create,
-            Map::from_iter([
-                ("name".into(), json!("web")),
-                (
-                    "provision".into(),
-                    json!({
-                        "files": [{
-                            "from_literal": "x",
-                            "dest": "/etc/x",
-                            "mode": "0600",
-                            "owner": "0:0"
-                        }]
-                    }),
-                ),
-            ]),
-        );
-
-        let responses = daemon.handle(req).await;
-
-        assert!(!responses[0].ok);
-        assert_eq!(
-            responses[0].error.as_ref().unwrap().code,
-            "provision.unsupported_image"
-        );
-        // No disk was created and nothing was allocated.
-        let calls = state.lock().unwrap().calls.clone();
-        assert!(!calls
-            .iter()
-            .any(|call| call.starts_with("qemu-img create ")));
-        let registry = Registry::load(&cfg).await.unwrap();
-        assert!(registry.get("web").is_err());
-        assert!(!registry.allocations.macs.contains_key("web"));
-    }
-
     // ---- §4 networking: managed addresses, static leases, managed publish ----
 
     #[tokio::test]
@@ -2128,16 +1852,13 @@ backoff_sec = 10
         tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
             .await
             .unwrap();
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         let host = FakeHost::default();
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
 
         let responses = daemon
-            .handle(Request::new("1", Verb::Create, name_args("web")))
+            .handle(Request::new("1", Verb::Create, create_args("web")))
             .await;
 
         assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
@@ -2167,16 +1888,13 @@ backoff_sec = 10
         let cfg = test_config(&root);
         // Deliberately do NOT create the drop-in dir (dev host without managed
         // dnsmasq): create must still succeed and skip the reservation.
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         let host = FakeHost::default();
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
 
         let responses = daemon
-            .handle(Request::new("1", Verb::Create, name_args("web")))
+            .handle(Request::new("1", Verb::Create, create_args("web")))
             .await;
 
         assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
@@ -2196,10 +1914,7 @@ backoff_sec = 10
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         let host = FakeHost::default();
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
@@ -2208,6 +1923,7 @@ backoff_sec = 10
             Verb::Create,
             Map::from_iter([
                 ("name".into(), json!("web")),
+                ("image".into(), json!("base")),
                 (
                     "publish".into(),
                     json!([
@@ -2247,16 +1963,13 @@ backoff_sec = 10
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         let host = FakeHost::default();
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
 
         let created = daemon
-            .handle(Request::new("1", Verb::Create, name_args("web")))
+            .handle(Request::new("1", Verb::Create, create_args("web")))
             .await;
         assert!(created[0].ok, "create failed: {:?}", created[0].error);
 
@@ -2383,10 +2096,7 @@ backoff_sec = 10
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         let daemon = Daemon::new(cfg.clone(), FakeHost::default());
         // A forward created without a name (as `spawn --publish` produces).
         let created = daemon
@@ -2395,6 +2105,7 @@ backoff_sec = 10
                 Verb::Create,
                 Map::from_iter([
                     ("name".into(), json!("web")),
+                    ("image".into(), json!("base")),
                     (
                         "publish".into(),
                         json!([{ "host_port": 9119, "guest_port": 9119, "protocol": "tcp" }]),
@@ -2429,10 +2140,7 @@ backoff_sec = 10
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         let host = FakeHost::default();
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
@@ -2441,6 +2149,7 @@ backoff_sec = 10
             Verb::Create,
             Map::from_iter([
                 ("name".into(), json!("web")),
+                ("image".into(), json!("base")),
                 (
                     "publish".into(),
                     json!([{ "host_port": 80, "guest_port": 80, "protocol": "sctp" }]),
@@ -2632,13 +2341,13 @@ backoff_sec = 10
 
     #[tokio::test]
     async fn reconcile_survives_service_with_failed_boot_prerequisites() {
-        // An enabled docker-rootfs service whose guest kernel is absent (fresh
+        // An enabled service whose guest kernel is absent (fresh
         // deploy / wiped kernels dir) must not abort reconcile: the daemon has
         // to keep booting, skip only the broken service, and still self-heal
         // host networking for the rest.
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        write_docker_service(&root, "dev", true, docker_manifest_toml()).await;
+        write_image_service(&root, "dev", true, image_manifest_toml()).await;
         // Deliberately no write_guest_kernel: validate_boot_prerequisites fails
         // with kernel.not_found for this service.
         let cfg = test_config(&root);
@@ -2666,10 +2375,10 @@ backoff_sec = 10
     }
 
     #[tokio::test]
-    async fn start_docker_rootfs_boots_when_kernel_present_and_contract_satisfied() {
+    async fn start_boots_when_kernel_present_and_contract_satisfied() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        write_image_service(&root, "dev", false, image_manifest_toml()).await;
         write_guest_kernel(&root, "1").await;
         let cfg = test_config(&root);
         let host = FakeHost::default();
@@ -2686,10 +2395,10 @@ backoff_sec = 10
     }
 
     #[tokio::test]
-    async fn start_docker_rootfs_fails_without_guest_kernel() {
+    async fn start_fails_without_guest_kernel() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        write_image_service(&root, "dev", false, image_manifest_toml()).await;
         // No write_guest_kernel: the configured guest kernel does not exist.
         let cfg = test_config(&root);
         let host = FakeHost::default();
@@ -2711,12 +2420,11 @@ backoff_sec = 10
     }
 
     #[tokio::test]
-    async fn start_docker_rootfs_fails_when_contract_too_old() {
+    async fn start_fails_when_contract_too_old() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let manifest = r#"
 version = 1
-kind = "docker-rootfs"
 root_device = "/dev/vda"
 root_fstype = "ext4"
 init = "/usr/local/bin/init"
@@ -2727,7 +2435,7 @@ args = ["/usr/local/bin/init"]
 env = ["EXEUNTU=1"]
 cwd = "/home/exedev"
 "#;
-        write_docker_service(&root, "dev", false, manifest).await;
+        write_image_service(&root, "dev", false, manifest).await;
         write_guest_kernel(&root, "1").await;
         let cfg = test_config(&root);
         let host = FakeHost::default();
@@ -2748,7 +2456,7 @@ cwd = "/home/exedev"
     async fn status_reports_boot_config_current_when_execstart_matches_launch_argv() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        write_image_service(&root, "dev", false, image_manifest_toml()).await;
         let cfg = test_config(&root);
         let svc = Registry::load(&cfg)
             .await
@@ -2776,7 +2484,7 @@ cwd = "/home/exedev"
     async fn status_reports_boot_config_stale_when_execstart_drifts() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        write_docker_service(&root, "dev", false, docker_manifest_toml()).await;
+        write_image_service(&root, "dev", false, image_manifest_toml()).await;
         let cfg = test_config(&root);
         let svc = Registry::load(&cfg)
             .await
@@ -2830,15 +2538,11 @@ cwd = "/home/exedev"
         write_service(&root, "mail", true).await;
         let cfg = test_config(&root);
         tokio::fs::create_dir_all(&cfg.disks_dir).await.unwrap();
-        tokio::fs::create_dir_all(&cfg.seeds_dir).await.unwrap();
         tokio::fs::create_dir_all(&cfg.log_dir).await.unwrap();
         tokio::fs::create_dir_all(cfg.snapshots_dir.join("mail"))
             .await
             .unwrap();
         tokio::fs::write(cfg.disk_path_ext("mail", "qcow2"), b"disk")
-            .await
-            .unwrap();
-        tokio::fs::write(cfg.seed_path("mail"), b"seed")
             .await
             .unwrap();
         tokio::fs::write(cfg.console_path("mail"), b"log")
@@ -2868,7 +2572,6 @@ cwd = "/home/exedev"
             .iter()
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
         assert!(!cfg.disk_path_ext("mail", "qcow2").exists());
-        assert!(!cfg.seed_path("mail").exists());
         assert!(!cfg.console_path("mail").exists());
         assert!(!cfg.snapshots_dir.join("mail").exists());
         assert!(!cfg.services_dir.join("mail.toml").exists());
@@ -3033,7 +2736,7 @@ cwd = "/home/exedev"
     }
 
     #[tokio::test]
-    async fn image_ls_returns_only_qcow2_images_sorted_with_hashes() {
+    async fn image_ls_returns_manifest_backed_images_sorted_with_hashes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
@@ -3042,6 +2745,12 @@ cwd = "/home/exedev"
             .await
             .unwrap();
         tokio::fs::write(cfg.images_dir.join("alpha.qcow2"), b"a")
+            .await
+            .unwrap();
+        tokio::fs::write(cfg.image_manifest_path("zeta"), image_manifest_toml())
+            .await
+            .unwrap();
+        tokio::fs::write(cfg.image_manifest_path("alpha"), image_manifest_toml())
             .await
             .unwrap();
         tokio::fs::write(cfg.images_dir.join("ignore.txt"), b"x")
@@ -3063,7 +2772,6 @@ cwd = "/home/exedev"
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].get("name"), Some(&json!("alpha")));
         assert_eq!(images[1].get("name"), Some(&json!("zeta")));
-        assert_eq!(images[0].get("kind"), Some(&json!("cloud-image")));
         assert_eq!(images[0].get("bytes"), Some(&json!(1)));
         assert!(images[0]
             .get("sha256")
@@ -3081,7 +2789,7 @@ cwd = "/home/exedev"
         let source_qcow2 = source_dir.join("exeuntu.qcow2");
         let source_manifest = source_dir.join("exeuntu.hearth.toml");
         tokio::fs::write(&source_qcow2, b"disk").await.unwrap();
-        tokio::fs::write(&source_manifest, docker_manifest_toml())
+        tokio::fs::write(&source_manifest, image_manifest_toml())
             .await
             .unwrap();
         let daemon = Daemon::new(cfg.clone(), FakeHost::default());
@@ -3099,8 +2807,6 @@ cwd = "/home/exedev"
             .await;
 
         assert!(imported[0].ok);
-        let result = imported[0].result.as_ref().unwrap();
-        assert_eq!(result.get("kind"), Some(&json!("docker-rootfs")));
         assert!(cfg.image_path("exeuntu").exists());
         assert!(cfg.image_manifest_path("exeuntu").exists());
 
@@ -3132,13 +2838,11 @@ cwd = "/home/exedev"
         write_service(&root, "mail", false).await;
         let cfg = test_config(&root);
         tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
-        tokio::fs::write(cfg.image_path("debian-12-cloud-amd64"), b"base")
-            .await
-            .unwrap();
+        write_test_image(&cfg, "base").await;
         tokio::fs::write(cfg.image_path("unused"), b"unused")
             .await
             .unwrap();
-        tokio::fs::write(cfg.image_manifest_path("unused"), docker_manifest_toml())
+        tokio::fs::write(cfg.image_manifest_path("unused"), image_manifest_toml())
             .await
             .unwrap();
         let daemon = Daemon::new(cfg.clone(), FakeHost::default());
@@ -3147,11 +2851,11 @@ cwd = "/home/exedev"
             .handle(Request::new(
                 "1",
                 Verb::ImageRm,
-                Map::from_iter([("name".into(), json!("debian-12-cloud-amd64.qcow2"))]),
+                Map::from_iter([("name".into(), json!("base.qcow2"))]),
             ))
             .await;
         assert!(!referenced[0].ok);
-        assert!(cfg.image_path("debian-12-cloud-amd64").exists());
+        assert!(cfg.image_path("base").exists());
 
         let removed = daemon
             .handle(Request::new(
@@ -3174,10 +2878,9 @@ cwd = "/home/exedev"
         assert!(!missing[0].ok);
     }
 
-    fn docker_manifest_toml() -> &'static str {
+    fn image_manifest_toml() -> &'static str {
         r#"
 version = 1
-kind = "docker-rootfs"
 root_device = "/dev/vda"
 root_fstype = "ext4"
 init = "/usr/local/bin/init"
@@ -3194,17 +2897,15 @@ cwd = "/home/exedev"
             r#"
 name = "{name}"
 enabled = {enabled}
-image = "debian-12-cloud-amd64"
+image = "base"
 cpu = 2
 memory_mib = 2048
 disk_gib = 20
 vsock_cid = {cid}
 mac = "{mac}"
 
-[cloud_init]
+[provision]
 hostname = "{name}"
-ssh_keys = []
-user = "agent"
 
 [restart]
 policy = "on-failure"
@@ -3223,10 +2924,29 @@ backoff_sec = 10
         )
         .await
         .unwrap();
+        write_test_image(&test_config(root), "base").await;
+        write_guest_kernel(root, "1").await;
     }
 
     fn name_args(name: &str) -> Map<String, Value> {
         Map::from_iter([("name".to_string(), json!(name))])
+    }
+
+    fn create_args(name: &str) -> Map<String, Value> {
+        Map::from_iter([
+            ("name".to_string(), json!(name)),
+            ("image".to_string(), json!("base")),
+        ])
+    }
+
+    async fn write_test_image(cfg: &Config, name: &str) {
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path(name), b"base")
+            .await
+            .unwrap();
+        tokio::fs::write(cfg.image_manifest_path(name), image_manifest_toml())
+            .await
+            .unwrap();
     }
 
     fn test_config(root: &Utf8Path) -> Config {
@@ -3242,16 +2962,12 @@ backoff_sec = 10
             root.join("images").as_str(),
             "--disks-dir",
             root.join("disks").as_str(),
-            "--seeds-dir",
-            root.join("seeds").as_str(),
             "--snapshots-dir",
             root.join("snapshots").as_str(),
             "--run-dir",
             root.join("run").as_str(),
             "--log-dir",
             root.join("log").as_str(),
-            "--firmware",
-            root.join("CLOUDHV.fd").as_str(),
             "--guest-kernel",
             root.join("kernels/current/vmlinux").as_str(),
             "--lease-file",
@@ -3262,9 +2978,9 @@ backoff_sec = 10
         ])
     }
 
-    /// Write a docker-rootfs service plus its image + sidecar manifest so a
+    /// Write a service plus its image + sidecar manifest so a
     /// `start` exercises the guest-kernel validation path.
-    async fn write_docker_service(root: &Utf8Path, name: &str, enabled: bool, manifest_toml: &str) {
+    async fn write_image_service(root: &Utf8Path, name: &str, enabled: bool, manifest_toml: &str) {
         let services = root.join("services");
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::write(
@@ -3280,10 +2996,8 @@ disk_gib = 20
 vsock_cid = 100
 mac = "52:54:00:00:00:01"
 
-[cloud_init]
+[provision]
 hostname = "{name}"
-ssh_keys = []
-user = "agent"
 
 [restart]
 policy = "on-failure"
@@ -3360,7 +3074,7 @@ backoff_sec = 10
             &self,
             _cfg: &Config,
             service: &Service,
-            _image: &ImageMetadata,
+            _image: &ImageManifest,
         ) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(format!("systemd-run {}", service.name));
@@ -3421,7 +3135,7 @@ backoff_sec = 10
             Ok(())
         }
 
-        async fn build_docker_disk(
+        async fn build_vm_disk(
             &self,
             _backing: &Utf8Path,
             disk: &Utf8Path,
@@ -3430,23 +3144,9 @@ backoff_sec = 10
             plan: &ProvisionPlan,
         ) -> Result<()> {
             self.state.lock().unwrap().calls.push(format!(
-                "build-docker-disk {disk} scratch={scratch} {}",
+                "build-vm-disk {disk} scratch={scratch} {}",
                 plan.describe()
             ));
-            Ok(())
-        }
-
-        async fn cloud_localds(
-            &self,
-            seed: &Utf8Path,
-            user_data: &Utf8Path,
-            meta_data: &Utf8Path,
-        ) -> Result<()> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("cloud-localds {seed} {user_data} {meta_data}"));
             Ok(())
         }
 

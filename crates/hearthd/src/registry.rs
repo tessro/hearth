@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tokio::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Service {
     pub name: String,
     pub enabled: bool,
@@ -32,8 +33,6 @@ pub struct Service {
     // with no publishes stays scalar-clean.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub publish: Vec<Publish>,
-    #[serde(default)]
-    pub cloud_init: CloudInit,
     #[serde(default)]
     pub provision: Provision,
     #[serde(default)]
@@ -96,7 +95,7 @@ fn default_protocol() -> String {
     "tcp".to_string()
 }
 
-/// Per-service offline customization applied to a docker-rootfs VM's disk at
+/// Per-service offline customization applied to a VM's disk at
 /// create time (see REFACTOR_PROPOSAL.md §3). The whole section is optional.
 /// Scalar fields are declared before `files` so `toml::to_string_pretty` (which
 /// rejects a scalar after an array-of-tables) can serialize it.
@@ -243,25 +242,6 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudInit {
-    pub hostname: String,
-    #[serde(default)]
-    pub ssh_keys: Vec<String>,
-    #[serde(default = "default_user")]
-    pub user: String,
-}
-
-impl Default for CloudInit {
-    fn default() -> Self {
-        Self {
-            hostname: String::new(),
-            ssh_keys: Vec::new(),
-            user: default_user(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartPolicy {
     #[serde(default = "default_restart_policy")]
     pub policy: String,
@@ -323,11 +303,7 @@ impl Registry {
             let text = fs::read_to_string(&path)
                 .await
                 .with_context(|| format!("read {path}"))?;
-            let mut svc: Service =
-                toml::from_str(&text).with_context(|| format!("parse {path}"))?;
-            if svc.cloud_init.hostname.is_empty() {
-                svc.cloud_init.hostname = svc.name.clone();
-            }
+            let svc: Service = toml::from_str(&text).with_context(|| format!("parse {path}"))?;
             validate_name(&svc.name)?;
             if services.insert(svc.name.clone(), svc).is_some() {
                 bail!("duplicate service name in registry");
@@ -458,10 +434,6 @@ async fn atomic_write_toml<T: Serialize>(path: &Utf8Path, value: &T) -> Result<(
     }
     fs::rename(&tmp, path).await?;
     Ok(())
-}
-
-fn default_user() -> String {
-    "agent".to_string()
 }
 
 fn default_restart_policy() -> String {
@@ -712,15 +684,13 @@ mac = "52:54:00:12:34:56"
         let text = r#"
 name = "mail"
 enabled = true
-image = "debian-12-cloud-amd64"
+image = "base"
 cpu = 2
 memory_mib = 2048
 disk_gib = 20
 vsock_cid = 100
 mac = "52:54:00:12:34:56"
 
-[cloud_init]
-hostname = "mail"
 "#;
         let svc: Service = toml::from_str(text).unwrap();
         assert!(svc.disk.is_none());

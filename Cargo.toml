@@ -23,13 +23,12 @@ hex = "0.4.3"
 libc = "0.2.186"
 rand = "0.8.5"
 regex = "1.10.6"
-reqwest = { version = "0.12.7", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0.208", features = ["derive"] }
 serde_json = "1.0.125"
 sha2 = "0.10.8"
 tempfile = "3.12.0"
 thiserror = "1.0.63"
-tokio = { version = "1.39.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.39.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.15"
 toml = "0.8.19"
 tracing = "0.1.40"

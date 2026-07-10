@@ -2,7 +2,7 @@
 
 ## Context
 
-The Hermes VM bring-up (2026-07-08/09) proved the docker-rootfs pipeline end to
+The Hermes VM bring-up (2026-07-08/09) proved the Hearth image pipeline end to
 end: `Dockerfile → buildah → umoci → ext4 qcow2 → image-import → direct-kernel
 boot → systemd → workload reachable on the bridge`. Getting there required a
 series of point fixes, each correct in isolation, several of which are
@@ -57,7 +57,7 @@ asserting it (see §5).
 **Now.** `build-vm-initramfs.sh` copies `.ko` files out of
 `/run/booted-system/kernel-modules` for whatever kernel the host happens to
 run. The artifact is invisibly pinned: a `nixos-rebuild` that bumps the kernel
-makes every docker-rootfs VM drop to a busybox shell on next boot, and nothing
+makes every VM drop to a busybox shell on next boot, and nothing
 detects the skew until then. The module list itself was discovered empirically
 (virtio_blk → virtio_net → af_packet, one panic/failure at a time).
 
@@ -87,7 +87,7 @@ CONFIG_EXT4_FS=y     CONFIG_PACKET=y      CONFIG_FUSE_FS/VIRTIO_FS=y
   kernel that predates a required feature refuses at start, not at panic.
 
 The dedicated kernel is now the *primary* deliverable, not the endgame: with
-virtio/ext4 built in, docker-rootfs VMs boot with **no initramfs at all**, and
+virtio/ext4 built in, Hearth VMs boot with **no initramfs at all**, and
 `scripts/build-vm-initramfs.sh` is deleted along with the host-kernel coupling.
 
 **Bridge (only until the vanilla kernel lands).** If the initramfs path must
@@ -99,8 +99,8 @@ coupling:
   `guest_kernel`'s version and **fails `start` with a one-line remedy** ("run
   scripts/build-vm-initramfs.sh") when missing — a clear error at start beats a
   busybox shell on serial.
-- `hearthd start` already knows the manifest kind; this is ~30 lines in
-  `docker_rootfs_argv` + config.
+- `hearthd start` reads the manifest; this is ~30 lines in its Cloud Hypervisor
+  argv generation plus config.
 - The module list stays a constant in the script, commented with which failure
   each entry prevents (`af_packet`: networkd DHCPv4 raw sockets; etc.). This is
   the guest driver contract until the kernel makes it moot.
@@ -181,15 +181,13 @@ disk-copy step in `create`):
   full-copy convert). Raw is used only as the loop-mountable provisioning
   intermediate.
 - Per-VM disk filenames must not lie about their format; every boot disk is
-  `{name}.qcow2`. cloud-image services keep qcow2 + seed ISO untouched.
+  `{name}.qcow2`.
 - `source =` paths are read by hearthd (absolute, e.g.
   `/etc/hearth/secrets/…`); `from_literal` carries content inline in the
   service TOML. `hearthctl` conveniences (`spawn --provision-file`, §10) read
   local files client-side and send content as literals, so the CLI's cwd
   never matters to the daemon.
-- This intentionally replaces cloud-init for docker-rootfs images (plan doc
-  already rules cloud-init out) and is Hearth-native VM customization, not
-  Docker emulation.
+- This is Hearth-native VM customization, not Docker emulation.
 - `hostname` defaults to the service name, so N services from one image get
   distinct identities without configuration.
 
@@ -433,6 +431,6 @@ Ordered by (risk removed ÷ effort), respecting dependencies:
   port-forwarding owned by the registry, nothing more.
 - No general image-build service — the linter narrows what Hearth accepts; it
   does not widen what it runs.
-- No cloud-init for docker-rootfs images — §3 is Hearth-native provisioning
-  with an explicit, inspectable file list.
+- Per-VM customization is §3's Hearth-native provisioning with an explicit,
+  inspectable file list.
 - No multi-host anything.

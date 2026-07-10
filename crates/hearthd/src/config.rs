@@ -32,12 +32,6 @@ pub struct Config {
     pub disks_dir: Utf8PathBuf,
     #[arg(
         long,
-        env = "HEARTH_SEEDS_DIR",
-        default_value = "/var/lib/hearth/seeds"
-    )]
-    pub seeds_dir: Utf8PathBuf,
-    #[arg(
-        long,
         env = "HEARTH_SNAPSHOTS_DIR",
         default_value = "/var/lib/hearth/snapshots"
     )]
@@ -46,12 +40,6 @@ pub struct Config {
     pub run_dir: Utf8PathBuf,
     #[arg(long, env = "HEARTH_LOG_DIR", default_value = "/var/log/hearth")]
     pub log_dir: Utf8PathBuf,
-    #[arg(
-        long,
-        env = "HEARTH_FIRMWARE",
-        default_value = "/usr/share/hypervisor-fw/CLOUDHV.fd"
-    )]
-    pub firmware: Utf8PathBuf,
     #[arg(
         long,
         env = "HEARTH_GUEST_KERNEL",
@@ -122,10 +110,6 @@ impl Config {
     /// is what matters.
     pub fn disk_path_ext(&self, name: &str, ext: &str) -> Utf8PathBuf {
         self.disks_dir.join(format!("{name}.{ext}"))
-    }
-
-    pub fn seed_path(&self, name: &str) -> Utf8PathBuf {
-        self.seeds_dir.join(format!("{name}.iso"))
     }
 
     pub fn console_path(&self, name: &str) -> Utf8PathBuf {

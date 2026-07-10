@@ -22,7 +22,6 @@ pub enum Verb {
     Resize,
     Logs,
     ImageLs,
-    ImagePull,
     ImageImport,
     ImageRm,
     NetSetup,
@@ -53,7 +52,6 @@ impl Verb {
         Verb::Resize,
         Verb::Logs,
         Verb::ImageLs,
-        Verb::ImagePull,
         Verb::ImageImport,
         Verb::ImageRm,
         Verb::NetSetup,
@@ -80,7 +78,6 @@ impl Verb {
             Self::Resize => "resize",
             Self::Logs => "logs",
             Self::ImageLs => "image-ls",
-            Self::ImagePull => "image-pull",
             Self::ImageImport => "image-import",
             Self::ImageRm => "image-rm",
             Self::NetSetup => "net-setup",
@@ -257,23 +254,9 @@ impl OciProcess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ImageKind {
-    DockerRootfs,
-}
-
-impl ImageKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::DockerRootfs => "docker-rootfs",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageManifest {
     pub version: u32,
-    pub kind: ImageKind,
     pub root_device: String,
     pub root_fstype: String,
     pub init: String,
@@ -287,12 +270,11 @@ pub struct ImageManifest {
 }
 
 impl ImageManifest {
-    pub fn docker_rootfs(process: OciProcess) -> Result<Self, String> {
+    pub fn from_oci_process(process: OciProcess) -> Result<Self, String> {
         let mut process = process;
         process.validate_init_only()?;
         Ok(Self {
             version: 1,
-            kind: ImageKind::DockerRootfs,
             root_device: "/dev/vda".to_string(),
             root_fstype: "ext4".to_string(),
             init: process.args[0].clone(),
@@ -308,16 +290,12 @@ impl ImageManifest {
                 self.version
             ));
         }
-        match self.kind {
-            ImageKind::DockerRootfs => {
-                validate_kernel_cmdline_path("root_device", &self.root_device)?;
-                validate_kernel_cmdline_token("root_fstype", &self.root_fstype)?;
-                validate_kernel_cmdline_path("init", &self.init)?;
-                self.oci.validate_init_only()?;
-                if self.oci.args[0] != self.init {
-                    return Err("manifest init must match oci.args[0]".to_string());
-                }
-            }
+        validate_kernel_cmdline_path("root_device", &self.root_device)?;
+        validate_kernel_cmdline_token("root_fstype", &self.root_fstype)?;
+        validate_kernel_cmdline_path("init", &self.init)?;
+        self.oci.validate_init_only()?;
+        if self.oci.args[0] != self.init {
+            return Err("manifest init must match oci.args[0]".to_string());
         }
         Ok(())
     }
@@ -377,7 +355,6 @@ mod tests {
                 | Verb::Resize
                 | Verb::Logs
                 | Verb::ImageLs
-                | Verb::ImagePull
                 | Verb::ImageImport
                 | Verb::ImageRm
                 | Verb::NetSetup
@@ -390,7 +367,7 @@ mod tests {
         for verb in Verb::ALL {
             witness(verb);
         }
-        assert_eq!(Verb::ALL.len(), 23, "Verb::ALL must list every variant");
+        assert_eq!(Verb::ALL.len(), 22, "Verb::ALL must list every variant");
         let mut names: Vec<&str> = Verb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();
@@ -408,23 +385,22 @@ mod tests {
     }
 
     #[test]
-    fn docker_rootfs_manifest_uses_absolute_init_as_pid_one() {
-        let manifest = ImageManifest::docker_rootfs(OciProcess {
+    fn image_manifest_uses_absolute_init_as_pid_one() {
+        let manifest = ImageManifest::from_oci_process(OciProcess {
             args: vec!["/usr/local/bin/init".to_string()],
             env: vec!["EXEUNTU=1".to_string()],
             cwd: "/home/exedev".to_string(),
         })
         .unwrap();
 
-        assert_eq!(manifest.kind, ImageKind::DockerRootfs);
         assert_eq!(manifest.init, "/usr/local/bin/init");
         assert_eq!(manifest.root_device, "/dev/vda");
         assert_eq!(manifest.root_fstype, "ext4");
     }
 
     #[test]
-    fn docker_rootfs_manifest_rejects_extra_args_for_now() {
-        let err = ImageManifest::docker_rootfs(OciProcess {
+    fn image_manifest_rejects_extra_args_for_now() {
+        let err = ImageManifest::from_oci_process(OciProcess {
             args: vec!["/init".to_string(), "--debug".to_string()],
             env: Vec::new(),
             cwd: "/".to_string(),
@@ -439,7 +415,6 @@ mod tests {
         let manifest: ImageManifest = serde_json::from_str(
             r#"{
                 "version": 1,
-                "kind": "docker-rootfs",
                 "root_device": "/dev/vda",
                 "root_fstype": "ext4",
                 "init": "/usr/local/bin/init",
@@ -452,7 +427,7 @@ mod tests {
 
     #[test]
     fn manifest_min_kernel_contract_round_trips() {
-        let mut manifest = ImageManifest::docker_rootfs(OciProcess {
+        let mut manifest = ImageManifest::from_oci_process(OciProcess {
             args: vec!["/usr/local/bin/init".to_string()],
             env: Vec::new(),
             cwd: "/".to_string(),
@@ -465,8 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn docker_rootfs_manifest_rejects_relative_init() {
-        let err = ImageManifest::docker_rootfs(OciProcess {
+    fn image_manifest_rejects_relative_init() {
+        let err = ImageManifest::from_oci_process(OciProcess {
             args: vec!["init".to_string()],
             env: Vec::new(),
             cwd: "/".to_string(),

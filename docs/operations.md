@@ -22,15 +22,11 @@ binaries and are called out as such.
 | `dnsmasq` | guest DHCP + leases on the bridge | `dnsmasq` | `dnsmasq` |
 | `ip` | tap/bridge wiring | `iproute2` | `iproute` |
 | `socat` | agent-in-charge vsock proxy | `socat` | `socat` |
-| `cloud-localds` | seed ISO for cloud-image services² | `cloud-image-utils` | `cloud-utils` |
 | KVM | `/dev/kvm`, `kvm` + `vhost_vsock` modules | kernel | kernel |
-| CHV firmware | PVH firmware for cloud images² | `make firmware` (downloads `CLOUDHV.fd`) | same |
 
 ¹ `cloud-hypervisor` is distributed as a static release binary from
 <https://github.com/cloud-hypervisor/cloud-hypervisor/releases>; drop it in
 `/usr/local/bin`. Some distros also package it.
-² Only for cloud-image services. Pure docker-rootfs VMs (the primary path) boot
-the dedicated guest kernel directly and need neither `cloud-localds` nor firmware.
 
 ### Build-time — `hearthctl image build` needs these
 
@@ -102,13 +98,10 @@ sudo make install
 #    kernel change.
 sudo scripts/build-guest-kernel.sh
 
-# 3. (cloud-image services only) fetch the CHV firmware.
-sudo make firmware
-
-# 4. Verify every prerequisite before starting anything.
+# 3. Verify every prerequisite before starting anything.
 hearthctl host check          # table of paths/commands/modules, ok=true each
 
-# 5. Start the daemon.
+# 4. Start the daemon.
 sudo systemctl enable --now hearth.service
 hearthctl ping                # "pong — hearthd <version> (pid <n>)"
 ```
@@ -130,7 +123,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now hearth.service
 A code-only redeploy (e.g. after a daemon fix) is just `sudo make install-bin &&
 sudo systemctl restart hearth` — the unit and paths do not change.
 
-`hearthctl host check` reports each directory, command, the firmware, the guest
+`hearthctl host check` reports each directory, command, the guest
 kernel, `/dev/kvm`, the bridge, and the `kvm`/`vhost_vsock` modules. Green there
 means `create`/`start` will not fail on a missing prerequisite. `hearthctl image
 build` and `scripts/build-guest-kernel.sh` additionally preflight their own build
@@ -146,7 +139,7 @@ installed one. This is **the** supported alternative, not a second deployment:
 
 ```sh
 make dev
-#   == sudo HEARTH_FIRMWARE=... HEARTH_BRIDGE=hearth0 ./target/release/hearthd
+#   == sudo HEARTH_BRIDGE=hearth0 ./target/release/hearthd
 # or the debug binary directly:
 sudo ./target/debug/hearthd
 ```

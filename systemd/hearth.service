@@ -6,9 +6,6 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-# Firmware default in Config is /usr/share/hypervisor-fw/CLOUDHV.fd; `make
-# firmware` installs it here instead, so point hearthd at that path.
-Environment=HEARTH_FIRMWARE=/var/lib/hearth/firmware/CLOUDHV.fd
 # Distro-generic PATH. hearthd shells out to cloud-hypervisor, qemu-img, nft,
 # dnsmasq, and systemctl; a release install commonly drops cloud-hypervisor in
 # /usr/local/bin. The guest-kernel default

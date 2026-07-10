@@ -170,7 +170,7 @@ image_exists() {
 
 # svc_field <name> <jq-path>: read a field from `status`, e.g.
 #   svc_field hermes-a .address
-#   svc_field hermes-a .cloud_init.hostname
+#   svc_field hermes-a .provision.hostname
 # Uses `// empty` so a missing/null field yields "" (never a hard jq error under
 # `set -e`); assert against the result.
 svc_field() {
