@@ -301,6 +301,21 @@ async fn provision_raw_disk(disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()>
 
 async fn systemd_run_chv(service: &Service, argv: Vec<String>) -> Result<()> {
     let unit = format!("hearth-vm-{}", service.name);
+    // A transient unit outlives the hearthd that created it, and one that
+    // crash-looped into `failed` stays loaded. Either leaves the name claimed,
+    // so a fresh `systemd-run --unit=<name>` fails with "already loaded or has a
+    // fragment file". Clear any stale instance first (best-effort — the unit
+    // usually does not exist, and callers only reach here when the VM is not
+    // running). `stop` handles an active/looping unit; `reset-failed` unloads a
+    // failed one.
+    for action in ["stop", "reset-failed"] {
+        let _ = Command::new("systemctl")
+            .args([action, &unit])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
     let mut cmd = Command::new("systemd-run");
     cmd.arg(format!("--unit={unit}"))
         .arg("--collect")
