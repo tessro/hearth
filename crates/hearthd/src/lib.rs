@@ -1585,6 +1585,8 @@ mod tests {
         assert!(argv.contains(
             "--cmdline console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init"
         ));
+        assert!(argv.contains("--memory size=4096M"));
+        assert!(argv.contains("--balloon size=0,free_page_reporting=on"));
     }
 
     #[test]

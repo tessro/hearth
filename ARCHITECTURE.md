@@ -188,7 +188,7 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 ### Boot (start)
 
 1. Read service config.
-2. Pre-create the per-VM tap (`ip tuntap add dev hrt-<name> mode tap`, then attach to `hearth0` and set up), then `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /var/lib/hearth/kernels/current/vmlinux --disk path=<disk>.qcow2 --cmdline "console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=<manifest-init>" --net tap=hrt-<name>,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M`.
+2. Pre-create the per-VM tap (`ip tuntap add dev hrt-<name> mode tap`, then attach to `hearth0` and set up), then `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /var/lib/hearth/kernels/current/vmlinux --disk path=<disk>.qcow2 --cmdline "console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=<manifest-init>" --net tap=hrt-<name>,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M --balloon size=0,free_page_reporting=on`.
 3. Wait for CHV API socket to be ready (poll with timeout).
 4. Mark `enabled = true` in registry (so reboot survives host restart).
 5. Return current status.
@@ -303,6 +303,10 @@ This is the only systemd config that lives on disk for hearth-related VM managem
 
 - **Snapshot retention**: explicit only, or auto-prune by count/age?
 - **`hearthctl exec`**: a verb for running commands inside guests was deferred. Likely belongs in a per-guest agent, not hearthd.
-- **Resource limits beyond CHV's**: should hearth set systemd `MemoryMax`/`CPUQuota` on the transient unit as a belt-and-suspenders bound? Probably yes for `MemoryMax`.
+- **Resource limits beyond CHV's**: guest RAM (`--memory size=`) and the host
+  cgroup footprint of the VMM are different quantities, so Hearth must not
+  derive a tight systemd `MemoryMax` from guest RAM. A future host limit should
+  be an explicit operator budget with separate accounting and admission
+  control; guest workload limits belong inside the guest.
 - **Host package surface**: keep libvirt/qemu/virt-manager installed as a debugging escape hatch, or strip to just cloud-hypervisor + virtiofsd? Default to keep for now; revisit after hearth is solid.
 - **Bridge management**: hearth currently *expects* `hearth0` to exist, declared in NixOS alongside dnsmasq + NAT. `hearthctl host check` validates its presence.
