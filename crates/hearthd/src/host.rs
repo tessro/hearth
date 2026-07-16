@@ -567,7 +567,26 @@ pub fn boot_config_status(execstart: &str, expected_argv: &[String]) -> Option<b
     if running.iter().any(|arg| arg == "--restore") {
         return None;
     }
-    Some(running.join(" ") == expected_argv.join(" "))
+    let (Some(running_executable), Some(expected_executable)) =
+        (running.first(), expected_argv.first())
+    else {
+        return Some(false);
+    };
+    Some(
+        executable_name(running_executable) == executable_name(expected_executable)
+            // `systemctl show` does not consistently preserve argument
+            // boundaries for values containing whitespace. Compare the
+            // flattened remainder exactly, as the property itself presents it.
+            && running[1..].join(" ") == expected_argv[1..].join(" "),
+    )
+}
+
+/// systemd may resolve argv[0] to an absolute executable path even when the
+/// transient unit was launched with a PATH-resolved command name. Only the
+/// executable's basename is relevant to boot-configuration drift; all other
+/// arguments still require an exact match.
+fn executable_name(executable: &str) -> &str {
+    executable.rsplit('/').next().unwrap_or(executable)
 }
 
 /// Tap device name for a service. Linux interface names are capped at 15 bytes.
@@ -691,6 +710,13 @@ mod tests {
         .collect();
         let current = "{ path=/x ; argv[]=cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --cmdline \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init\" ; ignore_errors=no }";
         assert_eq!(boot_config_status(current, &expected), Some(true));
+        let nix_resolved = "{ path=/nix/store/abc-cloud-hypervisor/bin/cloud-hypervisor ; argv[]=/run/current-system/sw/bin/cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --cmdline \"console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init\" ; ignore_errors=no }";
+        assert_eq!(boot_config_status(nix_resolved, &expected), Some(true));
+        let nix_resolved_unquoted = "{ path=/run/current-system/sw/bin/cloud-hypervisor ; argv[]=/run/current-system/sw/bin/cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --cmdline console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=/usr/local/bin/init ; ignore_errors=no }";
+        assert_eq!(
+            boot_config_status(nix_resolved_unquoted, &expected),
+            Some(true)
+        );
         let drifted = "{ path=/x ; argv[]=cloud-hypervisor --api-socket /run/hearth/vms/mail.sock --kernel /old/vmlinux ; ignore_errors=no }";
         assert_eq!(boot_config_status(drifted, &expected), Some(false));
     }

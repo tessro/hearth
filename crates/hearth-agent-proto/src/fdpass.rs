@@ -29,12 +29,12 @@ fn send_fd_raw(sock: RawFd, fd: RawFd) -> io::Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as usize;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
     unsafe {
         let hdr = libc::CMSG_FIRSTHDR(&msg);
         (*hdr).cmsg_level = libc::SOL_SOCKET;
         (*hdr).cmsg_type = libc::SCM_RIGHTS;
-        (*hdr).cmsg_len = libc::CMSG_LEN(4) as usize;
+        (*hdr).cmsg_len = libc::CMSG_LEN(4) as _;
         std::ptr::copy_nonoverlapping(
             &fd as *const RawFd as *const u8,
             libc::CMSG_DATA(hdr),
@@ -59,7 +59,7 @@ fn recv_fd_raw(sock: RawFd) -> io::Result<OwnedFd> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as usize;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
     let rc = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if rc < 0 {
         return Err(io::Error::last_os_error());

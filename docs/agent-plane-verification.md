@@ -1,6 +1,7 @@
 # Agent Plane — Verification Report
 
-Status: **implemented and self-verified** (2026-07-14). Companion to
+Status: **implemented and self-verified, including a live KVM guest**
+(2026-07-15). Companion to
 `docs/agent-plane.md`. Records what the acceptance tests actually exercise, and
 — honestly — what they cannot, plus how a future session could close each gap.
 
@@ -34,7 +35,7 @@ verb policy, socket broker, `wait`/`agent-endpoints` verbs, guest telemetry in
 
 ## Verified here (automated, on production code paths)
 
-Run: `cargo test --release` (220 tests) and
+Run: `cargo test --release` (225 tests) and
 `cargo clippy --release --all-targets -- -D warnings` (clean).
 
 The `hearth-e2e` crate exercises the whole stack in-process. Because CHV's
@@ -57,22 +58,63 @@ log's rotate/prune/truncation-marker and restart-survival; ledger replay across
 reopen; fd passing (a passed listener still accepts); the hybrid handshake
 leaves the stream byte-clean; the verb policy's allow/deny matrix.
 
-## Not verifiable in this environment — and how to close each gap
+## Verified live on NixOS + KVM
+
+The following was exercised on a real NixOS host on 2026-07-15, beyond the
+in-process acceptance harness:
+
+- `hearthctl host check` passes every prerequisite, including `/dev/kvm` as a
+  character device, `kvm`, `vhost_vsock`, the `hearth0` bridge, guest kernel,
+  recovery keyring, and all required host commands.
+- `hearth-guestd` was cross-compiled with the locked nixpkgs musl toolchain via
+  `make guest-bin-musl`; `file` reports `static-pie linked`, and the staged
+  vm-base binary is byte-identical to the target artifact. The Makefile now
+  forces `crt-static` because Nix's musl cross wrapper otherwise emits a
+  dynamically linked binary whose interpreter lives in `/nix/store`.
+- A root-ownership-preserving Buildah image was materialized and imported as
+  `agent-plane-smoke-clean`. On a rootless NixOS host the working invocation is
+  to run `hearthctl image build` *inside* `buildah unshare`, without passing
+  hearthctl's `--rootless` flag. The explicit flag currently flattens root-owned
+  guest files to the invoking uid and produces an invalid sudo installation;
+  that path remains an open tooling bug.
+- A real Cloud Hypervisor VM (`agent-plane-clean-vm`, vsock CID 101) booted the
+  image. `/usr/bin/sudo` retained `root:root 4755`; `sudo -n true` succeeded;
+  `hearth-guestd.service` was active; and `hearthctl wait
+  agent-plane-clean-vm` returned `ready (boot report)` without a console marker.
+- The real `AF_VSOCK` guest transport established the boot-report/heartbeat
+  channel. `status` reports guestd `0.1.0`, `connected: true`, `ready: true`, and
+  a fresh `last_seen`. This found and fixed an edge-triggered `AsyncFd` bug that
+  cleared connect readiness before the first write and could hang forever.
+- Restarting `hearthd` twice left both Cloud Hypervisor processes and guest
+  boot IDs unchanged. Guest telemetry reconnected, readiness remained green,
+  and both the long-running legacy VM and fresh agent VM report
+  `boot_config: current`.
+- A temporary `hearth-agentd --no-http` process used the production hearthd
+  socket broker to discover the live agent VM and list its empty task set. A
+  task against a disposable guest emitted durable `RUN_STARTED`, `RUN_ERROR`,
+  and terminal failure events when `codex app-server` was absent, proving the
+  real failure path is clean. No production agentd service was installed or
+  enabled.
+
+### Fixes produced by the live pass
+
+1. Offline image linting now detects absolute systemd enablement symlinks
+   without resolving them against the host root.
+2. `SCM_RIGHTS` control-message lengths compile on both glibc and musl libc
+   layouts.
+3. AF_VSOCK connect readiness is retained until real I/O consumes it.
+4. `guest-bin-musl` enforces a genuinely static guest artifact on Nix.
+5. `/dev/kvm` is checked as a character device instead of a regular file.
+6. Boot-config drift comparison tolerates systemd's resolved executable path
+   and flattened whitespace representation while still requiring Hearth's
+   generated argument remainder to match exactly.
+
+## Remaining gaps — and how to close each
 
 These are genuine gaps, not hand-waves. Each says what is unproven and what
 access would let a future session prove it.
 
-1. **Real CHV guest + real AF_VSOCK.** The harness emulates CHV's hybrid model
-   over unix sockets; `hearth-guestd`'s `vsock` transport (`AF_VSOCK` connect /
-   listen in `crates/hearth-guestd/src/vsock_io.rs`) is compiled but never run
-   against a live guest kernel here.
-   *To verify:* a host with KVM + cloud-hypervisor + a guest kernel with
-   `CONFIG_VIRTIO_VSOCKETS=y`. Build vm-base (`make vm-base`), `spawn --agent` a
-   VM, and assert `hearthctl wait <vm>` (no marker) returns and `hearthctl agent
-   ls` shows it. `scripts/` already has the CHV plumbing; add an
-   `scripts/test-agent-plane.sh` that spawns a guestd VM and runs a task.
-
-2. **Real `codex app-server` / `claude` CLIs.** The adapters drive a *pinned
+1. **Real `codex app-server` / `claude` CLIs.** The adapters drive a *pinned
    contract* (`PINNED_APP_SERVER_VERSION` / `PINNED_CLI_VERSION`) modelled on
    the real stream shapes but **not validated against the real binaries** — the
    exact method names (`newThread`/`sendUserTurn`/`execApproval`; claude's
@@ -85,7 +127,7 @@ access would let a future session prove it.
    mismatch is a loud, clean error, so the *contract mechanism* is proven — only
    the *specific schema* needs a real CLI.
 
-3. **Unmodified AG-UI `HttpAgent` conformance.** Phase 3 drives the endpoint
+2. **Unmodified AG-UI `HttpAgent` conformance.** Phase 3 drives the endpoint
    with a raw HTTP/SSE client that mirrors what `HttpAgent` does on the wire,
    not the TypeScript SDK itself.
    *To verify:* a Node environment with `@ag-ui/client`; point a real
@@ -95,27 +137,21 @@ access would let a future session prove it.
    (`crates/hearth-agent-proto/src/events.rs`), so this is a conformance check,
    not new development.
 
-4. **musl static build of guestd.** The default `make guest-bin` builds a glibc
-   binary (correct for the ubuntu vm-base and buildable here); the portable musl
-   static build (`make guest-bin-musl`) needs the musl std, which this
-   toolchain lacks (`rustup target add x86_64-unknown-linux-musl`).
-   *To verify:* `rustup target add x86_64-unknown-linux-musl && make
-   guest-bin-musl` and confirm `ldd` reports "not a dynamic executable".
-
-5. **systemd unit hardening + `LoadCredential` + real `hearth-agent` user.**
+3. **systemd unit hardening + `LoadCredential` + real `hearth-agent` user.**
    `systemd/hearth-agentd.service` declares the hardening and credential wiring
-   §4 requires, and the control socket is chmod'd `0660` in code, but the unit
-   is never actually launched by systemd here (the harness runs agentd as the
-   test uid). `SO_PEERCRED`-based policy is unit-tested with synthetic
-   uids/gids, not a real dedicated user.
-   *To verify:* on a systemd host, create the `hearth-agent` user, stage
-   `/etc/hearth/agent/{http-token,ref-key}`, `make install-agentd`, `systemctl
-   start hearth-agentd`, and assert (a) it can reach hearthd's broker via the
-   `hearth` supplementary group, (b) `ProtectSystem=strict` etc. hold
-   (`systemd-analyze security hearth-agentd`), and (c) a client with a random
-   uid is denied lifecycle verbs.
+   §4 requires, but it must not be enabled as written. Both `hearth.service`
+   and `hearth-agentd.service` claim `RuntimeDirectory=hearth`, so the
+   unprivileged unit could change ownership of the shared broker directory.
+   Further, agentd chmods its control socket to `0660` but does not assign the
+   documented `root:hearth` ownership; when run as `hearth-agent`, operators in
+   the `hearth` group would not own the socket through that primary group.
+   *To verify after fixing the unit/socket ownership:* declare the
+   `hearth-agent` user and credentials in NixOS, launch the unit, assert it can
+   reach hearthd through its supplementary `hearth` group, inspect
+   `systemd-analyze security hearth-agentd`, and confirm an unrelated uid is
+   denied machine-plane lifecycle verbs.
 
-6. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
+4. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
    rotation is unit-tested (`store.rs`) and the restore→`ReportAck{restored:
    true}`→`rotate_incarnation` wiring is in place (`hearthd` marks pending
    restore; guestd rotates on the ack), but the *machine-plane* `restore` path
@@ -125,10 +161,25 @@ access would let a future session prove it.
    fresh `task.status` re-syncs. The guest-side half is already proven by
    `phase2_tasks.rs::stale_cursor_is_rejected_by_incarnation`.
 
-7. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
+5. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only
    so the boundary stays honest: guests can still reach each other over
    `hearth0` at the IP layer; the agent plane simply never uses that path.
+
+## Host-environment issues observed during the live pass
+
+- `/etc/dnsmasq.d/hearth` is absent on this host. Hearth therefore cannot write
+  its requested static lease drop-in and the live agent VM uses dnsmasq's
+  dynamic lease instead. Connectivity works, but the declarative NixOS network
+  integration should create/wire the drop-in before static addressing can be
+  claimed.
+- A legacy image at `/var/lib/hearth/images/debian-13-generic-amd64` has no
+  `.hearth.toml`; one malformed legacy entry currently aborts the entire
+  `image ls`, which also blocks the composite `spawn` path. The live pass used
+  explicit image build/import, `create`, and `start` instead. No legacy disk or
+  image was deleted.
+- The generated `example/vm-base/hearth-guestd` is a build-context artifact and
+  is intentionally not source-controlled.
 
 ## Adversarial review pass
 

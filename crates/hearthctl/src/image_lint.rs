@@ -426,9 +426,16 @@ pub fn rootfs_has_guestd(rootfs: &Utf8Path) -> bool {
         || rootfs
             .join("usr/lib/systemd/system/hearth-guestd.service")
             .exists();
-    let enabled = rootfs
-        .join("etc/systemd/system/multi-user.target.wants/hearth-guestd.service")
-        .exists();
+    // Enabled units are commonly absolute symlinks inside the guest rootfs
+    // (`/etc/systemd/system/...`). `Path::exists` follows that link against the
+    // host root while linting offline, so a valid guest symlink appears
+    // dangling. Inspect the directory entry itself instead.
+    let enabled = fs::symlink_metadata(
+        rootfs
+            .join("etc/systemd/system/multi-user.target.wants/hearth-guestd.service")
+            .as_std_path(),
+    )
+    .is_ok();
     binary && unit && enabled
 }
 
@@ -586,7 +593,11 @@ mod tests {
         fs::write(&guestd, b"#!/bin/sh\n").unwrap();
         fs::set_permissions(&guestd, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(sys.join("hearth-guestd.service"), b"").unwrap();
-        fs::write(sys.join("multi-user.target.wants/hearth-guestd.service"), b"").unwrap();
+        symlink(
+            "/etc/systemd/system/hearth-guestd.service",
+            sys.join("multi-user.target.wants/hearth-guestd.service"),
+        )
+        .unwrap();
     }
 
     fn tmp() -> (tempfile::TempDir, Utf8PathBuf) {

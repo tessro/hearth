@@ -17,6 +17,9 @@ build:
 # distro image regardless of libc (docs/agent-plane.md §2); requires the musl
 # std (`rustup target add x86_64-unknown-linux-musl`). Override for other arches.
 GUEST_MUSL_TARGET ?= x86_64-unknown-linux-musl
+# Nix's musl cross wrapper defaults to a dynamic musl interpreter in the Nix
+# store. Enforce the static contract this target promises on every toolchain.
+GUEST_MUSL_RUSTFLAGS ?= -C target-feature=+crt-static -C link-arg=-static
 
 # Build hearth-guestd and stage it into the vm-base build context. Defaults to a
 # host-libc (glibc) build, correct for the ubuntu-based vm-base and buildable
@@ -26,7 +29,7 @@ guest-bin: build
 	$(INSTALL) -D -m 0755 target/release/hearth-guestd example/vm-base/hearth-guestd
 
 guest-bin-musl:
-	$(CARGO) build --release -p hearth-guestd --target $(GUEST_MUSL_TARGET)
+	RUSTFLAGS="$(GUEST_MUSL_RUSTFLAGS)" $(CARGO) build --release -p hearth-guestd --target $(GUEST_MUSL_TARGET)
 	$(INSTALL) -D -m 0755 target/$(GUEST_MUSL_TARGET)/release/hearth-guestd example/vm-base/hearth-guestd
 
 # Build the shared VM base layer as a plain local buildah image. Workload images

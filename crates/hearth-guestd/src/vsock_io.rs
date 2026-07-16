@@ -60,8 +60,11 @@ impl VsockStream {
         }
         let fd = AsyncFd::new(fd)?;
         // Wait for connect completion, then read SO_ERROR for the verdict.
-        let mut guard = fd.writable().await?;
-        guard.clear_ready();
+        // Keep the writable readiness cached for the first actual write. Tokio's
+        // AsyncFd readiness is edge-triggered; clearing it here, before doing
+        // any I/O that could return WouldBlock, can leave an established vsock
+        // stream waiting forever with no new edge.
+        let _guard = fd.writable().await?;
         let mut err: libc::c_int = 0;
         let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
         let rc = unsafe {
@@ -73,6 +76,7 @@ impl VsockStream {
                 &mut len,
             )
         };
+        drop(_guard);
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }

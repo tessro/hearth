@@ -1181,7 +1181,7 @@ impl<H: Host + 'static> Daemon<H> {
             check_path("log_dir", &self.cfg.log_dir, true),
             check_path("guest_kernel", &self.cfg.guest_kernel, false),
             check_authorized_keys_file(&self.cfg.authorized_keys_file).await,
-            check_path("kvm_device", &Utf8PathBuf::from("/dev/kvm"), false),
+            check_character_device("kvm_device", &Utf8PathBuf::from("/dev/kvm")),
             check_path(
                 "bridge",
                 &Utf8PathBuf::from(format!("/sys/class/net/{}", self.cfg.bridge)),
@@ -1457,6 +1457,15 @@ fn check_path(name: &str, path: &Utf8PathBuf, should_be_dir: bool) -> Value {
         } else {
             path.is_file()
         };
+    json!({ "name": name, "path": path, "ok": ok })
+}
+
+fn check_character_device(name: &str, path: &Utf8PathBuf) -> Value {
+    use std::os::unix::fs::FileTypeExt;
+
+    let ok = std::fs::metadata(path)
+        .map(|metadata| metadata.file_type().is_char_device())
+        .unwrap_or(false);
     json!({ "name": name, "path": path, "ok": ok })
 }
 
@@ -2242,6 +2251,18 @@ backoff_sec = 10
             .unwrap();
         assert_eq!(keys["ok"], json!(false));
         assert!(keys["error"].as_str().unwrap().contains("No such file"));
+    }
+
+    #[test]
+    fn character_device_check_accepts_device_nodes_and_rejects_regular_files() {
+        assert_eq!(
+            check_character_device("device", &Utf8PathBuf::from("/dev/null"))["ok"],
+            json!(true)
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(check_character_device("device", &path)["ok"], json!(false));
     }
 
     #[tokio::test]
