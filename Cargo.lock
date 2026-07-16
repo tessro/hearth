@@ -415,6 +415,82 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hearth-agent-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hearth-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "hearth-agentd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "chrono",
+ "clap",
+ "hearth-agent-proto",
+ "hearth-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
+name = "hearth-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "clap",
+ "hearth-agent-proto",
+ "hearth-agentd",
+ "hearth-guestd",
+ "hearth-proto",
+ "hearthd",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "hearth-guestd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "camino",
+ "chrono",
+ "clap",
+ "hearth-agent-proto",
+ "hearth-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "hearth-proto"
 version = "0.1.0"
 dependencies = [
@@ -431,6 +507,7 @@ dependencies = [
  "camino",
  "clap",
  "comfy-table",
+ "hearth-agent-proto",
  "hearth-proto",
  "serde",
  "serde_json",
@@ -450,6 +527,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "hearth-agent-proto",
  "hearth-proto",
  "hex",
  "libc",

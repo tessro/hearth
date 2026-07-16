@@ -88,10 +88,19 @@ pub struct Config {
     /// range.
     #[arg(long, env = "HEARTH_DHCP_STATIC_COUNT", default_value_t = 64)]
     pub dhcp_static_count: u32,
-    #[arg(long, env = "HEARTH_VSOCK_PORT", default_value_t = 1024)]
-    pub vsock_port: u32,
+    /// Skip binding the per-VM hybrid vsock listeners (dev hosts without a
+    /// writable run dir; unit tests).
     #[arg(long, env = "HEARTH_DISABLE_VSOCK", default_value_t = false)]
     pub disable_vsock: bool,
+    /// Per-peer-UID verb policy (docs/agent-plane.md §10). Absent file: the
+    /// built-in default applies (root and the hearth group may issue every
+    /// verb; nobody else matches).
+    #[arg(
+        long,
+        env = "HEARTH_VERB_POLICY",
+        default_value = "/etc/hearth/verb-policy.toml"
+    )]
+    pub verb_policy: Utf8PathBuf,
 }
 
 impl Config {
@@ -101,6 +110,15 @@ impl Config {
 
     pub fn vm_vsock_socket(&self, name: &str) -> Utf8PathBuf {
         self.run_dir.join("vsock").join(format!("{name}.sock"))
+    }
+
+    /// Host-side unix socket where a guest-initiated vsock connection to host
+    /// port `port` lands under CHV's hybrid model (`<vm>.sock_<port>`, §6 of
+    /// docs/agent-plane.md).
+    pub fn vm_vsock_port_socket(&self, name: &str, port: u32) -> Utf8PathBuf {
+        self.run_dir
+            .join("vsock")
+            .join(format!("{name}.sock_{port}"))
     }
 
     /// The per-VM disk path for a service. New services record their disk

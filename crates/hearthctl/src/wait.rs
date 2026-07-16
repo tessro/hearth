@@ -73,11 +73,61 @@ impl MarkerScan {
     }
 }
 
-/// Block until `marker` appears in `name`'s console log or `timeout_secs`
-/// elapses. On success prints the matched line to stdout and returns `Ok`; on
-/// timeout or an early stream close prints the last few log lines to stderr and
-/// returns an error (so `hearthctl` exits non-zero).
-pub async fn run(socket: &Utf8Path, name: &str, marker: &str, timeout_secs: u64) -> Result<()> {
+/// Block until `name` is ready. With a `marker`, tail the console log for it
+/// (the legacy signal). Without one, block on the guestd boot report via the
+/// daemon `wait` verb (docs/agent-plane.md §2.1). On success prints to stdout
+/// and returns `Ok`; on timeout returns an error (non-zero exit).
+pub async fn run(
+    socket: &Utf8Path,
+    name: &str,
+    marker: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    match marker {
+        Some(marker) => run_marker(socket, name, marker, timeout_secs).await,
+        None => run_boot_report(socket, name, timeout_secs).await,
+    }
+}
+
+/// Block on the guestd boot report (no marker). One `wait` request; the daemon
+/// blocks until the report or the timeout.
+async fn run_boot_report(socket: &Utf8Path, name: &str, timeout_secs: u64) -> Result<()> {
+    let stream = UnixStream::connect(socket.as_str())
+        .await
+        .with_context(|| format!("connect hearthd socket {socket}"))?;
+    let (read, mut write) = stream.into_split();
+    let mut args = Map::new();
+    args.insert("name".to_string(), json!(name));
+    args.insert("timeout".to_string(), json!(timeout_secs));
+    let req = Request::new(Ulid::new().to_string(), Verb::Wait, args);
+    write
+        .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
+        .await?;
+    write.shutdown().await?;
+    let mut lines = BufReader::new(read).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("hearthd closed the wait connection without a response"))?;
+    let resp: Response = serde_json::from_str(&line).context("parse wait response")?;
+    if resp.ok {
+        println!("{name} ready (boot report)");
+        Ok(())
+    } else {
+        let detail = resp
+            .error
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| "unknown hearthd error".to_string());
+        bail!("wait for {name} failed: {detail}");
+    }
+}
+
+async fn run_marker(
+    socket: &Utf8Path,
+    name: &str,
+    marker: &str,
+    timeout_secs: u64,
+) -> Result<()> {
     if marker.is_empty() {
         bail!("--marker must not be empty");
     }

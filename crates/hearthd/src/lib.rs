@@ -1,36 +1,44 @@
 pub mod config;
 pub mod error;
+pub mod guests;
 pub mod host;
 pub mod image;
 pub mod net;
 pub mod notify;
+pub mod policy;
 pub mod provision;
 pub mod registry;
 pub mod ssh;
+pub mod testing;
 pub mod vsock;
 
 use crate::{
     config::Config,
     error::{code_of, coded},
+    guests::GuestTable,
     host::{boot_config_status, cloud_hypervisor_argv, unit_name, wait_for_inactive, Host},
     net::PublishTarget,
+    policy::VerbPolicy,
     provision::ProvisionPlan,
     registry::{validate_name, Allocations, Provision, Publish, Registry, RestartPolicy, Service},
 };
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use chrono::Utc;
+use hearth_agent_proto::{fdpass, read_line_capped, MAX_LINE_BYTES, PORT_AGENT};
 use hearth_proto::{version_result, ImageManifest, Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 #[cfg(target_os = "linux")]
-use std::{mem, os::fd::AsRawFd};
+use std::mem;
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
     sync::{Mutex, OwnedMutexGuard},
+    task::JoinHandle,
     time::Duration,
 };
 use tracing::{error, info, warn};
@@ -41,6 +49,10 @@ pub struct Daemon<H> {
     host: Arc<H>,
     registry_lock: Arc<Mutex<()>>,
     service_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Guestd boot reports / heartbeats (agent plane §2.1).
+    pub(crate) guests: Arc<GuestTable>,
+    /// Per-service hybrid vsock listener tasks (agent plane §6).
+    pub(crate) channels: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
 }
 
 impl<H> Clone for Daemon<H> {
@@ -50,6 +62,8 @@ impl<H> Clone for Daemon<H> {
             host: Arc::clone(&self.host),
             registry_lock: Arc::clone(&self.registry_lock),
             service_locks: Arc::clone(&self.service_locks),
+            guests: Arc::clone(&self.guests),
+            channels: Arc::clone(&self.channels),
         }
     }
 }
@@ -61,6 +75,8 @@ impl<H: Host + 'static> Daemon<H> {
             host: Arc::new(host),
             registry_lock: Arc::new(Mutex::new(())),
             service_locks: Arc::new(Mutex::new(HashMap::new())),
+            guests: Arc::new(GuestTable::default()),
+            channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -79,25 +95,32 @@ impl<H: Host + 'static> Daemon<H> {
         {
             set_socket_permissions(&self.cfg.socket)?;
         }
+        let policy = Arc::new(VerbPolicy::load(&self.cfg.verb_policy).await?);
         info!(socket = %self.cfg.socket, "hearthd ready");
-        let _vsock_thread = self.spawn_vsock_listener().await?;
+        self.bind_running_guest_channels().await;
         notify::ready()?;
         loop {
             let (stream, _) = listener.accept().await?;
             let daemon = self.clone();
+            let policy = Arc::clone(&policy);
             tokio::spawn(async move {
-                if let Err(err) = daemon.handle_connection(stream).await {
+                if let Err(err) = daemon.handle_connection(stream, policy).await {
                     error!(error = %err, "connection failed");
                 }
             });
         }
     }
 
-    async fn handle_connection(&self, stream: UnixStream) -> Result<()> {
+    async fn handle_connection(
+        &self,
+        mut stream: UnixStream,
+        policy: Arc<VerbPolicy>,
+    ) -> Result<()> {
         let caller = peer_credentials(&stream);
-        let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            let Some(line) = read_line_capped(&mut stream, MAX_LINE_BYTES).await? else {
+                return Ok(());
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -108,7 +131,29 @@ impl<H: Host + 'static> Daemon<H> {
                     let id = req.id.clone();
                     let verb = req.verb.to_string();
                     let args = Value::Object(req.args.clone());
-                    let ok = self.handle_and_write(req, &mut write).await?;
+                    let allowed = policy.allows(
+                        caller.as_ref().map(|cred| cred.uid),
+                        caller.as_ref().map(|cred| cred.gid),
+                        &req.verb,
+                    );
+                    let ok = if allowed {
+                        let (ok, fd) = self.handle_and_write(req, &mut stream).await?;
+                        if let Some(fd) = fd {
+                            fdpass::send_fd(&stream, fd.as_raw_fd()).await?;
+                        }
+                        ok
+                    } else {
+                        write_response(
+                            &mut stream,
+                            &Response::failure(
+                                id.clone(),
+                                "verb.denied",
+                                format!("peer is not authorized for verb {verb}"),
+                            ),
+                        )
+                        .await?;
+                        false
+                    };
                     info!(
                         id = %id,
                         verb = %verb,
@@ -117,6 +162,7 @@ impl<H: Host + 'static> Daemon<H> {
                         caller_uid = caller.as_ref().map(|cred| cred.uid),
                         caller_gid = caller.as_ref().map(|cred| cred.gid),
                         caller_pid = caller.as_ref().and_then(|cred| cred.pid),
+                        allowed,
                         ok,
                         duration_ms = started.elapsed().as_millis() as u64,
                         "audit"
@@ -124,10 +170,10 @@ impl<H: Host + 'static> Daemon<H> {
                 }
                 Err(err) => {
                     let resp = Response::failure("", "protocol.invalid_json", err.to_string());
-                    write
+                    stream
                         .write_all(serde_json::to_string(&resp)?.as_bytes())
                         .await?;
-                    write.write_all(b"\n").await?;
+                    stream.write_all(b"\n").await?;
                     warn!(
                         error = %err,
                         caller_transport = "unix",
@@ -139,7 +185,6 @@ impl<H: Host + 'static> Daemon<H> {
                 }
             }
         }
-        Ok(())
     }
 
     pub async fn handle(&self, req: Request) -> Vec<Response> {
@@ -159,27 +204,43 @@ impl<H: Host + 'static> Daemon<H> {
                 "stream.requires_socket",
                 "follow streams must be served over a live socket",
             )],
+            Ok(Dispatch::PassFd { .. }) => vec![Response::failure(
+                id,
+                "stream.requires_socket",
+                "fd passing requires a live unix socket",
+            )],
             Err(err) => vec![Response::failure(id, error_code(&err), err.to_string())],
         }
     }
 
-    async fn handle_and_write(&self, req: Request, write: &mut OwnedWriteHalf) -> Result<bool> {
+    /// Dispatch one request and write its response(s). Returns `(ok, fd)`;
+    /// when `fd` is `Some`, the caller must SCM_RIGHTS it to the peer right
+    /// after the already-written success line (broker verbs, §6).
+    pub(crate) async fn handle_and_write<W: AsyncWrite + Unpin>(
+        &self,
+        req: Request,
+        write: &mut W,
+    ) -> Result<(bool, Option<OwnedFd>)> {
         let id = req.id.clone();
         match self.dispatch(req).await {
             Ok(Dispatch::One(value)) => {
                 write_response(write, &Response::success(id, value)).await?;
-                Ok(true)
+                Ok((true, None))
             }
             Ok(Dispatch::BufferedStream(values)) => {
                 for value in values {
                     write_response(write, &Response::stream_data(id.clone(), value)).await?;
                 }
                 write_response(write, &Response::stream_end(id)).await?;
-                Ok(true)
+                Ok((true, None))
             }
             Ok(Dispatch::FollowLog { path }) => {
                 self.stream_log(write, id, path, true).await?;
-                Ok(true)
+                Ok((true, None))
+            }
+            Ok(Dispatch::PassFd { result, fd }) => {
+                write_response(write, &Response::success(id, result)).await?;
+                Ok((true, Some(fd)))
             }
             Err(err) => {
                 write_response(
@@ -187,7 +248,7 @@ impl<H: Host + 'static> Daemon<H> {
                     &Response::failure(id, error_code(&err), err.to_string()),
                 )
                 .await?;
-                Ok(false)
+                Ok((false, None))
             }
         }
     }
@@ -243,6 +304,10 @@ impl<H: Host + 'static> Daemon<H> {
             Verb::HostCheck => self.host_check().await.map(Dispatch::One),
             Verb::Publish => self.add_publish(req.args).await.map(Dispatch::One),
             Verb::Unpublish => self.remove_publish(req.args).await.map(Dispatch::One),
+            Verb::Wait => self.wait(req.args).await.map(Dispatch::One),
+            Verb::AgentEndpoints => self.agent_endpoints().await.map(Dispatch::One),
+            Verb::GuestListener => self.guest_listener(req.args).await,
+            Verb::GuestConnect => self.guest_connect(req.args).await,
         }
     }
 
@@ -310,6 +375,34 @@ impl<H: Host + 'static> Daemon<H> {
                 value["boot_config"] = json!(state);
             }
         }
+        // Agent-plane telemetry (§2.1): shown when a guestd has reported,
+        // absent — absent, not unhealthy — for guestd-less images (§2.5).
+        // Guest-reported addresses are corroborating only; a divergence from
+        // the lease-resolved address is surfaced, and the lease wins.
+        if let Some(guest) = self.guests.get(name) {
+            let lease_ip = value
+                .get("address")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let diverged = lease_ip.as_deref().is_some_and(|ip| {
+                !guest.report.addrs.is_empty()
+                    && !guest
+                        .report
+                        .addrs
+                        .iter()
+                        .any(|addr| addr.split('/').next() == Some(ip))
+            });
+            value["guestd"] = guest.summary();
+            value["address_divergence"] = json!(diverged);
+            if diverged {
+                warn!(
+                    service = %name,
+                    lease = ?lease_ip,
+                    reported = ?guest.report.addrs,
+                    "guest-reported addresses diverge from lease; lease wins"
+                );
+            }
+        }
         Ok(value)
     }
 
@@ -340,12 +433,24 @@ impl<H: Host + 'static> Daemon<H> {
                 format!("base image not found: {image_path}"),
             ));
         }
-        let _manifest = image::load(&self.cfg, &image).await?;
+        let manifest = image::load(&self.cfg, &image).await?;
         let is_agent_in_charge = optional_bool(&args, "is_agent_in_charge").unwrap_or(false);
         if is_agent_in_charge && reg.services.values().any(|svc| svc.is_agent_in_charge) {
             return Err(coded(
                 "service.duplicate_agent_in_charge",
                 "at most one service may set is_agent_in_charge = true",
+            ));
+        }
+        // Agent-plane participation is declared, not guessed (§2.5): an
+        // `agent = true` service requires an image that carries guestd.
+        let agent = optional_bool(&args, "agent").unwrap_or(false);
+        if agent && !manifest.guestd {
+            return Err(coded(
+                "agent.requires_guestd",
+                format!(
+                    "image {image} does not declare guestd; rebuild it on the current vm-base \
+                     (or set guestd = true in its manifest after installing hearth-guestd)"
+                ),
             ));
         }
 
@@ -437,6 +542,7 @@ impl<H: Host + 'static> Daemon<H> {
             vsock_cid,
             mac,
             is_agent_in_charge,
+            agent,
             disk: Some(disk_filename.clone()),
             publish,
             provision: provisioning,
@@ -496,6 +602,9 @@ impl<H: Host + 'static> Daemon<H> {
         if !self.is_running(name).await {
             let image_metadata = image::load(&self.cfg, &svc.image).await?;
             validate_boot_prerequisites(&self.cfg, &image_metadata).await?;
+            // A fresh boot invalidates any previous guestd report; `wait` must
+            // block on this boot's report, not the last one's.
+            self.guests.forget(name);
             self.host
                 .systemd_run_vm(&self.cfg, &svc, &image_metadata)
                 .await?;
@@ -503,6 +612,7 @@ impl<H: Host + 'static> Daemon<H> {
                 .wait_for_vm_socket(&self.cfg.vm_socket(name), Duration::from_secs(20))
                 .await?;
         }
+        self.ensure_guest_channels(name).await?;
         svc.enabled = true;
         Registry::write_service(&self.cfg, &svc).await?;
         reg.services.insert(name.to_string(), svc);
@@ -560,6 +670,8 @@ impl<H: Host + 'static> Daemon<H> {
         }
         svc.enabled = false;
         Registry::write_service(&self.cfg, &svc).await?;
+        self.drop_guest_channels(name).await;
+        self.guests.forget(name);
         self.rewrite_nat(&reg).await;
         Ok(json!({ "name": name, "running": false, "enabled": false }))
     }
@@ -632,10 +744,15 @@ impl<H: Host + 'static> Daemon<H> {
         let _ = self.stop_unlocked(name).await;
         let reg = self.registry().await?;
         let mut svc = reg.get(name)?.clone();
+        // The restored guest's next boot report gets `restored: true` in its
+        // ack, so guestd rotates task incarnations and outstanding cursors go
+        // cleanly stale (§3.4). Marked before the guest can possibly reconnect.
+        self.guests.mark_pending_restore(name);
         self.host.systemd_restore_vm(&self.cfg, &svc, &src).await?;
         self.host
             .wait_for_vm_socket(&self.cfg.vm_socket(name), Duration::from_secs(20))
             .await?;
+        self.ensure_guest_channels(name).await?;
         svc.enabled = true;
         Registry::write_service(&self.cfg, &svc).await?;
         // Re-apply the NAT table (mirror start_unlocked): the resumed guest may
@@ -896,6 +1013,148 @@ impl<H: Host + 'static> Daemon<H> {
         self.status(service).await
     }
 
+    /// Block until a guestd boot report marks the service ready (kills
+    /// workaround #12). Readiness is declared, not guessed: an image that does
+    /// not declare guestd gets a clean error telling the caller to keep using
+    /// `--marker`.
+    async fn wait(&self, args: Map<String, Value>) -> Result<Value> {
+        let name = required_str(&args, "name")?;
+        let timeout_secs = optional_u64(&args, "timeout").unwrap_or(300);
+        let reg = self.registry().await?;
+        let svc = reg.get(name)?;
+        let manifest = image::load(&self.cfg, &svc.image).await?;
+        if !manifest.guestd {
+            return Err(coded(
+                "wait.requires_marker",
+                format!(
+                    "image {} does not declare guestd; use wait --marker as before",
+                    svc.image
+                ),
+            ));
+        }
+        if !self.is_running(name).await {
+            return Err(coded(
+                "wait.not_running",
+                format!("service {name} is not running"),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut changes = self.guests.subscribe();
+        loop {
+            if let Some(guest) = self.guests.get(name) {
+                if guest.report.ready {
+                    return Ok(json!({
+                        "name": name,
+                        "ready": true,
+                        "guestd": guest.summary(),
+                    }));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(coded(
+                    "wait.timeout",
+                    format!("timed out after {timeout_secs}s waiting for {name}'s boot report"),
+                ));
+            }
+            if tokio::time::timeout(remaining, changes.changed())
+                .await
+                .is_err()
+            {
+                return Err(coded(
+                    "wait.timeout",
+                    format!("timed out after {timeout_secs}s waiting for {name}'s boot report"),
+                ));
+            }
+        }
+    }
+
+    /// Agent-plane discovery: every `agent = true` service with its guestd
+    /// telemetry. This is how agentd learns which VMs exist without ever
+    /// touching the vsock directory itself.
+    async fn agent_endpoints(&self) -> Result<Value> {
+        let reg = self.registry().await?;
+        let mut endpoints = Vec::new();
+        for svc in reg.services.values().filter(|svc| svc.agent) {
+            let running = self.is_running(&svc.name).await;
+            let guest = self.guests.get(&svc.name);
+            endpoints.push(json!({
+                "name": svc.name,
+                "running": running,
+                "is_agent_in_charge": svc.is_agent_in_charge,
+                "guestd": guest.map(|g| g.summary()),
+            }));
+        }
+        Ok(json!({ "agents": endpoints }))
+    }
+
+    /// Broker verb (§6): bind `<vm>.sock_<port>` and pass the listening fd to
+    /// the caller. Only agent-plane ports may be brokered, and only for
+    /// agent-enabled services; the vsock directory itself stays root-owned.
+    async fn guest_listener(&self, args: Map<String, Value>) -> Result<Dispatch> {
+        let name = required_str(&args, "name")?;
+        let port = optional_u64(&args, "port").unwrap_or(PORT_AGENT as u64) as u32;
+        if port != PORT_AGENT {
+            return Err(coded(
+                "broker.port_not_allowed",
+                format!("port {port} is not an agent-plane broker port"),
+            ));
+        }
+        let reg = self.registry().await?;
+        let svc = reg.get(name)?;
+        if !svc.agent {
+            return Err(coded(
+                "agent.not_enabled",
+                format!("service {name} is not agent-enabled"),
+            ));
+        }
+        let path = self.cfg.vm_vsock_port_socket(name, port);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        match fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).context("remove stale brokered socket"),
+        }
+        let listener = std::os::unix::net::UnixListener::bind(path.as_str())
+            .with_context(|| format!("bind brokered listener {path}"))?;
+        Ok(Dispatch::PassFd {
+            result: json!({ "name": name, "port": port }),
+            fd: OwnedFd::from(listener),
+        })
+    }
+
+    /// Broker verb (§6): connect to `<vm>.sock` (the CHV hybrid vsock socket)
+    /// and pass the connected fd; the caller performs the in-band
+    /// `CONNECT <port>` handshake itself.
+    async fn guest_connect(&self, args: Map<String, Value>) -> Result<Dispatch> {
+        let name = required_str(&args, "name")?;
+        let reg = self.registry().await?;
+        let svc = reg.get(name)?;
+        if !svc.agent {
+            return Err(coded(
+                "agent.not_enabled",
+                format!("service {name} is not agent-enabled"),
+            ));
+        }
+        if !self.is_running(name).await {
+            return Err(coded(
+                "service.not_running",
+                format!("service {name} is not running"),
+            ));
+        }
+        let path = self.cfg.vm_vsock_socket(name);
+        let stream = UnixStream::connect(path.as_str())
+            .await
+            .with_context(|| format!("connect guest vsock socket {path}"))?;
+        let stream = stream.into_std().context("detach guest vsock stream")?;
+        Ok(Dispatch::PassFd {
+            result: json!({ "name": name }),
+            fd: OwnedFd::from(stream),
+        })
+    }
+
     async fn net_setup(&self, args: Map<String, Value>) -> Result<Value> {
         let tap = required_str(&args, "tap")?;
         validate_ifname("--tap", tap)?;
@@ -1004,9 +1263,9 @@ impl<H: Host + 'static> Daemon<H> {
         }
     }
 
-    async fn stream_log(
+    async fn stream_log<W: AsyncWrite + Unpin>(
         &self,
-        write: &mut OwnedWriteHalf,
+        write: &mut W,
         id: String,
         path: Utf8PathBuf,
         follow: bool,
@@ -1048,13 +1307,21 @@ impl<H: Host + 'static> Daemon<H> {
     }
 }
 
-enum Dispatch {
+pub(crate) enum Dispatch {
     One(Value),
     BufferedStream(Vec<Value>),
-    FollowLog { path: Utf8PathBuf },
+    FollowLog {
+        path: Utf8PathBuf,
+    },
+    /// A success line followed by one SCM_RIGHTS fd (broker verbs, §6). Only
+    /// deliverable over the host unix socket.
+    PassFd {
+        result: Value,
+        fd: OwnedFd,
+    },
 }
 
-async fn write_response(write: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
+async fn write_response<W: AsyncWrite + Unpin>(write: &mut W, response: &Response) -> Result<()> {
     write
         .write_all(serde_json::to_string(response)?.as_bytes())
         .await?;
@@ -1075,6 +1342,7 @@ fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Val
         "mac": svc.mac,
         "address": address,
         "is_agent_in_charge": svc.is_agent_in_charge,
+        "agent": svc.agent,
         "ssh_access": svc.provision.ssh_access_state(),
         "ssh_key_fingerprints": svc.provision.ssh_key_fingerprints(),
     })
@@ -1534,14 +1802,9 @@ pub async fn ensure_dirs(cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use crate::host::cloud_hypervisor_restore_argv;
-    use crate::host::DiskFormat;
-    use crate::host::Host;
-    use crate::provision::ProvisionPlan;
-    use anyhow::Result;
-    use async_trait::async_trait;
+    use crate::testing::FakeHost;
     use camino::Utf8Path;
     use clap::Parser;
-    use std::sync::Mutex as StdMutex;
 
     const TEST_AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPEVBr+XtUOuloYyDWGTcKPPHbVwpSIATl/mJ6RE7gdN hearth-test";
 
@@ -1564,6 +1827,7 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
             is_agent_in_charge: false,
+            agent: false,
             disk: Some("dev.qcow2".into()),
             publish: Vec::new(),
             provision: Provision::default(),
@@ -1602,6 +1866,7 @@ mod tests {
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
             is_agent_in_charge: false,
+            agent: false,
             disk: None,
             publish: Vec::new(),
             provision: Provision::default(),
@@ -3243,175 +3508,4 @@ backoff_sec = 10
             .unwrap();
     }
 
-    #[derive(Clone, Default)]
-    struct FakeHost {
-        state: Arc<StdMutex<FakeState>>,
-    }
-
-    #[derive(Default)]
-    struct FakeState {
-        calls: Vec<String>,
-        running: bool,
-        exec_start: Option<String>,
-        last_nft: Option<String>,
-    }
-
-    impl FakeHost {
-        fn running() -> Self {
-            Self {
-                state: Arc::new(StdMutex::new(FakeState {
-                    running: true,
-                    ..FakeState::default()
-                })),
-            }
-        }
-
-        /// A running host whose transient unit reports `exec_start` from
-        /// `systemctl show -p ExecStart --value`, so boot-config drift can be
-        /// exercised without systemd.
-        fn with_exec_start(exec_start: String) -> Self {
-            Self {
-                state: Arc::new(StdMutex::new(FakeState {
-                    running: true,
-                    exec_start: Some(exec_start),
-                    ..FakeState::default()
-                })),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Host for FakeHost {
-        async fn systemd_run_vm(
-            &self,
-            _cfg: &Config,
-            service: &Service,
-            _image: &ImageManifest,
-        ) -> Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(format!("systemd-run {}", service.name));
-            state.running = true;
-            Ok(())
-        }
-
-        async fn systemd_restore_vm(
-            &self,
-            _cfg: &Config,
-            service: &Service,
-            _snapshot_dir: &Utf8Path,
-        ) -> Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state
-                .calls
-                .push(format!("systemd-restore {}", service.name));
-            state.running = true;
-            Ok(())
-        }
-
-        async fn wait_for_vm_socket(&self, path: &Utf8Path, _dur: Duration) -> Result<()> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("wait-socket {path}"));
-            Ok(())
-        }
-
-        async fn systemctl(&self, args: &[&str]) -> Result<String> {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(format!("systemctl {}", args.join(" ")));
-            if args.first() == Some(&"is-active") {
-                Ok(if state.running {
-                    "active\n".to_string()
-                } else {
-                    "inactive\n".to_string()
-                })
-            } else if args.first() == Some(&"show") {
-                Ok(state.exec_start.clone().unwrap_or_default())
-            } else {
-                Ok(String::new())
-            }
-        }
-
-        async fn qemu_img_create(
-            &self,
-            backing: &Utf8Path,
-            disk: &Utf8Path,
-            disk_gib: u64,
-            format: DiskFormat,
-        ) -> Result<()> {
-            self.state.lock().unwrap().calls.push(format!(
-                "qemu-img create {backing} {disk} {disk_gib} {}",
-                format.extension()
-            ));
-            Ok(())
-        }
-
-        async fn build_vm_disk(
-            &self,
-            _backing: &Utf8Path,
-            disk: &Utf8Path,
-            scratch: &Utf8Path,
-            _disk_gib: u64,
-            plan: &ProvisionPlan,
-        ) -> Result<()> {
-            self.state.lock().unwrap().calls.push(format!(
-                "build-vm-disk {disk} scratch={scratch} {}",
-                plan.describe()
-            ));
-            Ok(())
-        }
-
-        async fn chv_get(&self, _socket: &Utf8Path, path: &str) -> Result<Value> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("chv-get {path}"));
-            Ok(json!({}))
-        }
-
-        async fn chv_put(&self, _socket: &Utf8Path, path: &str, body: Value) -> Result<Value> {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(format!("chv-put {path} {body}"));
-            if path == "/api/v1/vm.shutdown" || path == "/api/v1/vm.power-off" {
-                state.running = false;
-            }
-            Ok(json!({}))
-        }
-
-        async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("setup-tap {bridge} {tap}"));
-            Ok(true)
-        }
-
-        async fn delete_tap(&self, tap: &str) -> Result<()> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push(format!("delete-tap {tap}"));
-            Ok(())
-        }
-
-        async fn nft_apply(&self, ruleset: &str) -> Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push("nft-apply".to_string());
-            state.last_nft = Some(ruleset.to_string());
-            Ok(())
-        }
-
-        async fn reload_dnsmasq(&self) -> Result<()> {
-            self.state
-                .lock()
-                .unwrap()
-                .calls
-                .push("reload-dnsmasq".to_string());
-            Ok(())
-        }
-    }
 }

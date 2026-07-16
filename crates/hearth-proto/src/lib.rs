@@ -29,6 +29,17 @@ pub enum Verb {
     HostCheck,
     Publish,
     Unpublish,
+    /// Block until a guestd boot report says the service is ready (§2.1 of
+    /// docs/agent-plane.md). Only meaningful for images that declare guestd.
+    Wait,
+    /// Agent-plane discovery: services with `agent = true` plus their guestd
+    /// telemetry.
+    AgentEndpoints,
+    /// Socket-broker verb: bind `<vm>.sock_<port>` and pass the listening fd
+    /// (SCM_RIGHTS) to the caller.
+    GuestListener,
+    /// Socket-broker verb: connect `<vm>.sock` and pass the connected fd.
+    GuestConnect,
 }
 
 impl Verb {
@@ -59,6 +70,10 @@ impl Verb {
         Verb::HostCheck,
         Verb::Publish,
         Verb::Unpublish,
+        Verb::Wait,
+        Verb::AgentEndpoints,
+        Verb::GuestListener,
+        Verb::GuestConnect,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -85,6 +100,10 @@ impl Verb {
             Self::HostCheck => "host-check",
             Self::Publish => "publish",
             Self::Unpublish => "unpublish",
+            Self::Wait => "wait",
+            Self::AgentEndpoints => "agent-endpoints",
+            Self::GuestListener => "guest-listener",
+            Self::GuestConnect => "guest-connect",
         }
     }
 }
@@ -266,6 +285,13 @@ pub struct ImageManifest {
     /// serializes as a top-level scalar, not inside the `[oci]` table.
     #[serde(default = "default_min_kernel_contract")]
     pub min_kernel_contract: u32,
+    /// Whether the image carries hearth-guestd (docs/agent-plane.md §2.5).
+    /// Declared, not guessed: only guestd-declaring images may back
+    /// `agent = true` services, and only they get boot-report readiness —
+    /// everything else waits on a serial marker exactly as before. Kept before
+    /// `oci` so it serializes as a top-level scalar.
+    #[serde(default)]
+    pub guestd: bool,
     pub oci: OciProcess,
 }
 
@@ -279,6 +305,7 @@ impl ImageManifest {
             root_fstype: "ext4".to_string(),
             init: process.args[0].clone(),
             min_kernel_contract: default_min_kernel_contract(),
+            guestd: false,
             oci: process,
         })
     }
@@ -361,13 +388,17 @@ mod tests {
                 | Verb::NetTeardown
                 | Verb::HostCheck
                 | Verb::Publish
-                | Verb::Unpublish => {}
+                | Verb::Unpublish
+                | Verb::Wait
+                | Verb::AgentEndpoints
+                | Verb::GuestListener
+                | Verb::GuestConnect => {}
             }
         }
         for verb in Verb::ALL {
             witness(verb);
         }
-        assert_eq!(Verb::ALL.len(), 22, "Verb::ALL must list every variant");
+        assert_eq!(Verb::ALL.len(), 26, "Verb::ALL must list every variant");
         let mut names: Vec<&str> = Verb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();

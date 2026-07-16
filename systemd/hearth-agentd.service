@@ -1,0 +1,56 @@
+[Unit]
+Description=Hearth agent-plane host daemon
+Documentation=file:/usr/local/share/doc/hearth/agent-plane.md
+# agentd relays to guestds through hearthd's socket broker, so hearthd must be
+# up first. It degrades gracefully if hearthd restarts (retries), but ordering
+# avoids a noisy first few seconds.
+After=hearth.service network-online.target
+Wants=hearth.service
+
+[Service]
+Type=simple
+# Dedicated unprivileged user (docs/agent-plane.md §4). agentd never touches
+# disks, images, or systemd-run; it speaks only the brokered sockets.
+User=hearth-agent
+Group=hearth-agent
+# Supplementary group so agentd can open hearthd's `0660 root:hearth` control
+# socket for the broker/discovery verbs.
+SupplementaryGroups=hearth
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Secrets via LoadCredential (§4): systemd stages them read-only under
+# $CREDENTIALS_DIRECTORY, never in argv or the environment. Populate the source
+# paths at deploy time (e.g. from an agenix/sops secret).
+LoadCredential=http-token:/etc/hearth/agent/http-token
+LoadCredential=ref-key:/etc/hearth/agent/ref-key
+# Optional previous ref key for rotation; comment in when rotating.
+#LoadCredential=ref-key-prev:/etc/hearth/agent/ref-key-prev
+
+ExecStart=/usr/local/bin/hearth-agentd \
+    --token-file %d/http-token \
+    --ref-key-file %d/ref-key
+Restart=on-failure
+RestartSec=2
+
+# Hardening (§4): the agent-plane surface is internet-adjacent and drives
+# code-executing agents, so the relay process is boxed in tightly.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+# Only its own state dir and the shared runtime dir (for the control socket)
+# are writable.
+StateDirectory=hearth-agentd
+RuntimeDirectory=hearth
+RuntimeDirectoryMode=0770
+ReadWritePaths=/var/lib/hearth-agentd
+
+[Install]
+WantedBy=multi-user.target

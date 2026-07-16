@@ -54,6 +54,8 @@ pub struct SpawnOptions {
     /// regenerates a unique set on first boot (maps to `[provision]
     /// reset_ssh_hostkeys`, which serde-defaults to false).
     pub reset_ssh_hostkeys: bool,
+    /// Enrol the VM in the agent plane (requires a guestd-declaring image).
+    pub agent: bool,
     /// Start the service after create. Defaults to true; `--no-start` clears it.
     pub start: bool,
 }
@@ -232,6 +234,8 @@ struct CreateInputs<'a> {
     publish: &'a [PublishSpec],
     /// Emit `reset_ssh_hostkeys = true` in the provision block.
     reset_ssh_hostkeys: bool,
+    /// Emit `agent = true` (agent-plane enrolment).
+    agent: bool,
 }
 
 /// Build the exact `create` request the daemon expects. Provision files are sent
@@ -301,6 +305,9 @@ fn create_args(inputs: &CreateInputs) -> Map<String, Value> {
             })
             .collect();
         args.insert("publish".to_string(), json!(entries));
+    }
+    if inputs.agent {
+        args.insert("agent".to_string(), json!(true));
     }
     args
 }
@@ -398,6 +405,7 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
         allow_no_ssh: opts.allow_no_ssh,
         publish: &publishes,
         reset_ssh_hostkeys: opts.reset_ssh_hostkeys,
+        agent: opts.agent,
     });
     hearth_request(socket, Verb::Create, args).await?;
 
@@ -599,6 +607,7 @@ mod tests {
             allow_no_ssh: false,
             publish: &[],
             reset_ssh_hostkeys: false,
+            agent: false,
         });
         assert_eq!(args.get("name"), Some(&json!("dev")));
         assert_eq!(args.get("image"), Some(&json!("exeuntu")));
@@ -640,6 +649,7 @@ mod tests {
             allow_no_ssh: false,
             publish: &publish,
             reset_ssh_hostkeys: false,
+            agent: false,
         });
         assert_eq!(args.get("cpu"), Some(&json!(4)));
         assert_eq!(args.get("memory_mib"), Some(&json!(4096)));
@@ -684,6 +694,7 @@ mod tests {
             allow_no_ssh: true,
             publish: &[],
             reset_ssh_hostkeys: false,
+            agent: false,
         });
         assert_eq!(args["provision"]["allow_no_ssh"], json!(true));
     }
@@ -708,6 +719,7 @@ mod tests {
             allow_no_ssh: false,
             publish: &publish,
             reset_ssh_hostkeys: false,
+            agent: false,
         });
         let entry = &args.get("publish").unwrap().as_array().unwrap()[0];
         assert!(entry.get("bind").is_none());
@@ -730,6 +742,7 @@ mod tests {
             allow_no_ssh: false,
             publish: &[],
             reset_ssh_hostkeys: true,
+            agent: false,
         });
         assert_eq!(
             args.get("provision"),

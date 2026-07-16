@@ -21,6 +21,11 @@ pub struct Service {
     pub mac: String,
     #[serde(default)]
     pub is_agent_in_charge: bool,
+    /// Agent-plane participation (docs/agent-plane.md §2.5): only services
+    /// with `agent = true` are visible to `agent-endpoints`/agentd, and
+    /// setting it requires a guestd-declaring image at create time.
+    #[serde(default)]
+    pub agent: bool,
     // Recorded per-VM disk filename (e.g. `web.raw` or `mail.qcow2`). Older
     // services predate this field; `Config::disk_path` falls back to the legacy
     // `{name}.qcow2` when it is absent. Must stay a scalar (before the tables

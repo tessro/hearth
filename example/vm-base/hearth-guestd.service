@@ -1,0 +1,19 @@
+[Unit]
+Description=Hearth in-guest agent-plane daemon
+Documentation=file:/usr/local/share/doc/hearth/agent-plane.md
+# Reports readiness after the network + user session stack are up, so the boot
+# report's telemetry (addresses, session) reflects a fully-booted guest.
+After=multi-user.target systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=simple
+# vsock transport in a real VM; state on the guest disk carries task history
+# across snapshot/restore with the VM (docs/agent-plane.md §3.3).
+ExecStart=/usr/local/bin/hearth-guestd --transport vsock --state-dir /var/lib/hearth-guestd
+StateDirectory=hearth-guestd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

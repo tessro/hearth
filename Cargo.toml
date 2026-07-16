@@ -3,6 +3,10 @@ members = [
   "crates/hearth-proto",
   "crates/hearthd",
   "crates/hearthctl",
+  "crates/hearth-agent-proto",
+  "crates/hearth-guestd",
+  "crates/hearth-agentd",
+  "crates/hearth-e2e",
 ]
 resolver = "2"
 

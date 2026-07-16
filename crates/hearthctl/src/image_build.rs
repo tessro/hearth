@@ -114,7 +114,12 @@ pub async fn build(opts: BuildOptions) -> Result<()> {
     .await?;
 
     let process = read_oci_process(&paths.bundle)?;
-    let manifest = ImageManifest::from_oci_process(process).map_err(|message| anyhow!(message))?;
+    let mut manifest = ImageManifest::from_oci_process(process).map_err(|message| anyhow!(message))?;
+    // Declare guestd = true when the rootfs actually carries the agent-plane
+    // daemon and enables it (docs/agent-plane.md §2.5) — automatic for images
+    // built on the current vm-base. Only a guestd-declaring image may back an
+    // `agent = true` service; the linter warns when it is absent.
+    manifest.guestd = image_lint::rootfs_has_guestd(&paths.rootfs);
 
     // Validate the unpacked tree before we spend minutes turning it into a disk
     // (§2.2). Runs after umoci unpack, before mkfs.

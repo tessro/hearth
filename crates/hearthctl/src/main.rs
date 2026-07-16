@@ -10,6 +10,7 @@ use tokio::{
 };
 use ulid::Ulid;
 
+mod agent;
 mod client;
 mod image_build;
 mod image_lint;
@@ -27,6 +28,14 @@ struct Cli {
         default_value = "/run/hearth.sock"
     )]
     socket: Utf8PathBuf,
+    /// hearth-agentd's control socket, spoken by `hearthctl agent …`.
+    #[arg(
+        long,
+        global = true,
+        env = "HEARTH_AGENT_SOCKET",
+        default_value = "/run/hearth/agent.sock"
+    )]
+    agent_socket: Utf8PathBuf,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -62,6 +71,9 @@ enum Command {
         allow_no_ssh: bool,
         #[arg(long)]
         agent_in_charge: bool,
+        /// Enrol the VM in the agent plane (requires a guestd-declaring image).
+        #[arg(long)]
+        agent: bool,
     },
     /// Build (if needed), create, and start one VM from a template in a single
     /// command. Repeatable flags provision each VM independently.
@@ -120,6 +132,9 @@ enum Command {
         /// not `rm` them); vm-base already removes them, so this is a no-op there.
         #[arg(long = "reset-ssh-hostkeys")]
         reset_ssh_hostkeys: bool,
+        /// Enrol the VM in the agent plane (requires a guestd-declaring image).
+        #[arg(long)]
+        agent: bool,
         /// Start the VM after creating it (the default).
         #[arg(long, overrides_with = "no_start")]
         start: bool,
@@ -164,17 +179,24 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
-    /// Block until a marker substring appears in a service's console log, then
-    /// exit 0 printing the matched line; exit non-zero on timeout. Client-side
-    /// tail of the `logs --follow` stream — replaces the scripts' wait_for_log().
+    /// Block until a service is ready. With `--marker`, tails the console log
+    /// for a substring (the legacy signal, still required for guestd-less
+    /// images). Without it, blocks on the guestd boot report (kills workaround
+    /// #12) — the image must declare guestd.
     Wait {
         name: String,
         /// Substring to wait for on any console line (e.g. `HERMES_PROBE ok`).
+        /// Omit to wait on the guestd boot report instead.
         #[arg(long)]
-        marker: String,
+        marker: Option<String>,
         /// Give up after this many seconds.
         #[arg(long, default_value_t = 300)]
         timeout: u64,
+    },
+    /// Operate the agent plane via hearth-agentd (docs/agent-plane.md §10).
+    Agent {
+        #[command(subcommand)]
+        command: agent::AgentCommand,
     },
     Image {
         #[command(subcommand)]
@@ -317,6 +339,7 @@ async fn main() -> Result<()> {
         disk_gib,
         publish,
         reset_ssh_hostkeys,
+        agent,
         no_start,
         // `start` only exists so `--start` can override a preceding `--no-start`
         // (last flag wins); the effective decision is `!no_start`.
@@ -343,6 +366,7 @@ async fn main() -> Result<()> {
                 disk_gib: *disk_gib,
                 publish: publish.clone(),
                 reset_ssh_hostkeys: *reset_ssh_hostkeys,
+                agent: *agent,
                 start: !no_start,
             },
         )
@@ -355,7 +379,11 @@ async fn main() -> Result<()> {
         timeout,
     } = &cli.command
     {
-        return wait::run(&cli.socket, name, marker, *timeout).await;
+        return wait::run(&cli.socket, name, marker.as_deref(), *timeout).await;
+    }
+
+    if let Command::Agent { command } = &cli.command {
+        return agent::run(&cli.agent_socket, command, cli.json).await;
     }
 
     let (verb, args) = to_request(&cli.command)?;
@@ -395,6 +423,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             authorized_keys_file,
             allow_no_ssh,
             agent_in_charge,
+            agent,
         } => {
             let mut args = args([("name", json!(name)), ("image", json!(image))]);
             insert_opt(&mut args, "cpu", cpu.map(|v| json!(v)));
@@ -413,6 +442,9 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             }
             if *agent_in_charge {
                 args.insert("is_agent_in_charge".into(), json!(true));
+            }
+            if *agent {
+                args.insert("agent".into(), json!(true));
             }
             (Verb::Create, args)
         }
@@ -446,6 +478,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             args([("name", json!(name)), ("follow", json!(follow))]),
         ),
         Command::Wait { .. } => return Err(anyhow!("wait is handled locally")),
+        Command::Agent { .. } => return Err(anyhow!("agent is handled locally")),
         Command::Image { command } => match command {
             ImageCommand::Ls => (Verb::ImageLs, empty_args()),
             ImageCommand::Build { .. } => return Err(anyhow!("image build is handled locally")),
@@ -881,6 +914,7 @@ mod tests {
             authorized_keys_file: vec![],
             allow_no_ssh: true,
             agent_in_charge: true,
+            agent: false,
         })
         .unwrap();
         assert_eq!(verb, Verb::Create);
@@ -908,6 +942,7 @@ mod tests {
             authorized_keys_file: vec![path],
             allow_no_ssh: false,
             agent_in_charge: false,
+            agent: false,
         })
         .unwrap();
         assert_eq!(verb, Verb::Create);

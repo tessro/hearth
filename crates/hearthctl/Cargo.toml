@@ -10,6 +10,7 @@ anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
+hearth-agent-proto = { path = "../hearth-agent-proto" }
 hearth-proto = { path = "../hearth-proto" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -82,8 +82,16 @@ COPY ssh-hostkeys.service /etc/systemd/system/ssh-hostkeys.service
 COPY hearth-usersession.service /etc/systemd/system/hearth-usersession.service
 COPY hearth-usersession-check /usr/local/bin/hearth-usersession-check
 COPY init /usr/local/bin/init
+# hearth-guestd: the in-guest agent-plane daemon (docs/agent-plane.md §2). Built
+# by `make guest-bin` and staged into this build context beforehand; every image
+# on the new vm-base carries it, so its manifest declares guestd = true and it
+# can back agent-plane services. It replaces the hearth-proxy socat pair (guestd
+# serves the same agent-in-charge forward itself) and hermes-probe/netdiag (the
+# boot report supersedes them).
+COPY hearth-guestd /usr/local/bin/hearth-guestd
+COPY hearth-guestd.service /etc/systemd/system/hearth-guestd.service
 
-RUN chmod 0755 /usr/local/bin/init /usr/local/bin/hearth-usersession-check \
+RUN chmod 0755 /usr/local/bin/init /usr/local/bin/hearth-usersession-check /usr/local/bin/hearth-guestd \
   && mkdir -p /etc/systemd/system/multi-user.target.wants \
               /etc/systemd/system/sysinit.target.wants \
               /etc/systemd/system/sockets.target.wants \
@@ -108,6 +116,8 @@ RUN chmod 0755 /usr/local/bin/init /usr/local/bin/hearth-usersession-check \
   && ln -sf /lib/systemd/system/systemd-logind.service /etc/systemd/system/multi-user.target.wants/systemd-logind.service \
   # Boot-time proof the agent user's session stack is live (one marker on serial).
   && ln -sf /etc/systemd/system/hearth-usersession.service /etc/systemd/system/multi-user.target.wants/hearth-usersession.service \
+  # hearth-guestd at boot: the boot report replaces serial-marker readiness.
+  && ln -sf /etc/systemd/system/hearth-guestd.service /etc/systemd/system/multi-user.target.wants/hearth-guestd.service \
   # Lingering: start user@1000.service at boot with NO login, so the agent's user
   # manager and its delegated cgroup subtree exist before the first SSH session.
   # Ubuntu 24.04's systemd 255 ships `Delegate=pids memory cpu` on user@.service

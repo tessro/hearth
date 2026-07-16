@@ -12,6 +12,7 @@ camino.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures-util.workspace = true
+hearth-agent-proto = { path = "../hearth-agent-proto" }
 hearth-proto = { path = "../hearth-proto" }
 hex.workspace = true
 libc.workspace = true

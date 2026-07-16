@@ -1,0 +1,36 @@
+[package]
+name = "hearth-e2e"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# End-to-end acceptance harness for the agent plane (docs/agent-plane.md §11,
+# §12). Runs hearthd + hearth-guestd + hearth-agentd in one process, wired
+# through the real hearthd socket broker, with a fake `codex app-server` binary
+# standing in for the real CLI. Everything except a real CHV guest and a real
+# codex binary is exercised on production code paths.
+
+[[bin]]
+name = "fake_codex"
+path = "src/bin/fake_codex.rs"
+
+[[bin]]
+name = "fake_claude"
+path = "src/bin/fake_claude.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+camino = { workspace = true }
+clap = { workspace = true }
+hearth-agent-proto = { path = "../hearth-agent-proto" }
+hearth-agentd = { path = "../hearth-agentd" }
+hearth-guestd = { path = "../hearth-guestd" }
+hearth-proto = { path = "../hearth-proto" }
+hearthd = { path = "../hearthd" }
+libc = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+ulid = { workspace = true }

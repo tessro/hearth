@@ -11,7 +11,7 @@
 //! surfaces every blocker). WARN prints and continues.
 
 use anyhow::{bail, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use hearth_proto::ImageManifest;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -53,6 +53,7 @@ const CHECKS: &[Check] = &[
     check_pam_systemd_present,
     check_serial_getty_masked,
     check_growfs_in_fstab,
+    check_guestd_present,
 ];
 
 /// Run every check, dropping the ones that pass.
@@ -395,6 +396,42 @@ fn check_growfs_in_fstab(ctx: &LintCtx) -> Option<Finding> {
     }
 }
 
+/// The agent plane is strictly additive (docs/agent-plane.md §2.5): a
+/// guestd-less image keeps working, so this is a WARN, not a REJECT. The hard
+/// requirement lives where it is actually needed — `create`/`spawn` with
+/// `agent = true` fails against an image that does not declare guestd. This
+/// mirrors the `min_kernel_contract` gradient.
+fn check_guestd_present(ctx: &LintCtx) -> Option<Finding> {
+    if rootfs_has_guestd(&ctx.rootfs) {
+        None
+    } else {
+        Some(warn(
+            "guestd",
+            "hearth-guestd is not installed/enabled — this image cannot back an agent-plane \
+             service (create/spawn --agent will refuse it). Rebuild on the current vm-base to \
+             get it for free, or install the static binary + unit (§2.5)."
+                .to_string(),
+        ))
+    }
+}
+
+/// Whether a rootfs carries hearth-guestd (binary + unit + enabled). Shared by
+/// the linter WARN check and `image build`, which stamps `guestd = true` in the
+/// manifest when this holds (docs/agent-plane.md §2.5).
+pub fn rootfs_has_guestd(rootfs: &Utf8Path) -> bool {
+    let binary = rootfs.join("usr/local/bin/hearth-guestd").exists();
+    let unit = rootfs
+        .join("etc/systemd/system/hearth-guestd.service")
+        .exists()
+        || rootfs
+            .join("usr/lib/systemd/system/hearth-guestd.service")
+            .exists();
+    let enabled = rootfs
+        .join("etc/systemd/system/multi-user.target.wants/hearth-guestd.service")
+        .exists();
+    binary && unit && enabled
+}
+
 // --- helpers -------------------------------------------------------------
 
 /// Resolve an absolute guest path against the unpacked rootfs. The leading `/`
@@ -543,6 +580,13 @@ mod tests {
         let security = root.join("usr/lib/x86_64-linux-gnu/security");
         fs::create_dir_all(&security).unwrap();
         fs::write(security.join("pam_systemd.so"), b"").unwrap();
+
+        // hearth-guestd: binary + unit + enabled (the current vm-base shape).
+        let guestd = root.join("usr/local/bin/hearth-guestd");
+        fs::write(&guestd, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&guestd, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(sys.join("hearth-guestd.service"), b"").unwrap();
+        fs::write(sys.join("multi-user.target.wants/hearth-guestd.service"), b"").unwrap();
     }
 
     fn tmp() -> (tempfile::TempDir, Utf8PathBuf) {
@@ -557,6 +601,23 @@ mod tests {
     fn a_good_rootfs_has_no_findings() {
         let (_dir, root) = tmp();
         assert_eq!(lint(&ctx(&root)), Vec::new());
+    }
+
+    #[test]
+    fn guestd_absence_warns_but_does_not_reject() {
+        let (_dir, root) = tmp();
+        // The good rootfs carries guestd → no finding, and it is detected.
+        assert!(check_guestd_present(&ctx(&root)).is_none());
+        assert!(rootfs_has_guestd(&root));
+
+        // Remove the binary: WARN (never REJECT), and no longer declared.
+        fs::remove_file(root.join("usr/local/bin/hearth-guestd")).unwrap();
+        let finding = check_guestd_present(&ctx(&root)).unwrap();
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.check, "guestd");
+        assert!(!rootfs_has_guestd(&root));
+        // The build stays green: a WARN never fails enforce.
+        assert!(enforce(&lint(&ctx(&root))).is_ok());
     }
 
     #[test]
