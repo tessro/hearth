@@ -37,11 +37,13 @@ RUN test -n "$HERMES_COMMIT" || { echo 'build with --build-arg HERMES_COMMIT=<sh
 # hermes.env and authorized_keys are NOT baked in anymore. §3/§10 provisions the
 # env through `--provision-file` and SSH through typed
 # `--authorized-keys-file`; the .example files show their shape.
+RUN mkdir -p /etc/systemd/system/hearth-guestd.service.d
 COPY hermes.service /etc/systemd/system/hermes.service
 COPY hermes-probe.service /etc/systemd/system/hermes-probe.service
 COPY hermes-probe /usr/local/bin/hermes-probe
 COPY netdiag.service /etc/systemd/system/netdiag.service
 COPY netdiag /usr/local/bin/netdiag
+COPY hearth-guestd-hermes.conf /etc/systemd/system/hearth-guestd.service.d/10-hermes.conf
 
 RUN chmod 0755 /usr/local/bin/hermes-probe /usr/local/bin/netdiag \
   && ln -sf /etc/systemd/system/hermes.service /etc/systemd/system/multi-user.target.wants/hermes.service \
@@ -50,4 +52,6 @@ RUN chmod 0755 /usr/local/bin/hermes-probe /usr/local/bin/netdiag \
 
 # §8 verification: fail the build here if the launcher moved off ~/.local/bin,
 # instead of discovering it from the serial console on first boot.
-RUN test -x /home/agent/.local/bin/hermes && su - agent -c 'hermes --version'
+RUN test -x /home/agent/.local/bin/hermes \
+  && su - agent -c 'hermes --version' \
+  && su - agent -c 'hermes acp --check'

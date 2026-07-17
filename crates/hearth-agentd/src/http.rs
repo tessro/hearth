@@ -32,7 +32,11 @@ pub struct HttpConfig {
     pub cors_origins: Vec<String>,
 }
 
-pub async fn serve(agentd: Arc<Agentd>, listener: TcpListener, http: Arc<HttpConfig>) -> Result<()> {
+pub async fn serve(
+    agentd: Arc<Agentd>,
+    listener: TcpListener,
+    http: Arc<HttpConfig>,
+) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let agentd = Arc::clone(&agentd);
@@ -168,16 +172,16 @@ async fn route(
             let agents = agentd.list_agents().await?;
             write_json(stream, 200, "OK", cors, &agents).await
         }
-        ("POST", ["v1", "agents", name, "agui"]) => {
-            agui_run(agentd, req, stream, cors, name).await
-        }
+        ("POST", ["v1", "agents", name, "agui"]) => agui_run(agentd, req, stream, cors, name).await,
         ("GET", ["v1", "tasks"]) => {
             let tasks = list_tasks(agentd).await?;
             write_json(stream, 200, "OK", cors, &tasks).await
         }
         ("GET", ["v1", "tasks", task_ref]) => {
             let claims = agentd.resolve_ref(task_ref, "ui")?;
-            let status = agentd.relay_verb(&claims, AgentVerb::TaskStatus, Map::new()).await?;
+            let status = agentd
+                .relay_verb(&claims, AgentVerb::TaskStatus, Map::new())
+                .await?;
             write_json(stream, 200, "OK", cors, &status).await
         }
         ("GET", ["v1", "tasks", task_ref, "events"]) => {
@@ -185,11 +189,22 @@ async fn route(
         }
         ("POST", ["v1", "tasks", task_ref, "cancel"]) => {
             let claims = agentd.resolve_ref(task_ref, "ui")?;
-            let result = agentd.relay_verb(&claims, AgentVerb::TaskCancel, Map::new()).await?;
+            let result = agentd
+                .relay_verb(&claims, AgentVerb::TaskCancel, Map::new())
+                .await?;
             agentd.cancel_grant(&claims.task_id)?;
             write_json(stream, 200, "OK", cors, &result).await
         }
-        _ => write_json(stream, 404, "Not Found", cors, &json!({ "error": "not found" })).await,
+        _ => {
+            write_json(
+                stream,
+                404,
+                "Not Found",
+                cors,
+                &json!({ "error": "not found" }),
+            )
+            .await
+        }
     }
 }
 
@@ -205,7 +220,11 @@ async fn agui_run(
     let input: Value = serde_json::from_slice(&req.body).context("parse RunAgentInput")?;
     let messages = input.get("messages").and_then(Value::as_array);
     let user_text = messages
-        .and_then(|msgs| msgs.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")))
+        .and_then(|msgs| {
+            msgs.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        })
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -232,7 +251,9 @@ async fn agui_run(
             let claims = agentd.resolve_ref(&token, "ui")?;
             // Capture the current tip BEFORE responding so we stream every
             // event of the new run and none of the old (no gap, no dup).
-            let status = agentd.relay_verb(&claims, AgentVerb::TaskStatus, Map::new()).await?;
+            let status = agentd
+                .relay_verb(&claims, AgentVerb::TaskStatus, Map::new())
+                .await?;
             let cursor = status
                 .get("incarnation")
                 .and_then(Value::as_str)
@@ -241,7 +262,9 @@ async fn agui_run(
             // Resume: the answer is a new run carrying the resume payload.
             let mut extra = Map::new();
             extra.insert("response".to_string(), json!({ "text": user_text }));
-            agentd.relay_verb(&claims, AgentVerb::TaskRespond, extra).await?;
+            agentd
+                .relay_verb(&claims, AgentVerb::TaskRespond, extra)
+                .await?;
             (claims, cursor)
         }
     };
@@ -325,8 +348,13 @@ async fn list_tasks(agentd: &Arc<Agentd>) -> Result<Value> {
         if !endpoint.running {
             continue;
         }
-        if let Ok(value) =
-            relay::call(&agentd.hearthd, &endpoint.name, AgentVerb::TaskList, Map::new()).await
+        if let Ok(value) = relay::call(
+            &agentd.hearthd,
+            &endpoint.name,
+            AgentVerb::TaskList,
+            Map::new(),
+        )
+        .await
         {
             if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
                 for task in tasks {
@@ -361,7 +389,10 @@ fn cors_header(http: &HttpConfig, origin: Option<&str>) -> Vec<(String, String)>
     let mut headers = Vec::new();
     if let Some(origin) = origin {
         if http.cors_origins.iter().any(|o| o == origin) {
-            headers.push(("Access-Control-Allow-Origin".to_string(), origin.to_string()));
+            headers.push((
+                "Access-Control-Allow-Origin".to_string(),
+                origin.to_string(),
+            ));
             headers.push((
                 "Access-Control-Allow-Headers".to_string(),
                 "authorization, content-type".to_string(),
@@ -439,12 +470,10 @@ async fn write_json(
     body: &Value,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(body)?;
-    let extra: Vec<(String, String)> = std::iter::once((
-        "Content-Type".to_string(),
-        "application/json".to_string(),
-    ))
-    .chain(cors.iter().cloned())
-    .collect();
+    let extra: Vec<(String, String)> =
+        std::iter::once(("Content-Type".to_string(), "application/json".to_string()))
+            .chain(cors.iter().cloned())
+            .collect();
     write_response(stream, code, reason, &extra, &bytes).await
 }
 

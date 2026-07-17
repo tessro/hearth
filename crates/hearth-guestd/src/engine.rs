@@ -290,8 +290,7 @@ impl Engine {
         // and stops overwriting or appending.
         cell.queue.lock().unwrap().clear();
         let last_seq = cell.update_tx.borrow().1;
-        cell.update_tx
-            .send_replace((TaskState::Canceled, last_seq));
+        cell.update_tx.send_replace((TaskState::Canceled, last_seq));
         self.enqueue_outbox(task_id, TaskState::Canceled, None)?;
         self.rewrite_index();
         self.status(task_id)
@@ -364,7 +363,10 @@ impl Engine {
         };
         let log = cell.log.lock().await;
         let records = log.read_from(from, max)?;
-        let next_seq = records.last().map(|r| r.seq).unwrap_or(from.saturating_sub(1));
+        let next_seq = records
+            .last()
+            .map(|r| r.seq)
+            .unwrap_or(from.saturating_sub(1));
         let cursor = {
             let meta = cell.meta.lock().unwrap();
             make_cursor(&meta, next_seq)
@@ -480,7 +482,12 @@ impl Engine {
         }
     }
 
-    async fn run_one(self: &Arc<Self>, cell: &Arc<TaskCell>, task_id: &str, input: Value) -> Result<()> {
+    async fn run_one(
+        self: &Arc<Self>,
+        cell: &Arc<TaskCell>,
+        task_id: &str,
+        input: Value,
+    ) -> Result<()> {
         let run_id = new_ulid();
         let (agent, native_thread, thread_id) = {
             let mut meta = cell.meta.lock().unwrap();
@@ -501,12 +508,20 @@ impl Engine {
                 ended_at: None,
             });
             self.store.write_meta(&meta)?;
-            (meta.agent.clone(), meta.native_thread.clone(), meta.thread_id.clone())
+            (
+                meta.agent.clone(),
+                meta.native_thread.clone(),
+                meta.thread_id.clone(),
+            )
         };
-        self.append(cell, &run_id, AgentEvent::RunStarted {
-            thread_id: thread_id.clone(),
-            run_id: run_id.clone(),
-        })
+        self.append(
+            cell,
+            &run_id,
+            AgentEvent::RunStarted {
+                thread_id: thread_id.clone(),
+                run_id: run_id.clone(),
+            },
+        )
         .await?;
         self.publish(cell, TaskState::Running).await;
         // The run is now durable in the event log: a wake-up's inbox entry can
@@ -522,18 +537,30 @@ impl Engine {
         // Wake-ups carry provenance-framed text; other inputs are task text or
         // a resume payload the adapter interprets natively.
         let adapter_input = input.clone();
-        let output = adapter.run(native_thread.as_deref(), &adapter_input).await;
+        let output = adapter
+            .run(&thread_id, native_thread.as_deref(), &adapter_input)
+            .await;
         let output = match output {
             Ok(output) => output,
             Err(err) => {
-                self.append(cell, &run_id, AgentEvent::RunError {
-                    message: err.to_string(),
-                    code: Some("adapter_error".to_string()),
-                })
+                self.append(
+                    cell,
+                    &run_id,
+                    AgentEvent::RunError {
+                        message: err.to_string(),
+                        code: Some("adapter_error".to_string()),
+                    },
+                )
                 .await?;
                 self.finish_run(cell, &run_id, RunOutcome::Error);
-                self.set_terminal(cell, task_id, TaskState::Failed, Some(err.to_string()), None)
-                    .await?;
+                self.set_terminal(
+                    cell,
+                    task_id,
+                    TaskState::Failed,
+                    Some(err.to_string()),
+                    None,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -542,7 +569,8 @@ impl Engine {
             meta.native_thread = Some(native);
             self.store.write_meta(&meta)?;
         }
-        self.apply_adapter_events(cell, task_id, &run_id, output.events).await
+        self.apply_adapter_events(cell, task_id, &run_id, output.events)
+            .await
     }
 
     async fn apply_adapter_events(
@@ -680,7 +708,8 @@ impl Engine {
             meta.updated_at = now();
             self.store.write_meta(&meta)?;
         }
-        self.append(cell, "", AgentEvent::state_change(&state, None)).await?;
+        self.append(cell, "", AgentEvent::state_change(&state, None))
+            .await?;
         self.publish(cell, state).await;
         self.enqueue_outbox(task_id, state, result)?;
         self.rewrite_index();

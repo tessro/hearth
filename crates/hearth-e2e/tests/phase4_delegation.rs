@@ -5,8 +5,8 @@
 //! with a full ledger + audit trail. A non-allowlisted VM's `delegate` is
 //! rejected and ledgered.
 
-use hearth_e2e::{guest_verb, AgentSpec, Harness, HarnessOptions, McpClient};
 use hearth_agent_proto::AgentVerb;
+use hearth_e2e::{guest_verb, AgentSpec, Harness, HarnessOptions, McpClient};
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 
@@ -15,8 +15,9 @@ fn opts() -> HarnessOptions {
         agents: vec![AgentSpec::boss("boss"), AgentSpec::worker("worker")],
         delegators: vec!["boss".to_string()],
         http: None,
-        codex_command: env!("CARGO_BIN_EXE_fake_codex").to_string(),
+        codex_command: Some(env!("CARGO_BIN_EXE_fake_codex").to_string()),
         claude_command: None,
+        hermes_command: None,
     }
 }
 
@@ -27,7 +28,9 @@ async fn start_task(h: &Harness, vm: &str, text: &str) -> (String, String) {
     args.insert("agent".to_string(), json!("codex"));
     args.insert("text".to_string(), json!(text));
     args.insert("detach".to_string(), json!(false));
-    let summary = guest_verb(&mut stream, AgentVerb::TaskStart, args).await.unwrap();
+    let summary = guest_verb(&mut stream, AgentVerb::TaskStart, args)
+        .await
+        .unwrap();
     (
         summary["task_id"].as_str().unwrap().to_string(),
         summary["thread_id"].as_str().unwrap().to_string(),
@@ -38,7 +41,9 @@ async fn task_status(h: &Harness, vm: &str, task_id: &str) -> Value {
     let mut stream = h.guest_connect(vm).await.unwrap();
     let mut args = Map::new();
     args.insert("task_id".to_string(), json!(task_id));
-    guest_verb(&mut stream, AgentVerb::TaskStatus, args).await.unwrap()
+    guest_verb(&mut stream, AgentVerb::TaskStatus, args)
+        .await
+        .unwrap()
 }
 
 /// Poll a task on `vm` until it reaches `want` (or times out).
@@ -73,7 +78,10 @@ async fn delegation_survives_agentd_restart_and_wakes_the_initiator_exactly_once
 
     // The boss has a live thread to be woken on.
     let (boss_task, boss_thread) = start_task(&h, "boss", "boss idle").await;
-    assert_eq!(task_status(&h, "boss", &boss_task).await["state"], json!("completed"));
+    assert_eq!(
+        task_status(&h, "boss", &boss_task).await["state"],
+        json!("completed")
+    );
 
     // The boss delegates a task that will need approval — via MCP, occupying
     // the user seat of the callee's task (§6). Crucially, NO explicit
@@ -138,7 +146,10 @@ async fn delegation_survives_agentd_restart_and_wakes_the_initiator_exactly_once
     let mut settled = false;
     for _ in 0..40 {
         let waited = boss_mcp
-            .call_tool("wait_for", json!({ "task_ref": worker_ref, "timeout_seconds": 5 }))
+            .call_tool(
+                "wait_for",
+                json!({ "task_ref": worker_ref, "timeout_seconds": 5 }),
+            )
             .await
             .unwrap();
         if waited["state"] == json!("completed") {
@@ -154,8 +165,14 @@ async fn delegation_survives_agentd_restart_and_wakes_the_initiator_exactly_once
 
     // The ledger recorded the grant (wake-up authority, §4.4).
     let ledger = std::fs::read_to_string(h.root.join("ledger").join("delegations.log")).unwrap();
-    assert!(ledger.contains("\"granted\""), "delegation grant is ledgered");
-    assert!(ledger.contains(&worker_task), "the callee task is in the ledger");
+    assert!(
+        ledger.contains("\"granted\""),
+        "delegation grant is ledgered"
+    );
+    assert!(
+        ledger.contains(&worker_task),
+        "the callee task is in the ledger"
+    );
 }
 
 #[tokio::test]
@@ -175,5 +192,8 @@ async fn a_non_allowlisted_delegation_is_rejected_and_ledgered() {
 
     // The rejection is ledgered (the A2A `rejected` state lives here, §3.2).
     let ledger = std::fs::read_to_string(h.root.join("ledger").join("delegations.log")).unwrap();
-    assert!(ledger.contains("\"rejected\""), "rejection is ledgered: {ledger}");
+    assert!(
+        ledger.contains("\"rejected\""),
+        "rejection is ledgered: {ledger}"
+    );
 }

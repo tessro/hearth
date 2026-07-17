@@ -35,10 +35,7 @@ pub enum AgentEvent {
     #[serde(rename = "STEP_FINISHED", rename_all = "camelCase")]
     StepFinished { step_name: String },
     #[serde(rename = "TEXT_MESSAGE_START", rename_all = "camelCase")]
-    TextMessageStart {
-        message_id: String,
-        role: String,
-    },
+    TextMessageStart { message_id: String, role: String },
     #[serde(rename = "TEXT_MESSAGE_CONTENT", rename_all = "camelCase")]
     TextMessageContent { message_id: String, delta: String },
     #[serde(rename = "TEXT_MESSAGE_END", rename_all = "camelCase")]

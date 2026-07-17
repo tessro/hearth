@@ -122,12 +122,7 @@ async fn run_boot_report(socket: &Utf8Path, name: &str, timeout_secs: u64) -> Re
     }
 }
 
-async fn run_marker(
-    socket: &Utf8Path,
-    name: &str,
-    marker: &str,
-    timeout_secs: u64,
-) -> Result<()> {
+async fn run_marker(socket: &Utf8Path, name: &str, marker: &str, timeout_secs: u64) -> Result<()> {
     if marker.is_empty() {
         bail!("--marker must not be empty");
     }

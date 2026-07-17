@@ -56,7 +56,10 @@ impl CodexAdapter {
             next_id: 1,
         };
         let init = server
-            .request("initialize", json!({ "clientInfo": { "name": "hearth-guestd" } }))
+            .request(
+                "initialize",
+                json!({ "clientInfo": { "name": "hearth-guestd" } }),
+            )
             .await?;
         let version = init
             .get("serverInfo")
@@ -87,7 +90,12 @@ impl Adapter for CodexAdapter {
         Ok(PINNED_APP_SERVER_VERSION.to_string())
     }
 
-    async fn run(&self, native_thread: Option<&str>, input: &Value) -> Result<RunOutput> {
+    async fn run(
+        &self,
+        _thread_id: &str,
+        native_thread: Option<&str>,
+        input: &Value,
+    ) -> Result<RunOutput> {
         let mut server = self.spawn().await?;
         let thread_id = match native_thread {
             None => {
@@ -185,7 +193,10 @@ impl AppServer {
         let mut out = Vec::new();
         loop {
             let msg = self.recv().await?;
-            let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
+            let method = msg
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let params = msg.get("params").cloned().unwrap_or(json!({}));
             match method {
                 "item" => {
@@ -259,7 +270,10 @@ fn translate_item(item: &Value, out: &mut Vec<AdapterEvent>) {
                 .and_then(Value::as_str)
                 .unwrap_or("codex-msg")
                 .to_string();
-            let delta = item.get("delta").and_then(Value::as_str).unwrap_or_default();
+            let delta = item
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             out.push(AdapterEvent::Event(AgentEvent::TextMessageContent {
                 message_id,
                 delta: delta.to_string(),

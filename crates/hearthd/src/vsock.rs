@@ -225,7 +225,8 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
             if let Some(report) = frame.report {
                 let restored = self.guests.restore_pending(name);
                 let ready = report.ready;
-                self.guests.update_report(name, frame.hello.as_ref(), report);
+                self.guests
+                    .update_report(name, frame.hello.as_ref(), report);
                 let ack = HostFrame {
                     ack: Some(ReportAck { restored }),
                 };

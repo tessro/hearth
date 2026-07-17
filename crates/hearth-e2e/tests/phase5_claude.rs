@@ -2,8 +2,8 @@
 //! proven against the same task engine and traces that codex passes. Same
 //! interrupt→resume lifecycle, driven through claude's stream-json contract.
 
-use hearth_e2e::{guest_verb, AgentSpec, Harness, HarnessOptions};
 use hearth_agent_proto::AgentVerb;
+use hearth_e2e::{guest_verb, AgentSpec, Harness, HarnessOptions};
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 
@@ -12,8 +12,9 @@ fn opts() -> HarnessOptions {
         agents: vec![AgentSpec::worker("worker")],
         delegators: vec![],
         http: None,
-        codex_command: env!("CARGO_BIN_EXE_fake_codex").to_string(),
+        codex_command: Some(env!("CARGO_BIN_EXE_fake_codex").to_string()),
         claude_command: Some(env!("CARGO_BIN_EXE_fake_claude").to_string()),
+        hermes_command: None,
     }
 }
 
@@ -23,23 +24,37 @@ async fn start_claude(h: &Harness, text: &str) -> (tokio::net::UnixStream, Strin
     args.insert("agent".to_string(), json!("claude"));
     args.insert("text".to_string(), json!(text));
     args.insert("detach".to_string(), json!(false));
-    let summary = guest_verb(&mut stream, AgentVerb::TaskStart, args).await.unwrap();
+    let summary = guest_verb(&mut stream, AgentVerb::TaskStart, args)
+        .await
+        .unwrap();
     (stream, summary["task_id"].as_str().unwrap().to_string())
 }
 
 async fn task_status(stream: &mut tokio::net::UnixStream, task_id: &str) -> Value {
     let mut args = Map::new();
     args.insert("task_id".to_string(), json!(task_id));
-    guest_verb(stream, AgentVerb::TaskStatus, args).await.unwrap()
+    guest_verb(stream, AgentVerb::TaskStatus, args)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
 async fn claude_adapter_is_advertised() {
     let h = Harness::start(opts()).await.unwrap();
     let mut stream = h.guest_connect("worker").await.unwrap();
-    let agents = guest_verb(&mut stream, AgentVerb::AgentLs, Map::new()).await.unwrap();
-    let names: Vec<&str> = agents["agents"].as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
-    assert!(names.contains(&"claude"), "claude adapter registered: {names:?}");
+    let agents = guest_verb(&mut stream, AgentVerb::AgentLs, Map::new())
+        .await
+        .unwrap();
+    let names: Vec<&str> = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a.as_str())
+        .collect();
+    assert!(
+        names.contains(&"claude"),
+        "claude adapter registered: {names:?}"
+    );
     assert!(names.contains(&"codex"), "codex still registered too");
 }
 
@@ -53,7 +68,9 @@ async fn claude_task_streams_and_completes() {
     let mut args = Map::new();
     args.insert("task_id".to_string(), json!(task_id));
     args.insert("max".to_string(), json!(100));
-    let events = guest_verb(&mut stream, AgentVerb::TaskEvents, args).await.unwrap();
+    let events = guest_verb(&mut stream, AgentVerb::TaskEvents, args)
+        .await
+        .unwrap();
     let types: Vec<String> = events["events"]
         .as_array()
         .unwrap()
@@ -79,7 +96,9 @@ async fn claude_permission_prompt_interrupts_then_resumes() {
     let mut args = Map::new();
     args.insert("task_id".to_string(), json!(task_id));
     args.insert("response".to_string(), json!({ "text": "allow" }));
-    guest_verb(&mut stream, AgentVerb::TaskRespond, args).await.unwrap();
+    guest_verb(&mut stream, AgentVerb::TaskRespond, args)
+        .await
+        .unwrap();
 
     // The resumed run (a `--resume` invocation) completes the task.
     for _ in 0..200 {

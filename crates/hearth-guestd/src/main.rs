@@ -10,12 +10,21 @@ use hearth_guestd::transport::parse_transport;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "hearth-guestd", version, about = "In-guest Hearth agent-plane daemon")]
+#[command(
+    name = "hearth-guestd",
+    version,
+    about = "In-guest Hearth agent-plane daemon"
+)]
 struct Cli {
     /// Transport: `vsock` (real AF_VSOCK inside a VM) or `unix` (CHV
     /// hybrid-model emulation for tests / hypervisor-less dev). Global so it
     /// works whether it precedes or follows the `mcp` subcommand.
-    #[arg(long, global = true, env = "HEARTH_GUESTD_TRANSPORT", default_value = "vsock")]
+    #[arg(
+        long,
+        global = true,
+        env = "HEARTH_GUESTD_TRANSPORT",
+        default_value = "vsock"
+    )]
     transport: String,
     /// Emulated hybrid-vsock directory (unix transport only).
     #[arg(long, global = true, env = "HEARTH_GUESTD_UNIX_DIR")]
@@ -34,10 +43,18 @@ struct Cli {
     /// The codex binary the adapter drives (overridable for tests).
     #[arg(long, env = "HEARTH_GUESTD_CODEX", default_value = "codex")]
     codex_command: String,
+    /// Do not register the codex adapter. Workload images with a different
+    /// authenticated CLI use this to advertise only what they can run.
+    #[arg(long, env = "HEARTH_GUESTD_NO_CODEX")]
+    no_codex: bool,
     /// The claude binary the adapter drives (Phase 5). Absent → no claude
     /// adapter is registered.
     #[arg(long, env = "HEARTH_GUESTD_CLAUDE")]
     claude_command: Option<String>,
+    /// The Hermes binary to drive. It runs as vm-base's fixed agent:1000 user
+    /// so it sees that user's Hermes configuration and provider credentials.
+    #[arg(long, env = "HEARTH_GUESTD_HERMES")]
+    hermes_command: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -55,7 +72,9 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_writer(std::io::stderr)
         .init();
     let transport = parse_transport(&cli.transport, &cli.unix_dir, &cli.vm)?;
@@ -67,8 +86,12 @@ async fn main() -> Result<()> {
     let engine = hearth_guestd::build_engine_with(
         &cli.state_dir,
         hearth_guestd::AdapterConfig {
-            codex_command: cli.codex_command.clone(),
+            codex_command: (!cli.no_codex).then(|| cli.codex_command.clone()),
             claude_command: cli.claude_command.clone(),
+            hermes: cli
+                .hermes_command
+                .clone()
+                .map(hearth_guestd::HermesConfig::agent_user),
         },
     )?;
     let hostname = hostname();

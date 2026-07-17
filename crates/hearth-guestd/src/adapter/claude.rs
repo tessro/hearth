@@ -63,7 +63,12 @@ impl Adapter for ClaudeAdapter {
         }
     }
 
-    async fn run(&self, native_thread: Option<&str>, input: &Value) -> Result<RunOutput> {
+    async fn run(
+        &self,
+        _thread_id: &str,
+        native_thread: Option<&str>,
+        input: &Value,
+    ) -> Result<RunOutput> {
         let text = input
             .get("text")
             .and_then(Value::as_str)
@@ -152,7 +157,10 @@ fn translate(msg: &Value, session_id: &mut Option<String>, out: &mut Vec<Adapter
                 for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => {
-                            let delta = block.get("text").and_then(Value::as_str).unwrap_or_default();
+                            let delta = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
                             out.push(AdapterEvent::Event(AgentEvent::TextMessageContent {
                                 message_id: "claude-msg".to_string(),
                                 delta: delta.to_string(),

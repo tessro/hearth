@@ -114,7 +114,8 @@ pub async fn build(opts: BuildOptions) -> Result<()> {
     .await?;
 
     let process = read_oci_process(&paths.bundle)?;
-    let mut manifest = ImageManifest::from_oci_process(process).map_err(|message| anyhow!(message))?;
+    let mut manifest =
+        ImageManifest::from_oci_process(process).map_err(|message| anyhow!(message))?;
     // Declare guestd = true when the rootfs actually carries the agent-plane
     // daemon and enables it (docs/agent-plane.md §2.5) — automatic for images
     // built on the current vm-base. Only a guestd-declaring image may back an

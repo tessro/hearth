@@ -12,7 +12,7 @@
 use crate::transport::Transport;
 use anyhow::{Context, Result};
 use hearth_agent_proto::{Hello, HelloChannel, PORT_AGENT};
-use tokio::io::{AsyncWriteExt, copy};
+use tokio::io::{copy, AsyncWriteExt};
 
 pub async fn run(transport: Transport, thread_id: &str) -> Result<()> {
     let stream = transport

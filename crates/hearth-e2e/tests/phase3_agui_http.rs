@@ -24,8 +24,9 @@ async fn harness(bind: &str) -> Harness {
             token: "s3cret-token".to_string(),
             cors_origins: vec!["https://ui.example".to_string()],
         }),
-        codex_command: env!("CARGO_BIN_EXE_fake_codex").to_string(),
+        codex_command: Some(env!("CARGO_BIN_EXE_fake_codex").to_string()),
         claude_command: None,
+        hermes_command: None,
     })
     .await
     .unwrap()
@@ -72,7 +73,9 @@ async fn auth_is_required_end_to_end() {
     let bind = format!("127.0.0.1:{}", free_port());
     let h = harness(&bind).await;
     // No token → 401 on both a plain GET and the AG-UI POST.
-    let (code, _, _) = http_json(&bind, "GET", "/v1/agents", None, None, None).await.unwrap();
+    let (code, _, _) = http_json(&bind, "GET", "/v1/agents", None, None, None)
+        .await
+        .unwrap();
     assert_eq!(code, 401);
     let (code, _, _) = http_json(
         &bind,
@@ -97,10 +100,14 @@ async fn auth_is_required_end_to_end() {
     .await
     .unwrap();
     assert_eq!(code, 200);
-    assert!(agents["agents"].as_array().unwrap().iter().any(|a| a["name"] == json!("worker")));
-    assert!(headers
+    assert!(agents["agents"]
+        .as_array()
+        .unwrap()
         .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("access-control-allow-origin") && v == "https://ui.example"));
+        .any(|a| a["name"] == json!("worker")));
+    assert!(headers.iter().any(
+        |(k, v)| k.eq_ignore_ascii_case("access-control-allow-origin") && v == "https://ui.example"
+    ));
     let _ = h;
 }
 
@@ -108,14 +115,25 @@ async fn auth_is_required_end_to_end() {
 async fn a_fresh_thread_creates_a_task_and_streams_a_run() {
     let bind = format!("127.0.0.1:{}", free_port());
     let _h = harness(&bind).await;
-    let events = agui_post(&bind, "s3cret-token", "worker", &run_input("hello agent", None))
-        .await
-        .unwrap();
+    let events = agui_post(
+        &bind,
+        "s3cret-token",
+        "worker",
+        &run_input("hello agent", None),
+    )
+    .await
+    .unwrap();
     let types = event_types(&events);
-    assert!(types.contains(&"RUN_STARTED".to_string()), "types: {types:?}");
+    assert!(
+        types.contains(&"RUN_STARTED".to_string()),
+        "types: {types:?}"
+    );
     assert!(types.contains(&"TEXT_MESSAGE_CONTENT".to_string()));
     assert!(types.contains(&"RUN_FINISHED".to_string()));
-    assert!(task_ref_from(&events).is_some(), "a resumable task_ref is emitted");
+    assert!(
+        task_ref_from(&events).is_some(),
+        "a resumable task_ref is emitted"
+    );
 }
 
 #[tokio::test]
@@ -172,8 +190,12 @@ async fn detach_reattach_replays_losslessly_for_two_uis() {
     // Two independent UIs replay the same task's events from the start
     // (disconnect/reattach loses nothing — the guest log is the truth).
     let path = format!("/v1/tasks/{task_ref}/events?cursor=");
-    let ui_a = http_sse(&bind, "GET", &path, Some("s3cret-token"), None).await.unwrap();
-    let ui_b = http_sse(&bind, "GET", &path, Some("s3cret-token"), None).await.unwrap();
+    let ui_a = http_sse(&bind, "GET", &path, Some("s3cret-token"), None)
+        .await
+        .unwrap();
+    let ui_b = http_sse(&bind, "GET", &path, Some("s3cret-token"), None)
+        .await
+        .unwrap();
     let types_a = event_types(&ui_a);
     let types_b = event_types(&ui_b);
     assert!(types_a.contains(&"RUN_STARTED".to_string()));

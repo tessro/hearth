@@ -188,14 +188,17 @@ vocabulary (§5.1) and mapping the triad (§3.1) onto its native concepts:
 |---|---|---|---|
 | codex (**first**, Phase 2) | `codex app-server`: JSONL/stdio; threads, turns, streamed items, server-initiated approvals; version-matched JSON schemas | thread ↔ `thread_id`, turn ↔ `run`, streamed items → events | server-initiated approval requests → task `awaiting_input` |
 | claude (second, Phase 5) | headless `-p` with `stream-json` in/out, resumable sessions | session ↔ `thread_id`, one `-p` invocation ↔ `run` | permission prompts via its MCP permission-prompt hook → `awaiting_input` |
-| hermes (deferred) | TBD — interface not yet pinned | TBD | TBD — adapter contract is the deliverable |
+| hermes (Phase 6) | pinned `hermes acp`: ACP v1 JSON-RPC/stdio; `session/new`/`load`/`prompt`, streamed `session/update`, server-initiated `session/request_permission` | ACP session ↔ `thread_id`, prompt ↔ `run`, message/tool updates → AG-UI events; the per-session ACP MCP server launches the §2.4 shim with Hearth's thread id | permission request → task `awaiting_input`; guestd parks the live ACP process and `task.respond` answers the exact JSON-RPC request |
 
-Codex goes first deliberately: app-server is the best-specified of the three
-(schemas are generatable per version), so it derisks the adapter contract
-before the fuzzier integrations. Adapters couple to CLI stream formats, which
-drift. Rule (workaround #13's lesson): agent CLIs are **pinned by version in
-the image**, the manifest records adapter compatibility, and guestd refuses
-(loudly, at boot report) to adapt a CLI version it doesn't know.
+Codex was implemented first because app-server has generatable schemas. The
+current deployable path is Hermes ACP v1 at version `0.18.2`, source commit
+`2ea39dae`; presentation-oriented `hermes chat -q` output is deliberately not
+an adapter contract. Adapters couple to native protocols, which drift. Rule
+(workaround #13's lesson): agent CLIs are **pinned by version, protocol, and
+source revision in the image**, the manifest records adapter compatibility,
+and guestd refuses (loudly, at boot report) to adapt a CLI version it doesn't
+know. An image registers only adapters for CLIs it actually configures; the
+Hermes image therefore does not advertise codex or claude.
 
 ### 2.3 Turn queue and wake-up injection
 
@@ -704,10 +707,13 @@ proves the whole stack before the second CLI is added.
    **while agentd is stopped**, agentd restarts, initiator is woken exactly
    once, responds, collects the result — full ledger + audit trail; a
    non-allowlisted VM's `delegate` is rejected, ledgered, audited.
-6. **Phase 5 — second adapter and beyond.** claude adapter (after the
-   Phase 2–4 traces all pass on codex); hermes when its interface is pinned;
-   A2A façade, MCP-tasks façade, per-pair delegation capabilities, token
-   scopes, bridge east-west filtering.
+6. **Phase 5–6 — additional adapters and beyond.** claude adapter, then pinned
+   Hermes ACP v1. Hermes acceptance covers a Hermes-only guest, automatic
+   healthy-adapter selection, streamed message/tool events, per-session Hearth
+   MCP registration, completion, a wake-up that loads the same native session,
+   and a permission request answered through a second Hearth run. A2A façade,
+   MCP-tasks façade, per-pair delegation capabilities, token scopes, and bridge
+   east-west filtering follow.
 
 ## 12. Paper traces
 
@@ -792,8 +798,11 @@ tests verbatim.
   outbox retry horizon — pick the constants.
 - **Ref key rotation cadence** and whether refs need per-verb scoping
   (read-only refs for observers vs. respond-capable refs for initiators).
-- **Hermes adapter**: needs a pinned programmatic interface (its supply chain
-  is being pinned per `REFACTOR_PROPOSAL.md` §8) — what does it expose?
+- **Hermes ACP interruption lifetime**: an outstanding permission request is
+  process-local and the pinned Hermes callback currently waits 60 seconds.
+  Hearth preserves that process across `awaiting_input`; verify expiry and
+  guestd-restart behavior explicitly before promising offline/indefinite
+  approval prompts.
 - **Result artifacts**: tasks produce files (diffs, reports). First-class
   artifact events (A2A has them; we'd mirror) or leave it to the guest FS +
   SSH/`provision`-style copy-out?

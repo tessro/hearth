@@ -180,7 +180,12 @@ fn render(command: &AgentCommand, value: &Value) -> Result<()> {
         AgentCommand::Ls => render_agents(value),
         AgentCommand::Ps => render_tasks(value),
         AgentCommand::Events { .. } => {
-            for event in value.get("events").and_then(Value::as_array).into_iter().flatten() {
+            for event in value
+                .get("events")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 print_event_frame(event);
             }
             if let Some(cursor) = value.get("cursor").and_then(Value::as_str) {
@@ -276,7 +281,10 @@ fn compact(event: &Value) -> String {
         Some("CUSTOM") => format!(
             "{} {}",
             event.get("name").and_then(Value::as_str).unwrap_or(""),
-            event.get("value").map(|v| v.to_string()).unwrap_or_default()
+            event
+                .get("value")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         ),
         _ => serde_json::to_string(event).unwrap_or_default(),
     }
@@ -285,7 +293,11 @@ fn compact(event: &Value) -> String {
 fn cell(value: &Value, key: &str) -> String {
     value
         .get(key)
-        .map(|v| v.as_str().map(ToOwned::to_owned).unwrap_or_else(|| v.to_string()))
+        .map(|v| {
+            v.as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| v.to_string())
+        })
         .unwrap_or_default()
 }
 

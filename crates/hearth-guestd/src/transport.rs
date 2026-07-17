@@ -58,8 +58,8 @@ impl Transport {
     {
         match self {
             Transport::Vsock => {
-                let listener = VsockListener::bind(PORT_GUESTD)
-                    .context("bind in-guest vsock port 1027")?;
+                let listener =
+                    VsockListener::bind(PORT_GUESTD).context("bind in-guest vsock port 1027")?;
                 loop {
                     match listener.accept().await {
                         Ok(stream) => on_conn(Box::new(stream)),

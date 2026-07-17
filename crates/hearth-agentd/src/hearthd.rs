@@ -5,10 +5,14 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8Path;
-use hearth_agent_proto::{fdpass, hybrid, read_line_capped, PORT_GUESTD, PORT_AGENT};
+use hearth_agent_proto::{
+    fdpass, hybrid, read_line_capped, AgentDecl, Hello, AGENT_PROTOCOL_VERSION, PORT_AGENT,
+    PORT_GUESTD,
+};
 use hearth_proto::{Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use ulid::Ulid;
 
@@ -61,7 +65,10 @@ impl Hearthd {
             .filter_map(|entry| {
                 Some(AgentEndpoint {
                     name: entry.get("name")?.as_str()?.to_string(),
-                    running: entry.get("running").and_then(Value::as_bool).unwrap_or(false),
+                    running: entry
+                        .get("running")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     is_agent_in_charge: entry
                         .get("is_agent_in_charge")
                         .and_then(Value::as_bool)
@@ -71,6 +78,12 @@ impl Hearthd {
                         .and_then(|g| g.get("ready"))
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    agents: entry
+                        .get("guestd")
+                        .and_then(|g| g.get("agents"))
+                        .cloned()
+                        .and_then(|agents| serde_json::from_value(agents).ok())
+                        .unwrap_or_default(),
                 })
             })
             .collect())
@@ -91,7 +104,9 @@ impl Hearthd {
             let err = resp.error.map(|e| format!("{}: {}", e.code, e.message));
             bail!("guest-listener refused: {}", err.unwrap_or_default());
         }
-        let fd = fdpass::recv_fd(&stream).await.context("receive listener fd")?;
+        let fd = fdpass::recv_fd(&stream)
+            .await
+            .context("receive listener fd")?;
         let std_listener =
             unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd.into_raw_fd()) };
         std_listener.set_nonblocking(true)?;
@@ -115,13 +130,39 @@ impl Hearthd {
             bail!("guest-connect refused: {}", err.unwrap_or_default());
         }
         let fd: OwnedFd = fdpass::recv_fd(&stream).await.context("receive guest fd")?;
-        let std_stream =
-            unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd.into_raw_fd()) };
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd.into_raw_fd()) };
         std_stream.set_nonblocking(true)?;
         let mut guest = UnixStream::from_std(std_stream).context("adopt brokered guest stream")?;
         hybrid::connect_handshake(&mut guest, PORT_GUESTD)
             .await
             .context("CONNECT 1027 handshake")?;
+        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        guest
+            .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
+            .await
+            .context("send guestd hello")?;
+        let response = read_response(&mut guest)
+            .await
+            .context("read guestd hello response")?;
+        if !response.ok {
+            let err = response
+                .error
+                .map(|err| format!("{}: {}", err.code, err.message))
+                .unwrap_or_else(|| "guestd rejected hello without an error body".to_string());
+            bail!("guestd hello refused: {err}");
+        }
+        let peer_proto = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("proto"))
+            .and_then(Value::as_u64);
+        if peer_proto != Some(u64::from(AGENT_PROTOCOL_VERSION)) {
+            bail!(
+                "guestd protocol mismatch: expected {}, got {:?}",
+                AGENT_PROTOCOL_VERSION,
+                peer_proto
+            );
+        }
         Ok(guest)
     }
 }
@@ -132,6 +173,7 @@ pub struct AgentEndpoint {
     pub running: bool,
     pub is_agent_in_charge: bool,
     pub ready: bool,
+    pub agents: Vec<AgentDecl>,
 }
 
 fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -142,7 +184,6 @@ fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
 }
 
 async fn write_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     stream
         .write_all((serde_json::to_string(req)? + "\n").as_bytes())
         .await?;

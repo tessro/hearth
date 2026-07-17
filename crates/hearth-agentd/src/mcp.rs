@@ -45,7 +45,10 @@ impl McpServer {
                 }
             };
             let id = msg.get("id").cloned();
-            let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
+            let method = msg
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             // Notifications (no id) get no response.
             if id.is_none() {
                 continue;
@@ -75,7 +78,10 @@ impl McpServer {
             "tools/list" => Ok(json!({ "tools": tool_schemas() })),
             "tools/call" => {
                 let params = msg.get("params").cloned().unwrap_or(json!({}));
-                let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let args = params
                     .get("arguments")
                     .and_then(Value::as_object)
@@ -103,7 +109,10 @@ impl McpServer {
             "delegate" => {
                 let target = str_arg(args, "agent")?;
                 let text = str_arg(args, "task")?;
-                let wait_seconds = args.get("wait_seconds").and_then(Value::as_u64).unwrap_or(0);
+                let wait_seconds = args
+                    .get("wait_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 // The initiator thread — where the completion wake-up is
                 // injected — is the *calling agent's own session*, which the
                 // shim carried in its MCP hello (§2.4). Without this, every
@@ -114,7 +123,11 @@ impl McpServer {
                     .get("initiator_thread")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
-                    .or(if shim_thread.is_empty() { None } else { Some(shim_thread) });
+                    .or(if shim_thread.is_empty() {
+                        None
+                    } else {
+                        Some(shim_thread)
+                    });
                 let result = self
                     .agentd
                     .delegate(vm, initiator_thread, target, text)
@@ -132,7 +145,10 @@ impl McpServer {
             }
             "wait_for" => {
                 let task_ref = str_arg(args, "task_ref")?;
-                let timeout = args.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30);
+                let timeout = args
+                    .get("timeout_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30);
                 let cursor = args.get("cursor").and_then(Value::as_str);
                 self.wait_for(vm, task_ref, timeout, cursor).await
             }
@@ -149,7 +165,9 @@ impl McpServer {
                 if let Some(max) = args.get("max_events") {
                     extra.insert("max".to_string(), max.clone());
                 }
-                self.agentd.relay_verb(&claims, AgentVerb::TaskEvents, extra).await
+                self.agentd
+                    .relay_verb(&claims, AgentVerb::TaskEvents, extra)
+                    .await
             }
             "task_respond" => {
                 let task_ref = str_arg(args, "task_ref")?;
@@ -160,12 +178,16 @@ impl McpServer {
                 let claims = self.agentd.resolve_ref(task_ref, vm)?;
                 let mut extra = Map::new();
                 extra.insert("response".to_string(), response);
-                self.agentd.relay_verb(&claims, AgentVerb::TaskRespond, extra).await
+                self.agentd
+                    .relay_verb(&claims, AgentVerb::TaskRespond, extra)
+                    .await
             }
             "task_status" => {
                 let task_ref = str_arg(args, "task_ref")?;
                 let claims = self.agentd.resolve_ref(task_ref, vm)?;
-                self.agentd.relay_verb(&claims, AgentVerb::TaskStatus, Map::new()).await
+                self.agentd
+                    .relay_verb(&claims, AgentVerb::TaskStatus, Map::new())
+                    .await
             }
             "task_cancel" => {
                 let task_ref = str_arg(args, "task_ref")?;
@@ -250,7 +272,9 @@ fn tool_schemas() -> Vec<Value> {
 fn tool_description(name: &str) -> &'static str {
     match name {
         "list_agents" => "List agent-enabled VMs, their adapters, and task counts.",
-        "delegate" => "Delegate a task to another agent; optionally wait_seconds for a first result.",
+        "delegate" => {
+            "Delegate a task to another agent; optionally wait_seconds for a first result."
+        }
         "wait_for" => "Long-poll a delegated task until it changes, needs input, or ends.",
         "task_events" => "Read a delegated task's event log from a cursor, with a filter.",
         "task_respond" => "Answer a delegated task that is awaiting input (starts a new run).",
@@ -311,7 +335,8 @@ fn str_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
 }
 
 async fn warn_line<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) -> Result<()> {
-    let err = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": message } });
+    let err =
+        json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": message } });
     stream
         .write_all((serde_json::to_string(&err)? + "\n").as_bytes())
         .await?;

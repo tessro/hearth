@@ -1,7 +1,7 @@
 # Agent Plane — Verification Report
 
 Status: **implemented and self-verified, including a live KVM guest**
-(2026-07-15). Companion to
+(2026-07-16). Companion to
 `docs/agent-plane.md`. Records what the acceptance tests actually exercise, and
 — honestly — what they cannot, plus how a future session could close each gap.
 
@@ -15,7 +15,7 @@ New workspace crates:
   url-safe base64 (RFC 4648 vectors), the CHV hybrid-vsock `CONNECT` handshake,
   and `SCM_RIGHTS` fd passing.
 - `hearth-guestd` — the in-guest daemon: durable task registry (segmented event
-  logs, incarnations, outbox, dedup), the codex and claude adapters, the
+  logs, incarnations, outbox, dedup), codex, claude, and Hermes adapters, the
   task-verb server (port 1027), boot report + heartbeat + upcall loops, and the
   dumb MCP stdio↔vsock shim. Targets glibc by default and musl via
   `make guest-bin-musl`.
@@ -24,7 +24,7 @@ New workspace crates:
   the MCP server, and durable outbox→ack→dedup wake-up delivery.
 - `hearth-e2e` — the acceptance harness: boots hearthd + guestd(s) + agentd in
   one process, wired through the **real** hearthd socket broker, with fake
-  `codex`/`claude` binaries speaking the pinned CLI contracts.
+  `codex`/`claude`/`hermes` binaries speaking the pinned native protocols.
 
 Changed: `hearth-proto` (new verbs, manifest `guestd` flag); `hearthd`
 (per-VM hybrid vsock listeners replacing the `AF_VSOCK` listener, per-peer-UID
@@ -35,8 +35,12 @@ verb policy, socket broker, `wait`/`agent-endpoints` verbs, guest telemetry in
 
 ## Verified here (automated, on production code paths)
 
-Run: `cargo test --release` (225 tests) and
+Run: `cargo test --release` (235 tests) and
 `cargo clippy --release --all-targets -- -D warnings` (clean).
+Before invoking the top-level live binaries, run `cargo build --release --bin
+hearth-agentd --bin hearthctl`: Cargo's test command refreshes test harnesses
+under `target/release/deps`, but does not guarantee that the executable at
+`target/release/hearth-agentd` was relinked.
 
 The `hearth-e2e` crate exercises the whole stack in-process. Because CHV's
 hybrid vsock backend makes every host-side channel a plain unix socket, and the
@@ -46,12 +50,13 @@ the VM boot itself and the real CLIs:
 
 | Phase | Test file | What it proves |
 |---|---|---|
-| 0 | `phase0_transport_auth.rs` | Agent-in-charge verb channel over the hybrid `<vm>.sock_1024`; broker verbs refused on the guest channel; per-UID policy allows the allowlist and denies `destroy`; `agent-endpoints` lists only agent VMs. **The full broker path (hearthd binds/​connects, `SCM_RIGHTS`-passes the fd, agentd adopts it) is real.** |
+| 0 | `phase0_transport_auth.rs` | Agent-in-charge verb channel over the hybrid `<vm>.sock_1024`; broker verbs refused on the guest channel; per-UID policy allows the allowlist and denies `destroy`; `agent-endpoints` lists only agent VMs; guestd rejects a missing or version-skewed port-1027 hello. **The full broker path (hearthd binds/​connects, `SCM_RIGHTS`-passes the fd, agentd adopts it) is real.** |
 | 1 | `phase1_readiness.rs` | `wait` resolves on the guestd boot report with no marker; `status` surfaces guestd version, agents, `last_seen`; unknown service errors cleanly instead of hanging. |
 | 2 | `phase2_tasks.rs` | Start → stream (RUN/text/tool-call AG-UI events) → complete; approval **interrupt → new run on the same thread** with both run outcomes recorded; cancel; **cursor staleness by incarnation**. |
 | 3 | `phase3_agui_http.rs` | Real HTTP/SSE: task → interrupt → resume via `forwardedProps.task_ref`; lossless replay to two independent UIs; bearer auth required end-to-end; CORS origin echoed. |
 | 4 | `phase4_delegation.rs` | Delegate over MCP; **crash agentd while the callee is `awaiting_input`**; restart; initiator woken **exactly once** (dedup by `delivery_id`); respond; collect result; grant + rejection both ledgered. |
 | 5 | `phase5_claude.rs` | The claude adapter registered alongside codex; stream + complete; permission prompt → `awaiting_input` → resume, on the same engine and traces as codex. |
+| 6 | `phase6_hermes.rs` | A Hermes-only guest advertises only Hermes; agentd selects its first healthy reported adapter instead of hard-coding codex; ACP v1 message/tool updates map to AG-UI; `session/new` receives the per-thread Hearth MCP shim; a wake-up uses `session/load`; a server-initiated ACP permission request becomes `awaiting_input` and `task.respond` answers it on the still-live prompt. |
 
 Unit-level: HMAC/base64/taskref against published vectors; the segmented event
 log's rotate/prune/truncation-marker and restart-survival; ledger replay across
@@ -95,6 +100,58 @@ in-process acceptance harness:
   and terminal failure events when `codex app-server` was absent, proving the
   real failure path is clean. No production agentd service was installed or
   enabled.
+- The real Hermes install in the long-running `hermes-a` KVM guest reports
+  `Hermes Agent v0.18.2`, upstream `2ea39dae` (with one locally carried commit).
+  A quiet tool-source turn and resume established the presentation behavior,
+  but the adapter no longer depends on it. No provider credential was read or
+  moved from that VM.
+- A newly materialized `hermes-agent-plane` image and disposable
+  `hermes-agent-plane-vm` joined both halves on real KVM/AF_VSOCK. Its boot
+  report is ready/connected and advertises exactly one healthy adapter:
+  `hermes`, CLI `0.18.2 (upstream 2ea39dae)`. A temporary no-HTTP agentd
+  discovered it through hearthd's FD broker and selected Hermes automatically.
+  The first full task reached the real Hermes CLI and failed terminally because
+  the disposable VM initially had no inference provider configured. The user
+  subsequently completed portal/model setup in that disposable VM. Direct ACP
+  v1 verification then completed `initialize` → `session/new` →
+  `session/prompt`, streamed four `agent_message_chunk` updates spelling
+  `HERMES_ACP_OK`, and returned `stopReason: end_turn`. No credential or Hermes
+  configuration file was inspected or copied. The old quiet-CLI guestd adapter
+  still failed a full task with `Hermes quiet output contained no session_id`;
+  that live failure is why the presentation parser was removed in favor of ACP.
+- The ACP image was rebuilt from the pinned full source commit
+  `2ea39daeb1f675d72e5c21c9400f2d58d7e6d71a`; its build-time `hermes acp
+  --check` passed. It was imported separately as `hermes-agent-plane-acp`
+  (qcow2 SHA-256
+  `d5d060ef765f5c8a97dabbb8752ba7ea003d89db8563bafe1663d9d931e3afc4`),
+  leaving the long-running VM and original image untouched. That fresh install's
+  version banner labels the pinned checkout as `local 2ea39dae` rather than
+  `upstream 2ea39dae`; the adapter now accepts either real banner form while
+  still requiring the exact version and source pin. The imported qcow2 predates
+  that final probe compatibility fix and must be rebuilt before it is used as a
+  fresh-image acceptance artifact.
+- A rebuilt host agentd and the existing disposable guest completed the
+  production broker path for `agent ls`: restricted hearthd request,
+  `SCM_RIGHTS` connected-FD handoff, in-band `CONNECT 1027`, mandatory
+  protocol-v1 hello/ack, and the standard `agent-ls` verb. The guest advertised
+  only `hermes`. The static ACP guestd was then installed in that disposable
+  guest and its service restarted, preserving the user's provider setup without
+  reading or copying it. A full task through the same production path completed
+  as task `01KXQ8HJN0NP7ADPJS74YGCF5S`, with summary `HEARTH_ACP_OK`, Hermes
+  `stopReason: end_turn`, and a durable finished run. This proves the host
+  broker, strict hello, guest task engine, official ACP session, and real model
+  turn as one vertical path. Its 37-record event log preserved ACP thought and
+  usage updates as `RAW`, emitted the AG-UI `TEXT_MESSAGE_START` / `CONTENT` /
+  `END` sequence that reconstructs `HEARTH_ACP_OK`, and ended with
+  `RUN_FINISHED` plus the terminal Hearth state. A second real task used
+  Hermes's terminal tool to run the harmless `sudo -n true` probe and completed
+  with `HEARTH_PERMISSION_OK`; Hermes classified that command as safe, so it
+  did not produce a permission interrupt.
+- A real Codex `0.144.4` app-server schema audit found that the existing Codex
+  adapter's modeled `0.1.0` protocol is obsolete (`thread/start`, `turn/start`,
+  and same-connection approval responses replace its fake method set). A real
+  Claude `2.1.210` quiet run confirmed the broad stream envelope but not the
+  adapter's `1.0.0` pin. Neither adapter is enabled in the Hermes image.
 
 ### Fixes produced by the live pass
 
@@ -108,26 +165,60 @@ in-process acceptance harness:
 6. Boot-config drift comparison tolerates systemd's resolved executable path
    and flattened whitespace representation while still requiring Hearth's
    generated argument remainder to match exactly.
+7. Adapter registration is now explicit, so an authenticated Hermes image can
+   advertise Hermes alone instead of publishing a broken codex default.
+8. agentd chooses the target's first healthy boot-reported adapter; a
+   Hermes-only guest no longer receives an internal `agent = "codex"` request.
+9. Image listing skips malformed legacy qcow2 entries, returns structured
+   warnings for them, and continues to expose valid manifest-backed images.
+10. `spawn` no longer performs a fleet-wide image-list preflight when no
+    Dockerfile was requested; the named `create` operation is authoritative.
+11. Port 1027 now requires the §5.3 hello. agentd sends it after the brokered
+    hybrid-vsock handshake, validates guestd's protocol ack, and guestd rejects
+    missing, unauthorized-component, or version-skewed first frames.
+12. The Hermes adapter now drives pinned ACP v1 instead of parsing quiet terminal
+    output, registers the Hearth MCP shim per native session, maps structured
+    message/tool updates, and preserves the live process across permission input.
+13. Live host instructions explicitly build runnable release binaries; release
+    tests alone can leave a stale top-level daemon executable on disk.
 
 ## Remaining gaps — and how to close each
 
 These are genuine gaps, not hand-waves. Each says what is unproven and what
 access would let a future session prove it.
 
-1. **Real `codex app-server` / `claude` CLIs.** The adapters drive a *pinned
-   contract* (`PINNED_APP_SERVER_VERSION` / `PINNED_CLI_VERSION`) modelled on
-   the real stream shapes but **not validated against the real binaries** — the
-   exact method names (`newThread`/`sendUserTurn`/`execApproval`; claude's
-   `stream-json` event/`control_request` shapes) may differ.
-   *To verify:* install the pinned codex/claude versions in an image; capture a
-   real `codex app-server` and `claude -p --output-format stream-json` session;
-   diff against `crates/hearth-guestd/src/adapter/{codex,claude}.rs`; adjust the
-   `translate_*` functions and bump the pinned version. The version-pin refusal
-   path (`fake_codex` with `HEARTH_FAKE_CODEX_VERSION`) already tests that a
-   mismatch is a loud, clean error, so the *contract mechanism* is proven — only
-   the *specific schema* needs a real CLI.
+1. **Codex and Claude are intentionally inactive.** The real-binary audit has
+   now shown concrete skew rather than a hypothetical gap: the Codex adapter
+   must be rewritten for the current app-server JSON-RPC schema and must retain
+   the connection while answering server approval requests; Claude needs a
+   deliberate pin/schema pass at `2.1.210` or whichever version is chosen.
+   Authentication must then be provisioned for those CLIs. None of this blocks
+   the Hermes-only vertical.
 
-2. **Unmodified AG-UI `HttpAgent` conformance.** Phase 3 drives the endpoint
+2. **Fresh-image rebuild, authentication, and follow-up.** The ACP Dockerfile
+   build, direct ACP prompt, production broker/hello path, and authenticated
+   full task now pass. Rebuild the imported image once more with the final
+   source-pin banner compatibility fix; do not treat the recorded qcow2 hash as
+   the final artifact.
+   The authenticated task used the existing disposable VM with the new static
+   guestd installed in place so user-owned provider setup remained untouched.
+   Boot `hermes-agent-plane-acp`, perform setup interactively in that fresh VM,
+   then repeat the task and a same-session wake-up/follow-up before calling the
+   image fully self-contained. The existing `hermes-a` predates agent-plane
+   vm-base and remains running and unmodified; do not extract or silently copy
+   its credentials.
+
+3. **Hermes ACP approval expiry/restart.** The adapter preserves the exact ACP
+   process and request across `awaiting_input`, and the fake-protocol E2E proves
+   a second Hearth run answers it. Pinned Hermes currently times out permission
+   callbacks after 60 seconds, and a guestd process restart necessarily loses
+   an outstanding stdio request. Live approval was intentionally deferred until
+   the GUI is available to render and answer the interrupt; the harmless live
+   terminal probe did not ask. Exercise approve/deny, timeout, and guestd
+   restart from that GUI, then define the task transition (expiry/failure versus
+   a future persistent Runs API) before promising indefinite offline approvals.
+
+4. **Unmodified AG-UI `HttpAgent` conformance.** Phase 3 drives the endpoint
    with a raw HTTP/SSE client that mirrors what `HttpAgent` does on the wire,
    not the TypeScript SDK itself.
    *To verify:* a Node environment with `@ag-ui/client`; point a real
@@ -137,7 +228,7 @@ access would let a future session prove it.
    (`crates/hearth-agent-proto/src/events.rs`), so this is a conformance check,
    not new development.
 
-3. **systemd unit hardening + `LoadCredential` + real `hearth-agent` user.**
+5. **systemd unit hardening + `LoadCredential` + real `hearth-agent` user.**
    `systemd/hearth-agentd.service` declares the hardening and credential wiring
    §4 requires, but it must not be enabled as written. Both `hearth.service`
    and `hearth-agentd.service` claim `RuntimeDirectory=hearth`, so the
@@ -151,7 +242,7 @@ access would let a future session prove it.
    `systemd-analyze security hearth-agentd`, and confirm an unrelated uid is
    denied machine-plane lifecycle verbs.
 
-4. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
+6. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
    rotation is unit-tested (`store.rs`) and the restore→`ReportAck{restored:
    true}`→`rotate_incarnation` wiring is in place (`hearthd` marks pending
    restore; guestd rotates on the ack), but the *machine-plane* `restore` path
@@ -161,12 +252,26 @@ access would let a future session prove it.
    fresh `task.status` re-syncs. The guest-side half is already proven by
    `phase2_tasks.rs::stale_cursor_is_rejected_by_incarnation`.
 
-5. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
+7. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only
    so the boundary stays honest: guests can still reach each other over
    `hearth0` at the IP layer; the agent plane simply never uses that path.
 
 ## Host-environment issues observed during the live pass
+
+- `cargo test --release` rebuilt release-mode test executables but left the
+  top-level `target/release/hearth-agentd` stale. The strict guest correctly
+  rejected its first `task.start` frame with `protocol.hello_required`.
+  Explicit `cargo build --release --bin hearth-agentd --bin hearthctl` relinked
+  the live executables; after restarting agentd, adapter discovery and the real
+  task passed.
+- The locked dev shell does not currently include a musl Rust target. The first
+  live static build used an already-realized Nix 1.94 cross wrapper, which was
+  later garbage-collected; attempting to realize the current registry's Nix
+  1.95 cross compiler failed inside nixpkgs with a Rust bootstrap symlink
+  collision. No `rustup` state was added to the NixOS host. Pin a working musl
+  Rust toolchain in `devenv.nix` (or restore a binary-cacheable wrapper) before
+  rebuilding the final portable guest artifact and image.
 
 - `/etc/dnsmasq.d/hearth` is absent on this host. Hearth therefore cannot write
   its requested static lease drop-in and the live agent VM uses dnsmasq's
@@ -174,10 +279,12 @@ access would let a future session prove it.
   integration should create/wire the drop-in before static addressing can be
   claimed.
 - A legacy image at `/var/lib/hearth/images/debian-13-generic-amd64` has no
-  `.hearth.toml`; one malformed legacy entry currently aborts the entire
-  `image ls`, which also blocks the composite `spawn` path. The live pass used
-  explicit image build/import, `create`, and `start` instead. No legacy disk or
-  image was deleted.
+  `.hearth.toml`. It blocked the installed daemon's entire `image ls` and the
+  old composite `spawn` preflight. Source now skips invalid entries with a
+  structured warning, while `spawn` avoids listing altogether when it was
+  given an already-imported image. The latter path created the disposable
+  Hermes VM successfully against the still-installed older daemon. No legacy
+  disk or image was deleted.
 - The generated `example/vm-base/hearth-guestd` is a build-context artifact and
   is intentionally not source-controlled.
 

@@ -2,13 +2,14 @@
 //! hearth-guestd(s) + hearth-agentd in one test process, wired through the real
 //! hearthd socket broker over CHV-hybrid-emulated unix sockets. A fake
 //! `codex app-server` binary stands in for the CLI. Every layer except a real
-//! CHV guest and a real codex is exercised on production code paths.
+//! CHV guest and a real agent CLI is exercised on production code paths.
 
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use clap::Parser;
 use hearth_agent_proto::{
-    hybrid, read_line_capped, AgentRequest, AgentVerb, Hello, MAX_LINE_BYTES,
+    hybrid, read_line_capped, AgentRequest, AgentVerb, Hello, AGENT_PROTOCOL_VERSION,
+    MAX_LINE_BYTES,
 };
 use hearth_proto::{Request, Response, Verb};
 use serde_json::{json, Map, Value};
@@ -41,10 +42,12 @@ pub struct HarnessOptions {
     pub agents: Vec<AgentSpec>,
     pub delegators: Vec<String>,
     pub http: Option<HttpOptions>,
-    pub codex_command: String,
+    pub codex_command: Option<String>,
     /// If set, guestds also register the claude adapter pointed at this binary
     /// (Phase 5).
     pub claude_command: Option<String>,
+    /// If set, guestds register the Hermes adapter pointed at this binary.
+    pub hermes_command: Option<String>,
 }
 
 impl HarnessOptions {
@@ -54,8 +57,9 @@ impl HarnessOptions {
             agents,
             delegators: vec![],
             http: None,
-            codex_command: codex_command.to_string(),
+            codex_command: Some(codex_command.to_string()),
             claude_command: None,
+            hermes_command: None,
         }
     }
 }
@@ -164,6 +168,10 @@ impl Harness {
                 hearth_guestd::AdapterConfig {
                     codex_command: opts.codex_command.clone(),
                     claude_command: opts.claude_command.clone(),
+                    hermes: opts
+                        .hermes_command
+                        .clone()
+                        .map(hearth_guestd::HermesConfig::current_user),
                 },
             )?;
             let transport = hearth_guestd::transport::Transport::Unix {
@@ -267,6 +275,7 @@ impl Harness {
                 if hybrid::connect_handshake(&mut stream, hearth_agent_proto::PORT_GUESTD)
                     .await
                     .is_ok()
+                    && guest_hello(&mut stream, "hearthctl-agent").await.is_ok()
                 {
                     if let Ok(resp) = guest_verb(&mut stream, AgentVerb::Ping, Map::new()).await {
                         if resp.get("pong").and_then(Value::as_bool) == Some(true) {
@@ -283,6 +292,15 @@ impl Harness {
     /// Open a direct guestd task-verb connection (bypasses agentd) — used by
     /// tests that need to poke a guest without the host relay.
     pub async fn guest_connect(&self, vm: &str) -> Result<UnixStream> {
+        let mut stream = self.guest_connect_transport_only(vm).await?;
+        guest_hello(&mut stream, "hearthctl-agent").await?;
+        Ok(stream)
+    }
+
+    /// Open only the CHV-hybrid transport to guestd, without the mandatory
+    /// agent-plane hello. Protocol-negative tests use this to prove guestd
+    /// refuses missing or incompatible first frames.
+    pub async fn guest_connect_transport_only(&self, vm: &str) -> Result<UnixStream> {
         let path = self.vsock_dir.join(format!("{vm}.sock"));
         let mut stream = UnixStream::connect(path.as_str())
             .await
@@ -431,6 +449,32 @@ pub fn hello(component: &str) -> Hello {
     Hello::new(component, "test")
 }
 
+async fn guest_hello(stream: &mut UnixStream, component: &str) -> Result<()> {
+    stream
+        .write_all((serde_json::to_string(&hello(component))? + "\n").as_bytes())
+        .await?;
+    let line = read_line_capped(stream, MAX_LINE_BYTES)
+        .await?
+        .ok_or_else(|| anyhow!("guest closed during hello"))?;
+    let response: Response = serde_json::from_str(&line)?;
+    if !response.ok {
+        let err = response
+            .error
+            .map(|err| format!("{}: {}", err.code, err.message))
+            .unwrap_or_else(|| "guest rejected hello".to_string());
+        bail!("{err}");
+    }
+    let proto = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("proto"))
+        .and_then(Value::as_u64);
+    if proto != Some(u64::from(AGENT_PROTOCOL_VERSION)) {
+        bail!("guest returned incompatible protocol {proto:?}");
+    }
+    Ok(())
+}
+
 async fn write_service_toml(
     services: &Utf8PathBuf,
     name: &str,
@@ -546,7 +590,10 @@ impl McpClient {
     /// text block carrying JSON).
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
         let result = self
-            .rpc("tools/call", json!({ "name": name, "arguments": arguments }))
+            .rpc(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
             .await?;
         let text = result["content"][0]["text"]
             .as_str()
@@ -666,7 +713,9 @@ async fn write_http(
     body: Option<&Value>,
     origin: Option<&str>,
 ) -> Result<()> {
-    let body_bytes = body.map(|b| serde_json::to_vec(b).unwrap()).unwrap_or_default();
+    let body_bytes = body
+        .map(|b| serde_json::to_vec(b).unwrap())
+        .unwrap_or_default();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
     if let Some(token) = token {
         req.push_str(&format!("Authorization: Bearer {token}\r\n"));

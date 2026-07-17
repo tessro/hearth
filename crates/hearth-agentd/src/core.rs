@@ -43,8 +43,15 @@ impl Agentd {
         (self.now_fn)()
     }
 
-    pub fn mint_ref(&self, target: &str, task_id: &str, initiator: &str, thread: Option<&str>) -> String {
-        self.keys.mint(target, task_id, initiator, thread, self.now())
+    pub fn mint_ref(
+        &self,
+        target: &str,
+        task_id: &str,
+        initiator: &str,
+        thread: Option<&str>,
+    ) -> String {
+        self.keys
+            .mint(target, task_id, initiator, thread, self.now())
     }
 
     /// Verify a presented ref and confirm the presenter may use it (§7.1).
@@ -144,7 +151,10 @@ impl Agentd {
         self.audit("delegate", initiator, target, "granted", Some(&task_id));
 
         let mut args = Map::new();
-        args.insert("agent".to_string(), json!(default_agent_for(&endpoints, target)));
+        args.insert(
+            "agent".to_string(),
+            json!(default_agent_for(&endpoints, target)),
+        );
         args.insert("text".to_string(), json!(text));
         args.insert("detach".to_string(), json!(true));
         args.insert("task_id".to_string(), json!(task_id));
@@ -180,7 +190,12 @@ impl Agentd {
     /// ledgers a grant and mints a ref so status/attach/cancel and the ref
     /// machinery work uniformly. A UI has no wake thread (it polls), so no
     /// wake-up is ever injected for it.
-    pub async fn delegate_from_ui(&self, presenter: &str, target: &str, text: &str) -> Result<Value> {
+    pub async fn delegate_from_ui(
+        &self,
+        presenter: &str,
+        target: &str,
+        text: &str,
+    ) -> Result<Value> {
         let endpoints = self.hearthd.agent_endpoints().await?;
         if !endpoints.iter().any(|e| e.name == target && e.running) {
             bail!("agent.not_enabled: {target:?} is not a running agent-enabled VM");
@@ -197,7 +212,10 @@ impl Agentd {
         self.audit("task.start", presenter, target, "granted", Some(&task_id));
 
         let mut args = Map::new();
-        args.insert("agent".to_string(), json!(default_agent_for(&endpoints, target)));
+        args.insert(
+            "agent".to_string(),
+            json!(default_agent_for(&endpoints, target)),
+        );
         args.insert("text".to_string(), json!(text));
         args.insert("detach".to_string(), json!(true));
         args.insert("task_id".to_string(), json!(task_id));
@@ -245,7 +263,14 @@ impl Agentd {
 
     /// Structured audit line to journald-shaped fields (§4.4). Token-level
     /// event content is never audited; it lives in the guest event log.
-    pub fn audit(&self, verb: &str, initiator: &str, agent: &str, result: &str, task: Option<&str>) {
+    pub fn audit(
+        &self,
+        verb: &str,
+        initiator: &str,
+        agent: &str,
+        result: &str,
+        task: Option<&str>,
+    ) {
         info!(
             hearth_initiator = %initiator,
             hearth_agent = %agent,
@@ -257,8 +282,44 @@ impl Agentd {
     }
 }
 
-/// Pick the adapter to drive on a target for a bare `delegate` — the first
-/// adapter the guest reports, falling back to codex (the day-1 vertical).
-fn default_agent_for(_endpoints: &[crate::hearthd::AgentEndpoint], _target: &str) -> String {
-    "codex".to_string()
+/// Pick the first healthy adapter reported by the target. The codex fallback
+/// preserves compatibility with a pre-boot-report guest or older hearthd.
+fn default_agent_for(endpoints: &[crate::hearthd::AgentEndpoint], target: &str) -> String {
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.name == target)
+        .and_then(|endpoint| endpoint.agents.iter().find(|agent| agent.ok))
+        .map(|agent| agent.name.clone())
+        .unwrap_or_else(|| "codex".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hearth_agent_proto::AgentDecl;
+
+    #[test]
+    fn default_agent_uses_the_targets_first_healthy_declaration() {
+        let endpoints = vec![crate::hearthd::AgentEndpoint {
+            name: "hermes-vm".into(),
+            running: true,
+            is_agent_in_charge: false,
+            ready: true,
+            agents: vec![
+                AgentDecl {
+                    name: "codex".into(),
+                    cli_version: None,
+                    ok: false,
+                    error: Some("not installed".into()),
+                },
+                AgentDecl {
+                    name: "hermes".into(),
+                    cli_version: Some("0.18.2".into()),
+                    ok: true,
+                    error: None,
+                },
+            ],
+        }];
+        assert_eq!(default_agent_for(&endpoints, "hermes-vm"), "hermes");
+    }
 }

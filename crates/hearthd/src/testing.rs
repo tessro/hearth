@@ -5,7 +5,9 @@
 //! is a plain unix socket, so everything except the VM boot itself exercises
 //! production code paths.
 
-use crate::{config::Config, host::DiskFormat, host::Host, provision::ProvisionPlan, registry::Service};
+use crate::{
+    config::Config, host::DiskFormat, host::Host, provision::ProvisionPlan, registry::Service,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use camino::Utf8Path;

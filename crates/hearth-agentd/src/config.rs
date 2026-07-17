@@ -7,7 +7,11 @@ use camino::Utf8PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "hearth-agentd", version, about = "Hearth agent-plane host daemon")]
+#[command(
+    name = "hearth-agentd",
+    version,
+    about = "Hearth agent-plane host daemon"
+)]
 pub struct Config {
     /// hearthd's control socket (for agent-endpoints + the socket broker).
     #[arg(long, env = "HEARTH_SOCKET", default_value = "/run/hearth.sock")]

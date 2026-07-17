@@ -20,6 +20,10 @@ path = "src/bin/fake_codex.rs"
 name = "fake_claude"
 path = "src/bin/fake_claude.rs"
 
+[[bin]]
+name = "fake_hermes"
+path = "src/bin/fake_hermes.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 camino = { workspace = true }

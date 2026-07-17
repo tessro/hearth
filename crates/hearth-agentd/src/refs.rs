@@ -51,7 +51,12 @@ impl RefKeys {
 
     /// Verify a ref and confirm the presenter is entitled to it: the ref's
     /// initiator VM, or a UI bearing the HTTP token (`presenter = "ui"`).
-    pub fn verify_presenter(&self, token: &str, presenter: &str, now: i64) -> Result<TaskRefClaims> {
+    pub fn verify_presenter(
+        &self,
+        token: &str,
+        presenter: &str,
+        now: i64,
+    ) -> Result<TaskRefClaims> {
         let claims = self.verify(token, now)?;
         if presenter == "ui" && claims.initiator == "ui" {
             return Ok(claims);

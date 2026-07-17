@@ -12,9 +12,7 @@
 use crate::core::Agentd;
 use crate::relay;
 use anyhow::{anyhow, Context, Result};
-use hearth_agent_proto::{
-    read_line_capped, AgentVerb, Hello, HelloChannel, MAX_LINE_BYTES,
-};
+use hearth_agent_proto::{read_line_capped, AgentVerb, Hello, HelloChannel, MAX_LINE_BYTES};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -168,16 +166,26 @@ impl Listeners {
         // VM that learned another delegation's task_id could inject
         // attacker-chosen text into that delegation's initiator (§8).
         if grant.target != callee_vm {
-            self.agentd
-                .audit("wakeup", &grant.initiator, callee_vm, "target_mismatch", Some(task_id));
+            self.agentd.audit(
+                "wakeup",
+                &grant.initiator,
+                callee_vm,
+                "target_mismatch",
+                Some(task_id),
+            );
             return Err(anyhow!(
                 "wakeup.target_mismatch: task {task_id} is targeted at {}, not {callee_vm}",
                 grant.target
             ));
         }
         let Some(initiator_thread) = grant.initiator_thread.clone() else {
-            self.agentd
-                .audit("wakeup", &grant.initiator, callee_vm, "no_thread", Some(task_id));
+            self.agentd.audit(
+                "wakeup",
+                &grant.initiator,
+                callee_vm,
+                "no_thread",
+                Some(task_id),
+            );
             return Ok(());
         };
 
@@ -194,11 +202,21 @@ impl Listeners {
         args.insert("delivery_id".to_string(), json!(delivery_id));
         args.insert("thread_id".to_string(), json!(initiator_thread));
         args.insert("text".to_string(), json!(framed));
-        relay::call(&self.agentd.hearthd, &grant.initiator, AgentVerb::InjectTurn, args)
-            .await
-            .with_context(|| format!("inject.turn into {}", grant.initiator))?;
-        self.agentd
-            .audit("wakeup", &grant.initiator, callee_vm, "delivered", Some(task_id));
+        relay::call(
+            &self.agentd.hearthd,
+            &grant.initiator,
+            AgentVerb::InjectTurn,
+            args,
+        )
+        .await
+        .with_context(|| format!("inject.turn into {}", grant.initiator))?;
+        self.agentd.audit(
+            "wakeup",
+            &grant.initiator,
+            callee_vm,
+            "delivered",
+            Some(task_id),
+        );
         Ok(())
     }
 }

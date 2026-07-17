@@ -35,11 +35,7 @@ fn send_fd_raw(sock: RawFd, fd: RawFd) -> io::Result<()> {
         (*hdr).cmsg_level = libc::SOL_SOCKET;
         (*hdr).cmsg_type = libc::SCM_RIGHTS;
         (*hdr).cmsg_len = libc::CMSG_LEN(4) as _;
-        std::ptr::copy_nonoverlapping(
-            &fd as *const RawFd as *const u8,
-            libc::CMSG_DATA(hdr),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(&fd as *const RawFd as *const u8, libc::CMSG_DATA(hdr), 4);
     }
     let rc = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
     if rc < 0 {

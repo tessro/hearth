@@ -35,15 +35,8 @@ pub async fn report_loop(
     addrs: Vec<String>,
 ) {
     loop {
-        if let Err(err) = report_once(
-            &transport,
-            &engine,
-            &boot_id,
-            &agents,
-            &hostname,
-            &addrs,
-        )
-        .await
+        if let Err(err) =
+            report_once(&transport, &engine, &boot_id, &agents, &hostname, &addrs).await
         {
             warn!(error = %err, "boot-report connection dropped; reconnecting");
         }
@@ -141,7 +134,10 @@ async fn deliver_outbox(transport: &Transport, engine: &Arc<Engine>) -> Result<b
     if pending.is_empty() {
         return Ok(false);
     }
-    let stream = transport.dial_host(PORT_AGENT).await.context("dial agentd upcall port")?;
+    let stream = transport
+        .dial_host(PORT_AGENT)
+        .await
+        .context("dial agentd upcall port")?;
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
 

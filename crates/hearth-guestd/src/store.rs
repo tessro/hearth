@@ -201,7 +201,10 @@ impl EventLog {
         // where the just-rotated segment becomes the only survivor) first_seq
         // would stay stale and a truncated head would replay with no gap marker.
         let path = self.segment_path(*self.segments.last().unwrap());
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         file.write_all(line.as_bytes())?;
         self.active_size += line.len() as u64;
         self.next_seq += 1;
@@ -361,10 +364,10 @@ impl Store {
             .root
             .join("outbox")
             .join(format!("{}.json", delivery.delivery_id));
-        let tmp = self.root.join("outbox").join(format!(
-            ".{}.tmp",
-            delivery.delivery_id
-        ));
+        let tmp = self
+            .root
+            .join("outbox")
+            .join(format!(".{}.tmp", delivery.delivery_id));
         // fsync the content before the atomic rename: an outbox entry is the
         // only durable record of a pending wake-up, so it must survive host
         // power loss, not just a process crash.
@@ -468,7 +471,11 @@ impl Store {
     pub fn dedup_insert(&self, delivery_id: &str) -> Result<bool> {
         validate_ulid(delivery_id)?;
         let path = self.root.join("inbox-dedup").join(delivery_id);
-        match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
             Ok(_) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(err) => Err(err.into()),
@@ -598,15 +605,20 @@ mod tests {
             }
             other => panic!("expected a truncation marker, got {other:?}"),
         }
-        assert_eq!(events[1].seq, 2, "the surviving event replays after the marker");
+        assert_eq!(
+            events[1].seq, 2,
+            "the surviving event replays after the marker"
+        );
         // The only entry at the dropped head's seq is the marker itself — the
         // original seq-1 record is never silently replayed as real content.
-        let real_at_head = events
-            .iter()
-            .filter(|e| e.seq == 1)
-            .any(|e| !matches!(&e.event, AgentEvent::Custom { name, .. }
-                if name == hearth_agent_proto::events::CUSTOM_TRUNCATION));
-        assert!(!real_at_head, "the dropped head must not replay as a real event");
+        let real_at_head = events.iter().filter(|e| e.seq == 1).any(|e| {
+            !matches!(&e.event, AgentEvent::Custom { name, .. }
+                if name == hearth_agent_proto::events::CUSTOM_TRUNCATION)
+        });
+        assert!(
+            !real_at_head,
+            "the dropped head must not replay as a real event"
+        );
 
         // max_segments is clamped to >= 1 so rotation never empties the list.
         let clamped = EventLog::open(&dir.join("z"), 8, 0).unwrap();

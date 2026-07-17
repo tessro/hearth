@@ -29,10 +29,10 @@ use hearth_agent_proto::{fdpass, read_line_capped, MAX_LINE_BYTES, PORT_AGENT};
 use hearth_proto::{version_result, ImageManifest, Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::{collections::HashMap, sync::Arc, time::Instant};
 #[cfg(target_os = "linux")]
 use std::mem;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -813,6 +813,7 @@ impl<H: Host + 'static> Daemon<H> {
     async fn image_ls(&self) -> Result<Value> {
         fs::create_dir_all(&self.cfg.images_dir).await?;
         let mut images = Vec::new();
+        let mut warnings = Vec::new();
         let mut entries = fs::read_dir(&self.cfg.images_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = Utf8PathBuf::from_path_buf(entry.path())
@@ -821,14 +822,20 @@ impl<H: Host + 'static> Daemon<H> {
                 continue;
             }
             let name = path.file_stem().unwrap_or_default();
-            images.push(self.image_info(name).await?);
+            match self.image_info(name).await {
+                Ok(info) => images.push(info),
+                Err(err) => {
+                    warn!(image = %name, error = %err, "skipping invalid image entry");
+                    warnings.push(json!({ "name": name, "error": err.to_string() }));
+                }
+            }
         }
         images.sort_by(|left, right| {
             left.get("name")
                 .and_then(Value::as_str)
                 .cmp(&right.get("name").and_then(Value::as_str))
         });
-        Ok(json!({ "images": images }))
+        Ok(json!({ "images": images, "warnings": warnings }))
     }
 
     async fn image_import(&self, args: Map<String, Value>) -> Result<Value> {
@@ -3250,6 +3257,10 @@ cwd = "/home/exedev"
         tokio::fs::write(cfg.images_dir.join("ignore.txt"), b"x")
             .await
             .unwrap();
+        // One old/manual disk must not make every valid image undiscoverable.
+        tokio::fs::write(cfg.images_dir.join("legacy.qcow2"), b"old")
+            .await
+            .unwrap();
         let daemon = Daemon::new(cfg, FakeHost::default());
 
         let responses = daemon
@@ -3271,6 +3282,14 @@ cwd = "/home/exedev"
             .get("sha256")
             .and_then(Value::as_str)
             .is_some_and(|hash| hash.len() == 64));
+        let warnings = responses[0]
+            .result
+            .as_ref()
+            .and_then(|result| result.get("warnings"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].get("name"), Some(&json!("legacy")));
     }
 
     #[tokio::test]
@@ -3528,5 +3547,4 @@ backoff_sec = 10
             .await
             .unwrap();
     }
-
 }

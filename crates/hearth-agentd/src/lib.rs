@@ -30,7 +30,9 @@ pub async fn build(cfg: Config) -> Result<Arc<Agentd>> {
     let current = config::read_secret(&cfg.ref_key_file)
         .await?
         .unwrap_or_else(|| {
-            warn!("no task-ref key configured; using an ephemeral key (refs won't survive restart)");
+            warn!(
+                "no task-ref key configured; using an ephemeral key (refs won't survive restart)"
+            );
             ephemeral_key()
         });
     let previous = config::read_secret(&cfg.ref_key_prev_file).await?;

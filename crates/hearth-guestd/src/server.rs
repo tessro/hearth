@@ -17,7 +17,8 @@ pub async fn serve_connection<S>(engine: Arc<Engine>, mut stream: S) -> Result<(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Optional hello (agentd sends one; direct callers may not).
+    // The first application frame on every task-verb channel is the mandatory
+    // version hello (§5.3). Refuse skew before interpreting any task content.
     loop {
         let Some(line) = read_line_capped(&mut stream, MAX_LINE_BYTES).await? else {
             return Ok(());
@@ -25,16 +26,62 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(hello) = serde_json::from_str::<Hello>(&line) {
-            if hello.component == "agentd" || hello.component == "hearthctl-agent" {
-                // A hello, not a request: acknowledge and continue reading.
+        let hello = match serde_json::from_str::<Hello>(&line) {
+            Ok(hello) => hello,
+            Err(err) => {
                 write_line(
                     &mut stream,
-                    &Response::success("hello", json!({ "proto": AGENT_PROTOCOL_VERSION })),
+                    &Response::failure(
+                        "hello",
+                        "protocol.hello_required",
+                        format!("first frame must be an agent-plane hello: {err}"),
+                    ),
                 )
                 .await?;
-                continue;
+                return Ok(());
             }
+        };
+        if hello.component != "agentd" && hello.component != "hearthctl-agent" {
+            write_line(
+                &mut stream,
+                &Response::failure(
+                    "hello",
+                    "protocol.invalid_component",
+                    format!("component {:?} may not drive guestd", hello.component),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if hello.proto != AGENT_PROTOCOL_VERSION {
+            write_line(
+                &mut stream,
+                &Response::failure(
+                    "hello",
+                    "protocol.version_mismatch",
+                    format!(
+                        "guestd protocol {} does not support peer protocol {}",
+                        AGENT_PROTOCOL_VERSION, hello.proto
+                    ),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        write_line(
+            &mut stream,
+            &Response::success("hello", json!({ "proto": AGENT_PROTOCOL_VERSION })),
+        )
+        .await?;
+        break;
+    }
+
+    loop {
+        let Some(line) = read_line_capped(&mut stream, MAX_LINE_BYTES).await? else {
+            return Ok(());
+        };
+        if line.trim().is_empty() {
+            continue;
         }
         let req: AgentRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
@@ -66,9 +113,9 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
     let args = &req.args;
     match req.verb {
         AgentVerb::Ping => Ok(json!({ "pong": true, "component": "guestd" })),
-        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(
-            env!("CARGO_PKG_VERSION"),
-        )),
+        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(env!(
+            "CARGO_PKG_VERSION"
+        ))),
         AgentVerb::AgentLs => Ok(json!({ "agents": engine.adapters() })),
         AgentVerb::TaskStart => {
             let agent = str_arg(args, "agent")?;
@@ -82,12 +129,14 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
                 .get("task_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let summary = engine.start(agent, text, initiator, detach, task_id).await?;
+            let summary = engine
+                .start(agent, text, initiator, detach, task_id)
+                .await?;
             Ok(serde_json::to_value(summary)?)
         }
-        AgentVerb::TaskStatus => {
-            Ok(serde_json::to_value(engine.status(str_arg(args, "task_id")?)?)?)
-        }
+        AgentVerb::TaskStatus => Ok(serde_json::to_value(
+            engine.status(str_arg(args, "task_id")?)?,
+        )?),
         AgentVerb::TaskEvents => {
             let task_id = str_arg(args, "task_id")?;
             let cursor = args.get("cursor").and_then(Value::as_str);
@@ -104,9 +153,9 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
                 .ok_or_else(|| anyhow!("request.invalid: missing response"))?;
             Ok(serde_json::to_value(engine.respond(task_id, response)?)?)
         }
-        AgentVerb::TaskCancel => {
-            Ok(serde_json::to_value(engine.cancel(str_arg(args, "task_id")?)?)?)
-        }
+        AgentVerb::TaskCancel => Ok(serde_json::to_value(
+            engine.cancel(str_arg(args, "task_id")?)?,
+        )?),
         AgentVerb::TaskList => Ok(json!({ "tasks": engine.list() })),
         AgentVerb::TaskGc => {
             let keep = args.get("keep").and_then(Value::as_u64).unwrap_or(20) as usize;
@@ -138,7 +187,11 @@ where
             return write_line(stream, &Response::failure(id, code, message)).await;
         }
     };
-    let mut cursor = req.args.get("cursor").and_then(Value::as_str).map(str::to_string);
+    let mut cursor = req
+        .args
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let mut updates = match engine.subscribe(&task_id) {
         Ok(rx) => rx,
         Err(err) => {

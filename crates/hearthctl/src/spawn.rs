@@ -333,10 +333,17 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
     let authorized_keys =
         crate::read_authorized_key_inputs(&opts.ssh_key, &opts.authorized_keys_file)?;
 
-    // Build-if-missing: consult the daemon's image list, then decide.
-    let images = hearth_request(socket, Verb::ImageLs, empty_args()).await?;
-    let present = image_exists(&images, &opts.image);
-    match build_decision(present, opts.dockerfile.is_some()) {
+    // Build-if-missing only needs an inventory when a Dockerfile was supplied.
+    // With an already-imported image, create is the authoritative validation;
+    // avoiding a fleet-wide list also prevents one unrelated legacy image from
+    // blocking creation of this named, valid image.
+    let decision = if opts.dockerfile.is_some() {
+        let images = hearth_request(socket, Verb::ImageLs, empty_args()).await?;
+        build_decision(image_exists(&images, &opts.image), true)
+    } else {
+        BuildDecision::Skip
+    };
+    match decision {
         BuildDecision::Skip => {
             if opts.dockerfile.is_some() {
                 eprintln!("hearthctl: image {} exists, skipping build", opts.image);

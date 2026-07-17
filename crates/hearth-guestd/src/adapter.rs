@@ -14,6 +14,7 @@ use serde_json::Value;
 
 pub mod claude;
 pub mod codex;
+pub mod hermes;
 
 /// What an adapter emits as it drives one run. `Event` is appended to the log;
 /// `AwaitingInput` ends the current run `interrupted` and moves the task to
@@ -45,8 +46,14 @@ pub trait Adapter: Send + Sync {
     /// adapter refuses to drive it. Surfaces in the boot report (§2.1).
     async fn probe(&self) -> Result<String>;
 
-    /// Start a new run. `native_thread` is `None` for the task's first run and
-    /// the CLI-assigned session id for a resume. `input` is the task text (first
-    /// run) or the resume payload (answering `awaiting_input`).
-    async fn run(&self, native_thread: Option<&str>, input: &Value) -> Result<RunOutput>;
+    /// Start a new run. `thread_id` is Hearth's durable thread identity (used
+    /// to bind per-session MCP shims); `native_thread` is the CLI-assigned
+    /// session id, absent on the first run. `input` is the task text or resume
+    /// payload.
+    async fn run(
+        &self,
+        thread_id: &str,
+        native_thread: Option<&str>,
+        input: &Value,
+    ) -> Result<RunOutput>;
 }

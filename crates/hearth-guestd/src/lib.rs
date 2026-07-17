@@ -14,6 +14,7 @@ pub mod vsock_io;
 
 use crate::adapter::claude::ClaudeAdapter;
 use crate::adapter::codex::CodexAdapter;
+use crate::adapter::hermes::{HermesAdapter, ProcessIdentity};
 use crate::adapter::Adapter;
 use crate::engine::Engine;
 use crate::store::Store;
@@ -23,24 +24,51 @@ use camino::Utf8PathBuf;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Which CLIs to wire, with their binary names. Codex is the day-1 vertical
-/// (§2.2); claude follows in Phase 5. Commands are overridable so tests point
-/// at fakes.
+/// Which CLIs to wire, with their binary names. Commands are overridable so
+/// tests point at fakes; absent commands do not register an adapter.
 pub struct AdapterConfig {
-    pub codex_command: String,
+    pub codex_command: Option<String>,
     pub claude_command: Option<String>,
+    pub hermes: Option<HermesConfig>,
+}
+
+pub struct HermesConfig {
+    pub command: String,
+    pub identity: Option<ProcessIdentity>,
+}
+
+impl HermesConfig {
+    pub fn current_user(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            identity: None,
+        }
+    }
+
+    /// The fixed workload identity declared by vm-base.
+    pub fn agent_user(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            identity: Some(ProcessIdentity {
+                uid: 1000,
+                gid: 1000,
+                home: "/home/agent".into(),
+            }),
+        }
+    }
 }
 
 impl AdapterConfig {
     pub fn codex_only(codex_command: &str) -> Self {
         Self {
-            codex_command: codex_command.to_string(),
+            codex_command: Some(codex_command.to_string()),
             claude_command: None,
+            hermes: None,
         }
     }
 }
 
-/// Assemble the engine with codex (and, if configured, claude).
+/// Assemble the engine with codex (and any other configured adapters).
 pub fn build_engine(state_dir: &Utf8PathBuf, codex_command: &str) -> Result<Arc<Engine>> {
     build_engine_with(state_dir, AdapterConfig::codex_only(codex_command))
 }
@@ -48,11 +76,21 @@ pub fn build_engine(state_dir: &Utf8PathBuf, codex_command: &str) -> Result<Arc<
 pub fn build_engine_with(state_dir: &Utf8PathBuf, cfg: AdapterConfig) -> Result<Arc<Engine>> {
     let store = Arc::new(Store::new(state_dir, 256 * 1024, 64)?);
     let mut adapters: HashMap<String, Arc<dyn Adapter>> = HashMap::new();
-    let codex = Arc::new(CodexAdapter::new(&cfg.codex_command));
-    adapters.insert(codex.name().to_string(), codex);
+    if let Some(codex_command) = &cfg.codex_command {
+        let codex = Arc::new(CodexAdapter::new(codex_command));
+        adapters.insert(codex.name().to_string(), codex);
+    }
     if let Some(claude_command) = &cfg.claude_command {
         let claude = Arc::new(ClaudeAdapter::new(claude_command));
         adapters.insert(claude.name().to_string(), claude);
+    }
+    if let Some(hermes_cfg) = cfg.hermes {
+        let mut hermes = HermesAdapter::new(hermes_cfg.command);
+        if let Some(identity) = hermes_cfg.identity {
+            hermes = hermes.run_as(identity);
+        }
+        let hermes = Arc::new(hermes);
+        adapters.insert(hermes.name().to_string(), hermes);
     }
     Ok(Engine::new(store, adapters))
 }

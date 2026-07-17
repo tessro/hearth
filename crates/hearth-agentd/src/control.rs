@@ -69,9 +69,9 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
     let args = &req.args;
     match req.verb {
         AgentVerb::Ping => Ok(json!({ "pong": true, "component": "agentd" })),
-        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(
-            env!("CARGO_PKG_VERSION"),
-        )),
+        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(env!(
+            "CARGO_PKG_VERSION"
+        ))),
         AgentVerb::AgentLs => agentd.list_agents().await,
         AgentVerb::TaskStart => {
             // The operator starts a task directly on an agent VM. This is a
@@ -89,7 +89,9 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
         }
         AgentVerb::TaskStatus => {
             let claims = agentd.resolve_ref(str_arg(args, "task_ref")?, CONTROL_PRESENTER)?;
-            agentd.relay_verb(&claims, AgentVerb::TaskStatus, Map::new()).await
+            agentd
+                .relay_verb(&claims, AgentVerb::TaskStatus, Map::new())
+                .await
         }
         AgentVerb::TaskEvents => {
             let claims = agentd.resolve_ref(str_arg(args, "task_ref")?, CONTROL_PRESENTER)?;
@@ -99,7 +101,9 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
                     extra.insert(key.to_string(), v.clone());
                 }
             }
-            agentd.relay_verb(&claims, AgentVerb::TaskEvents, extra).await
+            agentd
+                .relay_verb(&claims, AgentVerb::TaskEvents, extra)
+                .await
         }
         AgentVerb::TaskRespond => {
             let claims = agentd.resolve_ref(str_arg(args, "task_ref")?, CONTROL_PRESENTER)?;
@@ -108,11 +112,15 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
                 "response".to_string(),
                 args.get("response").cloned().unwrap_or(json!({})),
             );
-            agentd.relay_verb(&claims, AgentVerb::TaskRespond, extra).await
+            agentd
+                .relay_verb(&claims, AgentVerb::TaskRespond, extra)
+                .await
         }
         AgentVerb::TaskCancel => {
             let claims = agentd.resolve_ref(str_arg(args, "task_ref")?, CONTROL_PRESENTER)?;
-            let result = agentd.relay_verb(&claims, AgentVerb::TaskCancel, Map::new()).await?;
+            let result = agentd
+                .relay_verb(&claims, AgentVerb::TaskCancel, Map::new())
+                .await?;
             agentd.cancel_grant(&claims.task_id)?;
             Ok(result)
         }
@@ -123,8 +131,13 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
                 if !endpoint.running {
                     continue;
                 }
-                if let Ok(value) =
-                    crate::relay::call(&agentd.hearthd, &endpoint.name, AgentVerb::TaskList, Map::new()).await
+                if let Ok(value) = crate::relay::call(
+                    &agentd.hearthd,
+                    &endpoint.name,
+                    AgentVerb::TaskList,
+                    Map::new(),
+                )
+                .await
                 {
                     if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
                         for task in tasks {
@@ -157,17 +170,20 @@ async fn attach(agentd: &Arc<Agentd>, stream: &mut UnixStream, req: &AgentReques
         extra.insert("cursor".to_string(), cursor.clone());
     }
     extra.insert("task_id".to_string(), json!(claims.task_id));
-    let (mut guest, _guest_id) = match crate::relay::attach(&agentd.hearthd, &claims.target, extra).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            let (code, message) = split_coded(&err);
-            return write_line(stream, &Response::failure(id, code, message)).await;
-        }
-    };
+    let (mut guest, _guest_id) =
+        match crate::relay::attach(&agentd.hearthd, &claims.target, extra).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                let (code, message) = split_coded(&err);
+                return write_line(stream, &Response::failure(id, code, message)).await;
+            }
+        };
     // Pump guest attach frames out to the control client, re-tagged with our id.
     loop {
         match crate::relay::next_attach_frame(&mut guest).await {
-            Ok(Some(frame)) => write_line(stream, &Response::stream_data(id.clone(), frame)).await?,
+            Ok(Some(frame)) => {
+                write_line(stream, &Response::stream_data(id.clone(), frame)).await?
+            }
             Ok(None) => return write_line(stream, &Response::stream_end(id)).await,
             Err(err) => {
                 warn!(error = %err, "attach relay dropped");

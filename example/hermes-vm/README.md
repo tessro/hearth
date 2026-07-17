@@ -9,6 +9,9 @@ It is `FROM localhost/vm-base` (all the boot boilerplate — systemd, udev,
 networkd, the init shim, fstab, the getty mask, sshd, the `agent` user) plus:
 
 - Hermes Agent installed for the `agent` user, pinned to a commit.
+- `hearth-guestd` configured with Hermes as its only advertised adapter. It
+  drives pinned ACP v1 as `agent:agent`, registers Hearth's MCP shim per
+  session, and uses that user's provisioned provider auth.
 - A `hermes.service` unit that runs `hermes serve --host 0.0.0.0 --port 9119`.
 - A serial-log probe that prints `HERMES_PROBE ok ... addr=<guest-ip>` once the
   gateway is listening.
@@ -48,15 +51,14 @@ build needs an explicit `--build-arg HERMES_COMMIT=<sha>`:
 ```sh
 make vm-base
 hearthctl image build --name hermes-vm --dockerfile example/hermes-vm/Dockerfile \
-  --context example/hermes-vm --disk 16 --build-arg HERMES_COMMIT=<sha>
+  --context example/hermes-vm --disk 16 \
+  --build-arg HERMES_COMMIT=2ea39daeb1f675d72e5c21c9400f2d58d7e6d71a
 ```
 
-> **Tested commit.** Record the sha you validated here and bump it deliberately
-> in a commit (the build refuses without one). At the time of writing the pin
-> had not been captured — the environment could not reach the Hermes git remote
-> — so pass the sha you install. The build ends with
-> `test -x /home/agent/.local/bin/hermes && hermes --version`, so a moved
-> launcher fails the build here, not on first boot.
+> **Tested commit.** The Hearth adapter pins Hermes `0.18.2`, source commit
+> `2ea39dae`, with ACP protocol v1. Bump the image commit and adapter contract
+> together. The build checks both `hermes --version` and `hermes acp --check`,
+> so a moved launcher or missing ACP dependency fails here, not on first boot.
 
 `image build` runs a build-time linter over the unpacked rootfs before it makes
 the disk (§2.2): it rejects an image whose init, fstab root entry, fixed
@@ -74,7 +76,7 @@ Dockerfile:
 hearthctl spawn hermes \
   --image hermes-vm \
   --provision-file source=./hermes.env,dest=/home/agent/.hermes/.env,mode=0600,owner=1000:1000 \
-  --authorized-keys-file ./authorized_keys \
+  --authorized-keys-file ./authorized_keys --agent \
   --mem 4096 --cpu 4 --disk 32
 hearthctl logs hermes --follow      # watch for HERMES_PROBE ok
 ```

@@ -11,8 +11,9 @@ fn opts() -> HarnessOptions {
         agents: vec![AgentSpec::worker("worker")],
         delegators: vec![],
         http: None,
-        codex_command: env!("CARGO_BIN_EXE_fake_codex").to_string(),
+        codex_command: Some(env!("CARGO_BIN_EXE_fake_codex").to_string()),
         claude_command: None,
+        hermes_command: None,
     }
 }
 
@@ -23,7 +24,10 @@ async fn wait_resolves_on_the_boot_report_without_a_marker() {
     args.insert("name".to_string(), json!("worker"));
     args.insert("timeout".to_string(), json!(10));
     let resp = h.hearthd(Verb::Wait, args).await.unwrap();
-    assert!(resp.ok, "wait should resolve on the guestd boot report: {resp:?}");
+    assert!(
+        resp.ok,
+        "wait should resolve on the guestd boot report: {resp:?}"
+    );
     let result = resp.result.unwrap();
     assert_eq!(result["ready"], json!(true));
     assert_eq!(result["guestd"]["component"], json!("guestd"));
@@ -64,6 +68,8 @@ async fn status_surfaces_guestd_telemetry() {
     assert!(guestd["last_seen"].as_str().is_some(), "last_seen present");
     // The codex adapter is declared as an agent in the boot report.
     let agents = guestd["agents"].as_array().unwrap();
-    assert!(agents.iter().any(|a| a["name"] == json!("codex") && a["ok"] == json!(true)));
+    assert!(agents
+        .iter()
+        .any(|a| a["name"] == json!("codex") && a["ok"] == json!(true)));
     assert_eq!(status["agent"], Value::Bool(true));
 }

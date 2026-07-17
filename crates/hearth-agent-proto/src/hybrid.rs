@@ -50,10 +50,7 @@ pub async fn accept_handshake(stream: &mut UnixStream) -> io::Result<u32> {
     let line = read_line_capped(stream, HANDSHAKE_LINE_CAP)
         .await?
         .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer closed before CONNECT",
-            )
+            io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed before CONNECT")
         })?;
     let port = line
         .strip_prefix("CONNECT ")

@@ -139,13 +139,23 @@ fn peer_group_set(uid: u32, primary_gid: u32) -> std::collections::HashSet<u32> 
     let mut ngroups: libc::c_int = 32;
     let mut buf = vec![0 as libc::gid_t; ngroups as usize];
     let rc = unsafe {
-        libc::getgrouplist(name, primary_gid as libc::gid_t, buf.as_mut_ptr(), &mut ngroups)
+        libc::getgrouplist(
+            name,
+            primary_gid as libc::gid_t,
+            buf.as_mut_ptr(),
+            &mut ngroups,
+        )
     };
     if rc < 0 {
         // Buffer too small: ngroups now holds the needed size — retry once.
         buf = vec![0 as libc::gid_t; ngroups.max(0) as usize];
         let rc = unsafe {
-            libc::getgrouplist(name, primary_gid as libc::gid_t, buf.as_mut_ptr(), &mut ngroups)
+            libc::getgrouplist(
+                name,
+                primary_gid as libc::gid_t,
+                buf.as_mut_ptr(),
+                &mut ngroups,
+            )
         };
         if rc < 0 {
             return gids;
@@ -230,7 +240,9 @@ verbs = ["ls"]
     #[test]
     fn invalid_policy_is_a_hard_error_not_a_bypass() {
         assert!(VerbPolicy::parse("[[peer]]\nverbs = [\"ls\"]\n").is_err());
-        assert!(VerbPolicy::parse("[[peer]]\nuid = 1\ngid = 2\nuser = \"x\"\nverbs = []\n").is_err());
+        assert!(
+            VerbPolicy::parse("[[peer]]\nuid = 1\ngid = 2\nuser = \"x\"\nverbs = []\n").is_err()
+        );
         assert!(VerbPolicy::parse("peer = 3\n").is_err());
     }
 }

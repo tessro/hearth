@@ -35,7 +35,10 @@ fn main() {
             Ok(msg) => msg,
             Err(_) => continue,
         };
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
+        let method = msg
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let id = msg.get("id").cloned();
         let params = msg.get("params").cloned().unwrap_or(json!({}));
         match method {
