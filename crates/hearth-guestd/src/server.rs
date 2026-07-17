@@ -153,6 +153,9 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
                 .ok_or_else(|| anyhow!("request.invalid: missing response"))?;
             Ok(serde_json::to_value(engine.respond(task_id, response)?)?)
         }
+        AgentVerb::TaskFollowup => Ok(serde_json::to_value(
+            engine.follow_up(str_arg(args, "task_id")?, str_arg(args, "text")?)?,
+        )?),
         AgentVerb::TaskCancel => Ok(serde_json::to_value(
             engine.cancel(str_arg(args, "task_id")?)?,
         )?),

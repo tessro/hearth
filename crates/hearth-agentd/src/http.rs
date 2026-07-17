@@ -4,9 +4,9 @@
 //!
 //! - `POST /v1/agents/{name}/agui` — **standard AG-UI**: accepts a
 //!   `RunAgentInput`, streams `BaseEvent`s over SSE. A fresh `threadId` creates
-//!   a task; `forwardedProps.task_ref` resumes an existing one as a new run,
-//!   per AG-UI's interrupt lifecycle. An unmodified AG-UI `HttpAgent` drives
-//!   this (Phase 3's conformance bar).
+//!   a task; `forwardedProps.task_ref` resumes an approval or continues a
+//!   settled task as a new run on the same thread. An unmodified AG-UI
+//!   `HttpAgent` drives this (Phase 3's conformance bar).
 //! - Hearth task API (honestly namespaced extensions): `GET /v1/agents`,
 //!   `GET /v1/tasks`, `GET /v1/tasks/{ref}`, `GET /v1/tasks/{ref}/events` (SSE),
 //!   `POST /v1/tasks/{ref}/cancel`.
@@ -249,7 +249,14 @@ async fn agui_run(
         }
         Some(token) => {
             let claims = agentd.resolve_ref(&token, "ui")?;
-            // Capture the current tip BEFORE responding so we stream every
+            if claims.target != agent_vm {
+                return Err(anyhow!(
+                    "task.target_mismatch: task belongs to {:?}, not {:?}",
+                    claims.target,
+                    agent_vm
+                ));
+            }
+            // Capture the current tip BEFORE continuing so we stream every
             // event of the new run and none of the old (no gap, no dup).
             let status = agentd
                 .relay_verb(&claims, AgentVerb::TaskStatus, Map::new())
@@ -259,12 +266,28 @@ async fn agui_run(
                 .and_then(Value::as_str)
                 .zip(status.get("last_seq").and_then(Value::as_u64))
                 .map(|(inc, seq)| format!("{inc}.{seq}"));
-            // Resume: the answer is a new run carrying the resume payload.
-            let mut extra = Map::new();
-            extra.insert("response".to_string(), json!({ "text": user_text }));
-            agentd
-                .relay_verb(&claims, AgentVerb::TaskRespond, extra)
-                .await?;
+            match status.get("state").and_then(Value::as_str) {
+                Some("awaiting_input") => {
+                    let mut extra = Map::new();
+                    extra.insert("response".to_string(), json!({ "text": user_text }));
+                    agentd
+                        .relay_verb(&claims, AgentVerb::TaskRespond, extra)
+                        .await?;
+                }
+                Some("completed" | "failed") => {
+                    let mut extra = Map::new();
+                    extra.insert("text".to_string(), json!(user_text));
+                    agentd
+                        .relay_verb(&claims, AgentVerb::TaskFollowup, extra)
+                        .await?;
+                }
+                Some(state) => {
+                    return Err(anyhow!(
+                        "task.not_settled: task is {state} and cannot accept another turn"
+                    ));
+                }
+                None => return Err(anyhow!("task.invalid_status: task state is missing")),
+            }
             (claims, cursor)
         }
     };
@@ -311,7 +334,6 @@ async fn agui_run(
             }
         }
     }
-    stream.write_all(b"event: done\ndata: {}\n\n").await?;
     stream.flush().await?;
     Ok(())
 }

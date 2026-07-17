@@ -40,6 +40,8 @@ pub enum AgentCommand {
     },
     /// Answer a task that is awaiting input (starts a new run).
     Respond { task_ref: String, text: String },
+    /// Continue a completed or failed task on the same conversation thread.
+    Followup { task_ref: String, text: String },
     /// Cancel a task.
     Cancel { task_ref: String },
     /// Attach: replay from a cursor, then follow the event stream.
@@ -98,6 +100,11 @@ fn to_request(command: &AgentCommand) -> (AgentVerb, Map<String, Value>, bool) {
                 ("task_ref", json!(task_ref)),
                 ("response", json!({ "text": text })),
             ]),
+            false,
+        ),
+        AgentCommand::Followup { task_ref, text } => (
+            AgentVerb::TaskFollowup,
+            args([("task_ref", json!(task_ref)), ("text", json!(text))]),
             false,
         ),
         AgentCommand::Cancel { task_ref } => (
@@ -193,7 +200,7 @@ fn render(command: &AgentCommand, value: &Value) -> Result<()> {
             }
             Ok(())
         }
-        AgentCommand::Run { .. } | AgentCommand::Respond { .. } => {
+        AgentCommand::Run { .. } | AgentCommand::Respond { .. } | AgentCommand::Followup { .. } => {
             if let Some(task_ref) = value.get("task_ref").and_then(Value::as_str) {
                 println!("task_ref: {task_ref}");
             }

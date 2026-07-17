@@ -116,6 +116,14 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
                 .relay_verb(&claims, AgentVerb::TaskRespond, extra)
                 .await
         }
+        AgentVerb::TaskFollowup => {
+            let claims = agentd.resolve_ref(str_arg(args, "task_ref")?, CONTROL_PRESENTER)?;
+            let mut extra = Map::new();
+            extra.insert("text".to_string(), json!(str_arg(args, "text")?));
+            agentd
+                .relay_verb(&claims, AgentVerb::TaskFollowup, extra)
+                .await
+        }
         AgentVerb::TaskCancel => {
             let claims = agentd.resolve_ref(str_arg(args, "task_ref")?, CONTROL_PRESENTER)?;
             let result = agentd

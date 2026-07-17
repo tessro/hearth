@@ -104,6 +104,45 @@ async fn approval_interrupts_then_a_new_run_resumes_the_thread() {
 }
 
 #[tokio::test]
+async fn completed_task_accepts_one_followup_on_the_same_thread() {
+    let h = Harness::start(opts()).await.unwrap();
+    let (mut stream, task_id) = start_task(&h, "first turn").await;
+    let before = task_status(&mut stream, &task_id).await;
+    let thread_id = before["thread_id"].as_str().unwrap().to_string();
+
+    let mut args = Map::new();
+    args.insert("task_id".to_string(), json!(task_id));
+    args.insert("text".to_string(), json!("second turn"));
+    guest_verb(&mut stream, AgentVerb::TaskFollowup, args)
+        .await
+        .unwrap();
+
+    let settled = wait_state(&h, "worker", &task_id, "completed").await;
+    assert!(settled, "follow-up run should complete");
+    let after = task_status(&mut stream, &task_id).await;
+    assert_eq!(after["thread_id"], json!(thread_id));
+    assert_eq!(after["runs"].as_array().unwrap().len(), 2);
+
+    // The state reservation rejects a second concurrent/retried follow-up
+    // after the first has claimed the task, whether it is still queued/running
+    // or has already reached its scripted approval interrupt.
+    let mut args = Map::new();
+    args.insert("task_id".to_string(), json!(task_id));
+    args.insert("text".to_string(), json!("NEEDS_APPROVAL third turn"));
+    let first = guest_verb(&mut stream, AgentVerb::TaskFollowup, args)
+        .await
+        .unwrap();
+    assert_eq!(first["state"], json!("queued"));
+    let mut args = Map::new();
+    args.insert("task_id".to_string(), json!(task_id));
+    args.insert("text".to_string(), json!("duplicate third turn"));
+    let err = guest_verb(&mut stream, AgentVerb::TaskFollowup, args)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("task.not_settled"), "got: {err}");
+}
+
+#[tokio::test]
 async fn cancel_moves_a_task_to_canceled() {
     let h = Harness::start(opts()).await.unwrap();
     // Interrupt so the task rests in awaiting_input, then cancel it.

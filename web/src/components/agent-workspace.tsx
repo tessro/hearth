@@ -35,6 +35,7 @@ import { Tool, ToolContent, ToolHeader, ToolInput, ToolOutput } from "@/componen
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
+import { Spinner } from "@/components/ui/spinner"
 import { cn } from "@/lib/utils"
 import type { AgentInfo, TaskState, TaskSummary } from "@/lib/hearth-api"
 import { permissionText, type TranscriptEntry } from "@/lib/transcript"
@@ -161,9 +162,13 @@ export function AgentWorkspace({
   onQuickResponse,
   onRetryReplay,
 }: AgentWorkspaceProps) {
-  const canRespond = !task || task.state === "awaiting_input"
+  const canFollowUp = task?.state === "completed" || task?.state === "failed"
+  const canRespond = !task || task.state === "awaiting_input" || canFollowUp
   const canCancel = task && ["queued", "running", "awaiting_input"].includes(task.state)
   const status = busy ? "streaming" : streamError ? "error" : "ready"
+  const lastEntry = transcript.at(-1)
+  const waitingForAgent =
+    busy && lastEntry?.kind === "message" && lastEntry.role === "user"
 
   return (
     <main className="flex min-h-0 min-w-0 flex-col bg-neutral-900 text-neutral-100">
@@ -235,6 +240,17 @@ export function AgentWorkspace({
             transcript.map((entry) => <Entry entry={entry} key={`${entry.kind}-${entry.id}`} />)
           )}
 
+          {waitingForAgent ? (
+            <Message className="max-w-[88%]" from="assistant">
+              <MessageContent>
+                <div className="flex items-center gap-2 text-sm text-neutral-400">
+                  <Spinner className="size-4" />
+                  <span>Agent is working…</span>
+                </div>
+              </MessageContent>
+            </Message>
+          ) : null}
+
           {streamError ? (
             <div className="flex items-center justify-between gap-4 rounded-xl border border-red-400/20 bg-red-400/5 px-4 py-3">
               <div className="flex min-w-0 items-center gap-2 text-sm text-red-300">
@@ -285,18 +301,22 @@ export function AgentWorkspace({
                 placeholder={
                   task?.state === "awaiting_input"
                     ? "Answer the agent…"
-                    : task
-                      ? "This task is not waiting for another turn"
-                      : agent
-                        ? `Give ${agent.name} a task…`
-                        : "Choose an agent to begin"
+                    : canFollowUp
+                      ? "Continue this conversation…"
+                      : task
+                        ? "This task cannot accept another turn"
+                        : agent
+                          ? `Give ${agent.name} a task…`
+                          : "Choose an agent to begin"
                 }
               />
             </PromptInputBody>
             <PromptInputFooter>
               <PromptInputTools>
                 <span className="px-1 text-[11px] text-neutral-600">
-                  {task?.state === "awaiting_input" ? "New run on the same thread" : "Enter to send · Shift+Enter for newline"}
+                  {task && canRespond
+                    ? "New run on the same thread"
+                    : "Enter to send · Shift+Enter for newline"}
                 </span>
               </PromptInputTools>
               <PromptInputSubmit

@@ -355,7 +355,8 @@ rollback detection is needed.
 `task.start` (task text, agent, initiator meta, detach) · `task.status` ·
 `task.events` (cursor, filter, max) · `task.attach` (replay-from-cursor then
 follow; streaming responses framed like `logs --follow`) · `task.respond`
-(resume payload → new run) · `task.cancel` · `task.list` · `task.gc` ·
+(resume payload → new run) · `task.followup` (ordinary user turn on a settled
+task's existing thread) · `task.cancel` · `task.list` · `task.gc` ·
 `inject.turn` (wake-up delivery, agentd-only, idempotent per `delivery_id`).
 Every channel opens with the §5.3 hello.
 
@@ -379,10 +380,11 @@ not file-permission gymnastics.
   (`threadId`, `runId`, messages, `forwardedProps`), streams `BaseEvent`s
   (SSE). A fresh `threadId` creates a task (and thread); a resume after
   `awaiting_input` is a new run on the same thread carrying the resume
-  payload, per AG-UI's interrupt lifecycle. `forwardedProps.task_ref`
-  attaches the run to an existing task explicitly. An unmodified AG-UI
-  `HttpAgent` works against this endpoint — that is the conformance bar, and
-  Phase 3's acceptance test.
+  payload, per AG-UI's interrupt lifecycle. For a completed or failed task,
+  the same ref starts an ordinary follow-up run on its existing thread.
+  `forwardedProps.task_ref` attaches the run to an existing task explicitly.
+  An unmodified AG-UI `HttpAgent` works against this endpoint — that is the
+  conformance bar, and Phase 3's acceptance test.
 - **Hearth task API** (extensions, not AG-UI, honestly namespaced):
   `GET /v1/agents` · `GET /v1/tasks` · `GET /v1/tasks/{task_ref}` ·
   `GET /v1/tasks/{task_ref}/events?cursor=…` (SSE: exact replay from cursor,

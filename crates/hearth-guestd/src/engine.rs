@@ -242,6 +242,33 @@ impl Engine {
         self.status(task_id)
     }
 
+    /// Continue a completed or failed task with an ordinary user turn on its
+    /// existing thread/native session. Reserving `queued` before enqueueing
+    /// prevents duplicate follow-ups and keeps a new attach from observing the
+    /// previous terminal state before the driver starts.
+    pub fn follow_up(self: &Arc<Self>, task_id: &str, text: &str) -> Result<TaskSummary> {
+        if text.trim().is_empty() {
+            bail!("request.invalid: follow-up text must not be empty");
+        }
+        let cell = self.cell(task_id)?;
+        {
+            let mut meta = cell.meta.lock().unwrap();
+            if !matches!(meta.state, TaskState::Completed | TaskState::Failed) {
+                bail!(
+                    "task.not_settled: task {task_id} is {} (follow-up requires completed or failed)",
+                    meta.state
+                );
+            }
+            meta.state = TaskState::Queued;
+            meta.updated_at = now();
+            meta.result_json = None;
+            meta.failure = None;
+            self.store.write_meta(&meta)?;
+        }
+        self.enqueue_run(task_id, json!({ "text": text }))?;
+        self.status(task_id)
+    }
+
     /// Deliver a wake-up as a new user turn on `thread_id` (§2.3, §7.2).
     /// Idempotent per `delivery_id`: a retried delivery is acknowledged
     /// without a second injection. Returns whether this was the first delivery.

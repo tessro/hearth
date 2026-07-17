@@ -21,7 +21,7 @@ use std::fmt;
 
 /// Version of the agent-plane wire protocol. Sent in every hello; a mismatch is
 /// a clean error, never a guess (the workaround #9 rule, applied from day 1).
-pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+pub const AGENT_PROTOCOL_VERSION: u32 = 2;
 
 /// Longest accepted line on any agent-plane line-JSON channel. Guests are
 /// assumed adversarial; a reader must fail a connection that exceeds this
@@ -150,6 +150,8 @@ pub enum AgentVerb {
     TaskAttach,
     #[serde(rename = "task.respond")]
     TaskRespond,
+    #[serde(rename = "task.followup")]
+    TaskFollowup,
     #[serde(rename = "task.cancel")]
     TaskCancel,
     #[serde(rename = "task.list")]
@@ -170,6 +172,7 @@ impl AgentVerb {
         AgentVerb::TaskEvents,
         AgentVerb::TaskAttach,
         AgentVerb::TaskRespond,
+        AgentVerb::TaskFollowup,
         AgentVerb::TaskCancel,
         AgentVerb::TaskList,
         AgentVerb::TaskGc,
@@ -186,6 +189,7 @@ impl AgentVerb {
             Self::TaskEvents => "task.events",
             Self::TaskAttach => "task.attach",
             Self::TaskRespond => "task.respond",
+            Self::TaskFollowup => "task.followup",
             Self::TaskCancel => "task.cancel",
             Self::TaskList => "task.list",
             Self::TaskGc => "task.gc",
@@ -294,6 +298,7 @@ mod tests {
                 | AgentVerb::TaskEvents
                 | AgentVerb::TaskAttach
                 | AgentVerb::TaskRespond
+                | AgentVerb::TaskFollowup
                 | AgentVerb::TaskCancel
                 | AgentVerb::TaskList
                 | AgentVerb::TaskGc
@@ -303,7 +308,7 @@ mod tests {
         for verb in AgentVerb::ALL {
             witness(verb);
         }
-        assert_eq!(AgentVerb::ALL.len(), 12);
+        assert_eq!(AgentVerb::ALL.len(), 13);
         let mut names: Vec<&str> = AgentVerb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();
@@ -324,7 +329,7 @@ mod tests {
     #[test]
     fn boot_report_frame_matches_spec_shape() {
         let frame: GuestFrame = serde_json::from_str(
-            r#"{"hello": {"proto": 1, "component": "guestd", "version": "0.1.0"},
+            r#"{"hello": {"proto": 2, "component": "guestd", "version": "0.1.0"},
                 "report": {"ready": true, "addrs": ["192.168.122.31/24"],
                            "hostname": "web-a",
                            "agents": [{"name": "codex", "ok": true}],

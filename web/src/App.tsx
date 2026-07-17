@@ -185,7 +185,10 @@ function App() {
 
   const submit = async (text: string) => {
     if (!selectedAgent || busy) return
-    if (selectedTask && selectedTask.state !== "awaiting_input") return
+    if (
+      selectedTask &&
+      !["awaiting_input", "completed", "failed"].includes(selectedTask.state)
+    ) return
 
     replayAbort.current?.abort()
     setStreamError(undefined)

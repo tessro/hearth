@@ -148,11 +148,10 @@ async fn a_fresh_thread_creates_a_task_and_streams_a_run() {
         ref_index < terminal_index,
         "the resumable ref must precede the terminal event"
     );
-    assert!(
-        events[terminal_index + 1..]
-            .iter()
-            .all(|event| event_type(event).is_none()),
-        "no typed event may follow the terminal event"
+    assert_eq!(
+        terminal_index + 1,
+        events.len(),
+        "the terminal event must be the final SSE datum"
     );
 }
 
@@ -195,6 +194,67 @@ async fn interrupt_then_resume_on_the_same_thread() {
         types.contains(&"RUN_STARTED".to_string()) && types.contains(&"RUN_FINISHED".to_string()),
         "the resume is a fresh run that finishes: {types:?}"
     );
+}
+
+#[tokio::test]
+async fn completed_task_accepts_an_agui_followup_on_the_same_thread() {
+    let bind = format!("127.0.0.1:{}", free_port());
+    let _h = harness(&bind).await;
+    let first = agui_post(
+        &bind,
+        "s3cret-token",
+        "worker",
+        &run_input("first turn", None),
+    )
+    .await
+    .unwrap();
+    let task_ref = task_ref_from(&first).expect("task_ref for follow-up");
+
+    let second = agui_post(
+        &bind,
+        "s3cret-token",
+        "worker",
+        &run_input("second turn", Some(&task_ref)),
+    )
+    .await
+    .unwrap();
+    let types = event_types(&second);
+    assert!(
+        types.contains(&"RUN_STARTED".to_string())
+            && types.contains(&"TEXT_MESSAGE_CONTENT".to_string())
+            && types.contains(&"RUN_FINISHED".to_string()),
+        "the follow-up is a complete streamed run: {types:?}"
+    );
+    let refreshed_ref = task_ref_from(&second).expect("refreshed task_ref after follow-up");
+
+    let (code, body, _) = http_json(
+        &bind,
+        "GET",
+        &format!("/v1/tasks/{task_ref}"),
+        Some("s3cret-token"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(body["runs"].as_array().unwrap().len(), 2);
+    let task_id = body["task_id"].clone();
+
+    // Re-minting can refresh the signed ref's expiry; identity is the durable
+    // task id behind both opaque refs, not byte equality of the tokens.
+    let (code, refreshed, _) = http_json(
+        &bind,
+        "GET",
+        &format!("/v1/tasks/{refreshed_ref}"),
+        Some("s3cret-token"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(refreshed["task_id"], task_id);
 }
 
 #[tokio::test]
