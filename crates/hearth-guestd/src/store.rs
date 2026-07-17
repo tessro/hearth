@@ -67,6 +67,7 @@ impl TaskMeta {
             task_id: self.task_id.clone(),
             thread_id: self.thread_id.clone(),
             agent: self.agent.clone(),
+            text: self.text.clone(),
             state: self.state,
             incarnation: self.incarnation.clone(),
             last_seq,

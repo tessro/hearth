@@ -289,17 +289,20 @@ async fn agui_run(
         match relay::next_attach_frame(&mut guest).await {
             Ok(Some(frame)) => {
                 let event = frame.get("event").cloned().unwrap_or(Value::Null);
-                write_sse_event(stream, &event).await?;
                 if is_run_end(&event) {
-                    // Hand the client the ref it needs to resume, then stop.
+                    // Hand the client the ref it needs to resume before the
+                    // terminal event. AG-UI requires RUN_FINISHED/RUN_ERROR
+                    // to be the final typed event in a run.
                     let ref_event = json!({
                         "type": "CUSTOM",
                         "name": "hearth.task_ref",
                         "value": { "task_ref": ref_token },
                     });
                     write_sse_event(stream, &ref_event).await?;
+                    write_sse_event(stream, &event).await?;
                     break;
                 }
+                write_sse_event(stream, &event).await?;
             }
             Ok(None) => break,
             Err(err) => {
@@ -360,6 +363,10 @@ async fn list_tasks(agentd: &Arc<Agentd>) -> Result<Value> {
                 for task in tasks {
                     let mut task = task.clone();
                     task["agent_vm"] = json!(endpoint.name);
+                    if let Some(task_id) = task.get("task_id").and_then(Value::as_str) {
+                        let task_ref = agentd.mint_ref(&endpoint.name, task_id, "ui", None);
+                        task["task_ref"] = json!(task_ref);
+                    }
                     all.push(task);
                 }
             }

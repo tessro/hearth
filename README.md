@@ -16,6 +16,18 @@ cargo test
 cargo build
 ```
 
+Web operator console (React 19 + TypeScript 7 + Vite 8.1):
+
+```sh
+devenv shell
+cd web
+pnpm install
+pnpm dev
+```
+
+See [`web/README.md`](web/README.md) for the agentd proxy, authentication, and
+production CORS setup.
+
 Install the daemon, CLI, and systemd unit; then build the dedicated guest kernel
 (vanilla kernel.org sources, no Nix) that Hearth VMs boot directly:
 

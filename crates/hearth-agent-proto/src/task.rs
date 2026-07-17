@@ -116,6 +116,9 @@ pub struct TaskSummary {
     pub task_id: String,
     pub thread_id: String,
     pub agent: String,
+    /// The initial user turn. This lets operator surfaces label and restore a
+    /// task without reconstructing input text from adapter output events.
+    pub text: String,
     pub state: TaskState,
     pub incarnation: String,
     /// Seq of the newest event, so callers can build a follow cursor.

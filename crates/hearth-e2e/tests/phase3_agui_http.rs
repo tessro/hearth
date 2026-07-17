@@ -47,20 +47,25 @@ fn run_input(text: &str, task_ref: Option<&str>) -> Value {
 fn event_types(events: &[Value]) -> Vec<String> {
     events
         .iter()
-        .filter_map(|e| {
-            e.get("type")
-                .or_else(|| e.get("event").and_then(|ev| ev.get("type")))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|e| event_type(e).map(str::to_string))
         .collect()
+}
+
+fn event_type(event: &Value) -> Option<&str> {
+    event
+        .get("type")
+        .or_else(|| event.get("event").and_then(|nested| nested.get("type")))
+        .and_then(Value::as_str)
+}
+
+fn is_task_ref_event(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("CUSTOM")
+        && event.get("name").and_then(Value::as_str) == Some("hearth.task_ref")
 }
 
 fn task_ref_from(events: &[Value]) -> Option<String> {
     events.iter().find_map(|e| {
-        if e.get("type").and_then(Value::as_str) == Some("CUSTOM")
-            && e.get("name").and_then(Value::as_str) == Some("hearth.task_ref")
-        {
+        if is_task_ref_event(e) {
             e["value"]["task_ref"].as_str().map(str::to_string)
         } else {
             None
@@ -134,6 +139,21 @@ async fn a_fresh_thread_creates_a_task_and_streams_a_run() {
         task_ref_from(&events).is_some(),
         "a resumable task_ref is emitted"
     );
+    let ref_index = events.iter().position(is_task_ref_event).unwrap();
+    let terminal_index = events
+        .iter()
+        .position(|event| matches!(event_type(event), Some("RUN_FINISHED") | Some("RUN_ERROR")))
+        .unwrap();
+    assert!(
+        ref_index < terminal_index,
+        "the resumable ref must precede the terminal event"
+    );
+    assert!(
+        events[terminal_index + 1..]
+            .iter()
+            .all(|event| event_type(event).is_none()),
+        "no typed event may follow the terminal event"
+    );
 }
 
 #[tokio::test]
@@ -201,4 +221,26 @@ async fn detach_reattach_replays_losslessly_for_two_uis() {
     assert!(types_a.contains(&"RUN_STARTED".to_string()));
     assert!(types_a.contains(&"RUN_FINISHED".to_string()));
     assert_eq!(types_a, types_b, "both UIs see the identical replay");
+}
+
+#[tokio::test]
+async fn task_list_returns_ui_refs_and_original_prompts() {
+    let bind = format!("127.0.0.1:{}", free_port());
+    let _h = harness(&bind).await;
+    let _ = agui_post(
+        &bind,
+        "s3cret-token",
+        "worker",
+        &run_input("remember this prompt", None),
+    )
+    .await
+    .unwrap();
+
+    let (code, body, _) = http_json(&bind, "GET", "/v1/tasks", Some("s3cret-token"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let task = body["tasks"].as_array().unwrap().first().unwrap();
+    assert_eq!(task["text"], "remember this prompt");
+    assert!(task["task_ref"].as_str().is_some_and(|r| !r.is_empty()));
 }
