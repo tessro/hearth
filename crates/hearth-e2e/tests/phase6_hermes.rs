@@ -61,6 +61,50 @@ async fn hermes_only_is_selected_and_its_session_resumes() {
 }
 
 #[tokio::test]
+async fn hermes_thought_is_durable_before_the_prompt_finishes() {
+    let h = Harness::start(opts()).await.unwrap();
+
+    let mut args = Map::new();
+    args.insert("agent".to_string(), json!("worker"));
+    args.insert("text".to_string(), json!("slow thought"));
+    let started = h.agent(AgentVerb::TaskStart, args).await.unwrap();
+    let task_id = started["task_id"].as_str().unwrap().to_string();
+
+    let mut guest = h.guest_connect("worker").await.unwrap();
+    let mut observed_live_thought = false;
+    for _ in 0..100 {
+        let mut args = Map::new();
+        args.insert("task_id".to_string(), json!(task_id));
+        args.insert("max".to_string(), json!(100));
+        let events = guest_verb(&mut guest, AgentVerb::TaskEvents, args)
+            .await
+            .unwrap();
+        let records = events["events"].as_array().unwrap();
+        if records.iter().any(|record| {
+            record["event"]["type"] == json!("REASONING_MESSAGE_CONTENT")
+                && record["event"]["delta"] == json!("considering the request")
+        }) {
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record["event"]["type"] != json!("RUN_FINISHED")),
+                "the thought must be observable before the terminal event"
+            );
+            observed_live_thought = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        observed_live_thought,
+        "Hermes thought chunk was buffered until run completion"
+    );
+
+    let status = wait_for_state(&h, &task_id, "completed", 1).await;
+    assert_eq!(status["result"]["summary"], json!("finished thinking"));
+}
+
+#[tokio::test]
 async fn hermes_acp_permission_interrupts_and_responds_on_the_live_prompt() {
     let h = Harness::start(opts()).await.unwrap();
 

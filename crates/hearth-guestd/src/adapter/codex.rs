@@ -12,12 +12,14 @@
 //! §2.2 requires; that refusal is what makes the pin enforceable rather than
 //! aspirational.
 
-use super::{Adapter, AdapterEvent, RunOutput};
+use super::{flush_events, Adapter, AdapterEvent, EventSink, RunOutput};
+use crate::store::new_ulid;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use hearth_agent_proto::events::AgentEvent;
 use hearth_agent_proto::read_line_capped;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -95,6 +97,7 @@ impl Adapter for CodexAdapter {
         _thread_id: &str,
         native_thread: Option<&str>,
         input: &Value,
+        events: EventSink,
     ) -> Result<RunOutput> {
         let mut server = self.spawn().await?;
         let thread_id = match native_thread {
@@ -132,10 +135,10 @@ impl Adapter for CodexAdapter {
                 .await?;
         }
 
-        let events = server.drive_turn(&thread_id).await?;
+        let terminal_events = server.drive_turn(&thread_id, &events).await?;
         server.shutdown().await;
         Ok(RunOutput {
-            events,
+            events: terminal_events,
             native_thread: Some(thread_id),
         })
     }
@@ -189,8 +192,13 @@ impl AppServer {
 
     /// Read streamed items until the turn ends: `turnComplete`, `turnFailed`,
     /// or an `execApproval` server request (which interrupts).
-    async fn drive_turn(&mut self, thread_id: &str) -> Result<Vec<AdapterEvent>> {
+    async fn drive_turn(
+        &mut self,
+        thread_id: &str,
+        events: &EventSink,
+    ) -> Result<Vec<AdapterEvent>> {
         let mut out = Vec::new();
+        let mut translated = Translation::default();
         loop {
             let msg = self.recv().await?;
             let method = msg
@@ -201,10 +209,13 @@ impl AppServer {
             match method {
                 "item" => {
                     if let Some(item) = params.get("item") {
-                        translate_item(item, &mut out);
+                        translated.update(item, &mut out);
+                        flush_events(&mut out, events)?;
                     }
                 }
                 "execApproval" => {
+                    translated.close_message(&mut out);
+                    flush_events(&mut out, events)?;
                     // Server-initiated approval → task awaiting_input. The run
                     // ends interrupted; answering starts a new run (§3.1).
                     let call = params.get("call").cloned().unwrap_or(json!({}));
@@ -224,14 +235,18 @@ impl AppServer {
                     return Ok(out);
                 }
                 "turnComplete" => {
+                    translated.close_message(&mut out);
+                    flush_events(&mut out, events)?;
                     let result = params
                         .get("result")
                         .cloned()
-                        .unwrap_or_else(|| json!({ "summary": collect_text(&out) }));
+                        .unwrap_or_else(|| json!({ "summary": translated.summary }));
                     out.push(AdapterEvent::Finished { result });
                     return Ok(out);
                 }
                 "turnFailed" => {
+                    translated.close_message(&mut out);
+                    flush_events(&mut out, events)?;
                     let message = params
                         .get("error")
                         .and_then(Value::as_str)
@@ -247,6 +262,7 @@ impl AppServer {
                         event: msg,
                         source: Some("codex".to_string()),
                     }));
+                    flush_events(&mut out, events)?;
                 }
             }
         }
@@ -259,79 +275,178 @@ impl AppServer {
     }
 }
 
-/// Translate one codex streamed item into AG-UI events (§5.1). Modelled on
-/// codex item types; extend as the pinned contract grows.
-fn translate_item(item: &Value, out: &mut Vec<AdapterEvent>) {
-    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-    match item_type {
-        "agentMessageDelta" => {
-            let message_id = item
-                .get("messageId")
-                .and_then(Value::as_str)
-                .unwrap_or("codex-msg")
-                .to_string();
-            let delta = item
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            out.push(AdapterEvent::Event(AgentEvent::TextMessageContent {
-                message_id,
-                delta: delta.to_string(),
-            }));
+struct Translation {
+    turn_id: String,
+    message_count: u64,
+    message_id: Option<String>,
+    provider_message_id: Option<String>,
+    tool_count: u64,
+    tool_ids: HashMap<String, String>,
+    summary: String,
+}
+
+impl Default for Translation {
+    fn default() -> Self {
+        Self {
+            turn_id: new_ulid(),
+            message_count: 0,
+            message_id: None,
+            provider_message_id: None,
+            tool_count: 0,
+            tool_ids: HashMap::new(),
+            summary: String::new(),
         }
-        "commandExecutionBegin" => {
-            let tool_call_id = tool_id(item);
-            out.push(AdapterEvent::Event(AgentEvent::ToolCallStart {
-                tool_call_id: tool_call_id.clone(),
-                tool_call_name: "shell".to_string(),
-                parent_message_id: None,
-            }));
-            if let Some(command) = item.get("command") {
-                out.push(AdapterEvent::Event(AgentEvent::ToolCallArgs {
-                    tool_call_id,
-                    delta: command.to_string(),
+    }
+}
+
+impl Translation {
+    /// Translate one codex streamed item into canonical AG-UI events (§5.1).
+    fn update(&mut self, item: &Value, out: &mut Vec<AdapterEvent>) {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        match item_type {
+            "agentMessageDelta" => {
+                let Some(provider_message_id) = item.get("messageId").and_then(Value::as_str)
+                else {
+                    self.raw(item, out);
+                    return;
+                };
+                let Some(delta) = item.get("delta").and_then(Value::as_str) else {
+                    self.raw(item, out);
+                    return;
+                };
+                if delta.is_empty() {
+                    return;
+                }
+                if self.provider_message_id.as_deref() != Some(provider_message_id) {
+                    self.close_message(out);
+                    let message_id =
+                        format!("codex-message-{}-{}", self.turn_id, self.message_count);
+                    self.message_count += 1;
+                    out.push(AdapterEvent::Event(AgentEvent::TextMessageStart {
+                        message_id: message_id.clone(),
+                        role: "assistant".to_string(),
+                    }));
+                    self.provider_message_id = Some(provider_message_id.to_string());
+                    self.message_id = Some(message_id);
+                }
+                self.summary.push_str(delta);
+                out.push(AdapterEvent::Event(AgentEvent::TextMessageContent {
+                    message_id: self.message_id.clone().expect("message just opened"),
+                    delta: delta.to_string(),
                 }));
             }
+            "commandExecutionBegin" => {
+                self.close_message(out);
+                let Some(provider_id) = item.get("callId").and_then(Value::as_str) else {
+                    self.raw(item, out);
+                    return;
+                };
+                let tool_call_id = format!("codex-tool-{}-{}", self.turn_id, self.tool_count);
+                self.tool_count += 1;
+                self.tool_ids
+                    .insert(provider_id.to_string(), tool_call_id.clone());
+                out.push(AdapterEvent::Event(AgentEvent::ToolCallStart {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_call_name: "shell".to_string(),
+                    parent_message_id: None,
+                }));
+                if let Some(command) = item.get("command") {
+                    out.push(AdapterEvent::Event(AgentEvent::ToolCallArgs {
+                        tool_call_id,
+                        delta: command.to_string(),
+                    }));
+                }
+            }
+            "commandExecutionEnd" => {
+                let Some(provider_id) = item.get("callId").and_then(Value::as_str) else {
+                    self.raw(item, out);
+                    return;
+                };
+                let Some(tool_call_id) = self.tool_ids.remove(provider_id) else {
+                    self.raw(item, out);
+                    return;
+                };
+                out.push(AdapterEvent::Event(AgentEvent::ToolCallEnd {
+                    tool_call_id: tool_call_id.clone(),
+                }));
+                let content = item
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                out.push(AdapterEvent::Event(AgentEvent::ToolCallResult {
+                    message_id: format!("{tool_call_id}-result"),
+                    tool_call_id,
+                    content,
+                    role: Some("tool".to_string()),
+                }));
+            }
+            _ => self.raw(item, out),
         }
-        "commandExecutionEnd" => {
-            let tool_call_id = tool_id(item);
-            out.push(AdapterEvent::Event(AgentEvent::ToolCallEnd {
-                tool_call_id: tool_call_id.clone(),
-            }));
-            let content = item
-                .get("output")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            out.push(AdapterEvent::Event(AgentEvent::ToolCallResult {
-                message_id: format!("{tool_call_id}-result"),
-                tool_call_id,
-                content,
-                role: Some("tool".to_string()),
+    }
+
+    fn close_message(&mut self, out: &mut Vec<AdapterEvent>) {
+        if let Some(message_id) = self.message_id.take() {
+            out.push(AdapterEvent::Event(AgentEvent::TextMessageEnd {
+                message_id,
             }));
         }
-        _ => {
-            out.push(AdapterEvent::Event(AgentEvent::Raw {
-                event: item.clone(),
-                source: Some("codex".to_string()),
-            }));
-        }
+        self.provider_message_id = None;
+    }
+
+    fn raw(&self, item: &Value, out: &mut Vec<AdapterEvent>) {
+        out.push(AdapterEvent::Event(AgentEvent::Raw {
+            event: item.clone(),
+            source: Some("codex".to_string()),
+        }));
     }
 }
 
-fn tool_id(item: &Value) -> String {
-    item.get("callId")
-        .and_then(Value::as_str)
-        .unwrap_or("codex-exec")
-        .to_string()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn collect_text(events: &[AdapterEvent]) -> String {
-    let mut text = String::new();
-    for event in events {
-        if let AdapterEvent::Event(AgentEvent::TextMessageContent { delta, .. }) = event {
-            text.push_str(delta);
-        }
+    #[test]
+    fn text_and_tools_are_complete_unique_agui_segments() {
+        let mut translated = Translation::default();
+        let mut out = Vec::new();
+        translated.update(
+            &json!({ "type": "agentMessageDelta", "messageId": "m", "delta": "before" }),
+            &mut out,
+        );
+        translated.update(
+            &json!({ "type": "commandExecutionBegin", "callId": "c", "command": ["true"] }),
+            &mut out,
+        );
+        translated.update(
+            &json!({ "type": "commandExecutionEnd", "callId": "c", "output": "" }),
+            &mut out,
+        );
+        translated.update(
+            &json!({ "type": "agentMessageDelta", "messageId": "m", "delta": "after" }),
+            &mut out,
+        );
+        translated.close_message(&mut out);
+
+        let starts: Vec<&str> = out
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Event(AgentEvent::TextMessageStart { message_id, .. }) => {
+                    Some(message_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(
+                    event,
+                    AdapterEvent::Event(AgentEvent::TextMessageEnd { .. })
+                ))
+                .count(),
+            2
+        );
     }
-    text
 }

@@ -184,6 +184,12 @@ retires when the telemetry above ships.
 One adapter per CLI, translating its native stream into the AG-UI event
 vocabulary (§5.1) and mapping the triad (§3.1) onto its native concepts:
 
+Ordinary message, reasoning, tool, and RAW events are appended to the durable
+task log as the native stream emits them, while the adapter run is still in
+progress. Approval and terminal transitions remain ordered after those live
+events. Attach and SSE consumers therefore render work immediately through the
+same cursor/replay path used after completion.
+
 | Adapter | Drive | Native ↔ triad mapping | Approvals |
 |---|---|---|---|
 | codex (**first**, Phase 2) | `codex app-server`: JSONL/stdio; threads, turns, streamed items, server-initiated approvals; version-matched JSON schemas | thread ↔ `thread_id`, turn ↔ `run`, streamed items → events | server-initiated approval requests → task `awaiting_input` |
@@ -447,6 +453,12 @@ event set: `RUN_STARTED/FINISHED/ERROR`, `STEP_STARTED/FINISHED`,
 `STATE_SNAPSHOT/DELTA`, `MESSAGES_SNAPSHOT`, `RAW`, `CUSTOM`. Types are
 hand-rolled in a new `hearth-agent-proto` crate (the ecosystem SDKs are
 TS/Python; the vocabulary is small and stable enough to own).
+
+At the start of every run, guestd records the textual user input as a
+`TEXT_MESSAGE_START/CONTENT/END` sequence with role `user`, before adapter
+output. Consequently the guest event log reconstructs follow-up turns as well
+as assistant/tool/reasoning output; the UI does not rely on optimistic browser
+state for conversation history.
 
 Initial conformance subset: run lifecycle, text, tool calls, `CUSTOM`.
 Hearth-specific moments ride namespaced `CUSTOM` events:

@@ -5,7 +5,8 @@
 //! task/thread/run model and AG-UI event vocabulary without parsing terminal
 //! presentation text.
 
-use super::{Adapter, AdapterEvent, RunOutput};
+use super::{flush_events, Adapter, AdapterEvent, EventSink, RunOutput};
+use crate::store::new_ulid;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use hearth_agent_proto::events::AgentEvent;
@@ -25,7 +26,7 @@ const PINNED_ACP_PROTOCOL: u64 = 1;
 
 const LINE_CAP: usize = 4 * 1024 * 1024;
 const OUTPUT_CAP: u64 = 4 * 1024 * 1024;
-const MESSAGE_ID: &str = "hermes-message";
+const REASONING_ID: &str = "hermes-reasoning";
 const DEFAULT_MCP_COMMAND: &str = "/usr/local/bin/hearth-guestd";
 
 /// Optional process identity for a CLI installed and authenticated as the
@@ -185,6 +186,7 @@ impl HermesAdapter {
         thread_id: &str,
         native_thread: Option<&str>,
         input: &Value,
+        events: &EventSink,
     ) -> Result<RunOutput> {
         let text = input_text(input)?;
         let mut server = self.spawn_acp().await?;
@@ -233,7 +235,7 @@ impl HermesAdapter {
                 }),
             )
             .await?;
-        let driven = server.drive_prompt(&session_id, &prompt_id).await;
+        let driven = server.drive_prompt(&session_id, &prompt_id, events).await;
         match driven {
             Ok(driven) => {
                 self.finish_or_park(server, session_id, prompt_id, driven)
@@ -251,6 +253,7 @@ impl HermesAdapter {
         session_id: &str,
         input: &Value,
         mut pending: PendingAcp,
+        events: &EventSink,
     ) -> Result<RunOutput> {
         let decision = match permission_decision(input, &pending.permission.options) {
             Ok(decision) => decision,
@@ -287,7 +290,7 @@ impl HermesAdapter {
             .context("answer Hermes ACP permission request")?;
         let driven = pending
             .server
-            .drive_prompt(session_id, &pending.prompt_id)
+            .drive_prompt(session_id, &pending.prompt_id, events)
             .await;
         match driven {
             Ok(driven) => {
@@ -381,15 +384,19 @@ impl Adapter for HermesAdapter {
         thread_id: &str,
         native_thread: Option<&str>,
         input: &Value,
+        events: EventSink,
     ) -> Result<RunOutput> {
         if let Some(session_id) = native_thread {
             validate_session_id(session_id)?;
             let pending = self.pending.lock().await.remove(session_id);
             if let Some(pending) = pending {
-                return self.resume_permission(session_id, input, pending).await;
+                return self
+                    .resume_permission(session_id, input, pending, &events)
+                    .await;
             }
         }
-        self.drive_new_turn(thread_id, native_thread, input).await
+        self.drive_new_turn(thread_id, native_thread, input, &events)
+            .await
     }
 }
 
@@ -462,12 +469,19 @@ impl AcpServer {
         .await
     }
 
-    async fn drive_prompt(&mut self, session_id: &str, prompt_id: &Value) -> Result<DrivenPrompt> {
+    async fn drive_prompt(
+        &mut self,
+        session_id: &str,
+        prompt_id: &Value,
+        events: &EventSink,
+    ) -> Result<DrivenPrompt> {
         let mut translated = Translation::default();
         loop {
             let message = self.recv().await?;
             if message.get("id") == Some(prompt_id) && message.get("method").is_none() {
+                translated.close_reasoning();
                 translated.close_message();
+                flush_events(&mut translated.events, events)?;
                 if let Some(error) = message.get("error") {
                     translated.events.push(AdapterEvent::Failed {
                         message: format!("Hermes ACP prompt error: {error}"),
@@ -510,7 +524,9 @@ impl AcpServer {
                     }
                 }
                 "session/request_permission" if message.get("id").is_some() => {
+                    translated.close_reasoning();
                     translated.close_message();
+                    flush_events(&mut translated.events, events)?;
                     let params = message.get("params").cloned().unwrap_or(Value::Null);
                     let options: HashSet<String> = params
                         .get("options")
@@ -553,6 +569,7 @@ impl AcpServer {
                 }
                 _ => translated.raw(message),
             }
+            flush_events(&mut translated.events, events)?;
         }
     }
 
@@ -580,12 +597,32 @@ struct DrivenPrompt {
     permission: Option<PermissionRequest>,
 }
 
-#[derive(Default)]
 struct Translation {
     events: Vec<AdapterEvent>,
-    message_open: bool,
+    turn_id: String,
+    message_id: Option<String>,
+    message_count: u64,
+    reasoning_id: Option<String>,
+    reasoning_count: u64,
+    tool_count: u64,
+    tool_ids: HashMap<String, String>,
     text: String,
-    tool_names: HashMap<String, String>,
+}
+
+impl Default for Translation {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            turn_id: new_ulid(),
+            message_id: None,
+            message_count: 0,
+            reasoning_id: None,
+            reasoning_count: 0,
+            tool_count: 0,
+            tool_ids: HashMap::new(),
+            text: String::new(),
+        }
+    }
 }
 
 impl Translation {
@@ -595,7 +632,7 @@ impl Translation {
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
-            "agent_message_chunk" => {
+            "agent_thought_chunk" => {
                 let text = update
                     .get("content")
                     .and_then(|content| content.get("text"))
@@ -604,33 +641,79 @@ impl Translation {
                 if text.is_empty() {
                     return;
                 }
-                if !self.message_open {
+                // AG-UI transcript items are chronological segments. Thought
+                // content starts a new segment rather than remaining nested
+                // inside assistant text that began before a tool/reasoning
+                // transition.
+                self.close_message();
+                let message_id = match &self.reasoning_id {
+                    Some(message_id) => message_id.clone(),
+                    None => {
+                        let message_id =
+                            format!("{REASONING_ID}-{}-{}", self.turn_id, self.reasoning_count);
+                        self.reasoning_count += 1;
+                        self.events
+                            .push(AdapterEvent::Event(AgentEvent::ReasoningStart {
+                                message_id: message_id.clone(),
+                            }));
+                        self.events
+                            .push(AdapterEvent::Event(AgentEvent::ReasoningMessageStart {
+                                message_id: message_id.clone(),
+                                role: "reasoning".to_string(),
+                            }));
+                        self.reasoning_id = Some(message_id.clone());
+                        message_id
+                    }
+                };
+                self.events
+                    .push(AdapterEvent::Event(AgentEvent::ReasoningMessageContent {
+                        message_id,
+                        delta: text.to_string(),
+                    }));
+            }
+            "agent_message_chunk" => {
+                self.close_reasoning();
+                let text = update
+                    .get("content")
+                    .and_then(|content| content.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    return;
+                }
+                if self.message_id.is_none() {
+                    let message_id =
+                        format!("hermes-message-{}-{}", self.turn_id, self.message_count);
+                    self.message_count += 1;
                     self.events
                         .push(AdapterEvent::Event(AgentEvent::TextMessageStart {
-                            message_id: MESSAGE_ID.to_string(),
+                            message_id: message_id.clone(),
                             role: "assistant".to_string(),
                         }));
-                    self.message_open = true;
+                    self.message_id = Some(message_id);
                 }
                 self.text.push_str(text);
                 self.events
                     .push(AdapterEvent::Event(AgentEvent::TextMessageContent {
-                        message_id: MESSAGE_ID.to_string(),
+                        message_id: self.message_id.clone().expect("message just opened"),
                         delta: text.to_string(),
                     }));
             }
             "tool_call" => {
-                let id = update
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("hermes-tool")
-                    .to_string();
+                self.close_reasoning();
+                self.close_message();
+                let Some(provider_id) = update.get("toolCallId").and_then(Value::as_str) else {
+                    self.raw(update.clone());
+                    return;
+                };
+                let id = format!("hermes-tool-{}-{}", self.turn_id, self.tool_count);
+                self.tool_count += 1;
+                self.tool_ids.insert(provider_id.to_string(), id.clone());
                 let title = update
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("hermes tool")
                     .to_string();
-                self.tool_names.insert(id.clone(), title.clone());
                 self.events
                     .push(AdapterEvent::Event(AgentEvent::ToolCallStart {
                         tool_call_id: id.clone(),
@@ -646,13 +729,16 @@ impl Translation {
                 }
             }
             "tool_call_update" => {
-                let id = update
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("hermes-tool")
-                    .to_string();
+                let Some(provider_id) = update.get("toolCallId").and_then(Value::as_str) else {
+                    self.raw(update.clone());
+                    return;
+                };
                 let status = update.get("status").and_then(Value::as_str);
                 if matches!(status, Some("completed" | "failed")) {
+                    let Some(id) = self.tool_ids.remove(provider_id) else {
+                        self.raw(update.clone());
+                        return;
+                    };
                     self.events
                         .push(AdapterEvent::Event(AgentEvent::ToolCallEnd {
                             tool_call_id: id.clone(),
@@ -667,24 +753,33 @@ impl Translation {
                                 role: Some("tool".to_string()),
                             }));
                     }
-                    self.tool_names.remove(&id);
                 } else {
                     self.raw(update.clone());
                 }
             }
-            // AG-UI has no standard thought/plan/usage/session-info event that
-            // preserves ACP's full shape. Keep those losslessly as RAW.
+            // AG-UI reasoning events cover thought chunks. Preserve other ACP
+            // plan/usage/session-info updates losslessly as RAW.
             _ => self.raw(update.clone()),
         }
     }
 
+    fn close_reasoning(&mut self) {
+        if let Some(message_id) = self.reasoning_id.take() {
+            self.events
+                .push(AdapterEvent::Event(AgentEvent::ReasoningMessageEnd {
+                    message_id: message_id.clone(),
+                }));
+            self.events
+                .push(AdapterEvent::Event(AgentEvent::ReasoningEnd { message_id }));
+        }
+    }
+
     fn close_message(&mut self) {
-        if self.message_open {
+        if let Some(message_id) = self.message_id.take() {
             self.events
                 .push(AdapterEvent::Event(AgentEvent::TextMessageEnd {
-                    message_id: MESSAGE_ID.to_string(),
+                    message_id,
                 }));
-            self.message_open = false;
         }
     }
 
@@ -835,6 +930,113 @@ mod tests {
             event,
             AdapterEvent::Event(AgentEvent::ToolCallResult { content, .. }) if content == "hi"
         )));
+    }
+
+    #[test]
+    fn assistant_text_is_segmented_around_tools_in_wire_order() {
+        let mut translated = Translation::default();
+        translated.update(&json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "Let me look." },
+        }));
+        translated.update(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "web search",
+            "rawInput": { "query": "weather" },
+        }));
+        translated.update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "status": "completed",
+            "content": [{
+                "type": "content",
+                "content": { "type": "text", "text": "sunny" }
+            }],
+        }));
+        translated.update(&json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "It is sunny." },
+        }));
+        translated.close_message();
+
+        let types: Vec<&str> = translated
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Event(AgentEvent::TextMessageStart { .. }) => Some("text-start"),
+                AdapterEvent::Event(AgentEvent::TextMessageContent { .. }) => Some("text"),
+                AdapterEvent::Event(AgentEvent::TextMessageEnd { .. }) => Some("text-end"),
+                AdapterEvent::Event(AgentEvent::ToolCallStart { .. }) => Some("tool-start"),
+                AdapterEvent::Event(AgentEvent::ToolCallArgs { .. }) => Some("tool-args"),
+                AdapterEvent::Event(AgentEvent::ToolCallEnd { .. }) => Some("tool-end"),
+                AdapterEvent::Event(AgentEvent::ToolCallResult { .. }) => Some("tool-result"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "text-start",
+                "text",
+                "text-end",
+                "tool-start",
+                "tool-args",
+                "tool-end",
+                "tool-result",
+                "text-start",
+                "text",
+                "text-end",
+            ]
+        );
+
+        let message_ids: Vec<&str> = translated
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Event(AgentEvent::TextMessageStart { message_id, .. }) => {
+                    Some(message_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(message_ids.len(), 2);
+        assert_ne!(message_ids[0], message_ids[1]);
+    }
+
+    #[test]
+    fn translates_acp_thought_chunks_to_agui_reasoning() {
+        let mut translated = Translation::default();
+        translated.update(&json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": { "type": "text", "text": "CON" },
+        }));
+        translated.update(&json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": { "type": "text", "text": "SIDER" },
+        }));
+        translated.close_reasoning();
+
+        assert!(matches!(
+            translated.events.first(),
+            Some(AdapterEvent::Event(AgentEvent::ReasoningStart { .. }))
+        ));
+        assert_eq!(
+            translated
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    AdapterEvent::Event(AgentEvent::ReasoningMessageContent { delta, .. }) =>
+                        Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "CONSIDER"
+        );
+        assert!(matches!(
+            translated.events.last(),
+            Some(AdapterEvent::Event(AgentEvent::ReasoningEnd { .. }))
+        ));
     }
 
     #[test]

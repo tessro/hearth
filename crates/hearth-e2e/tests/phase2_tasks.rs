@@ -55,9 +55,8 @@ async fn start_streams_events_and_completes() {
     let events = guest_verb(&mut stream, AgentVerb::TaskEvents, args)
         .await
         .unwrap();
-    let types: Vec<String> = events["events"]
-        .as_array()
-        .unwrap()
+    let records = events["events"].as_array().unwrap();
+    let types: Vec<String> = records
         .iter()
         .filter_map(|e| e["event"]["type"].as_str().map(str::to_string))
         .collect();
@@ -66,6 +65,47 @@ async fn start_streams_events_and_completes() {
     assert!(types.contains(&"TOOL_CALL_START".to_string()));
     assert!(types.contains(&"TOOL_CALL_RESULT".to_string()));
     assert!(types.contains(&"RUN_FINISHED".to_string()));
+
+    let user_events: Vec<&Value> = records
+        .iter()
+        .map(|record| &record["event"])
+        .filter(|event| {
+            event["messageId"]
+                .as_str()
+                .is_some_and(|id| id == format!("prompt-{task_id}"))
+        })
+        .collect();
+    assert_eq!(
+        user_events
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_CONTENT",
+            "TEXT_MESSAGE_END"
+        ]
+    );
+    assert_eq!(user_events[0]["role"], json!("user"));
+    assert_eq!(user_events[1]["delta"], json!("hello world"));
+    let user_end = records
+        .iter()
+        .position(|record| record["event"] == *user_events[2])
+        .unwrap();
+    let first_adapter_event = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record["event"]["type"].as_str(),
+                Some("TOOL_CALL_START" | "REASONING_MESSAGE_START")
+            ) || (record["event"]["type"] == json!("TEXT_MESSAGE_START")
+                && record["event"]["role"] == json!("assistant"))
+        })
+        .unwrap();
+    assert!(
+        user_end < first_adapter_event,
+        "user turn must precede adapter output"
+    );
 }
 
 #[tokio::test]
@@ -122,6 +162,29 @@ async fn completed_task_accepts_one_followup_on_the_same_thread() {
     let after = task_status(&mut stream, &task_id).await;
     assert_eq!(after["thread_id"], json!(thread_id));
     assert_eq!(after["runs"].as_array().unwrap().len(), 2);
+
+    // Both user turns are first-class durable AG-UI messages, so replaying the
+    // task reconstructs more than just the initial TaskSummary text.
+    let mut args = Map::new();
+    args.insert("task_id".to_string(), json!(task_id));
+    args.insert("max".to_string(), json!(100));
+    let events = guest_verb(&mut stream, AgentVerb::TaskEvents, args)
+        .await
+        .unwrap();
+    let user_deltas: Vec<&str> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| &record["event"])
+        .filter(|event| event["type"] == json!("TEXT_MESSAGE_CONTENT"))
+        .filter(|event| {
+            event["messageId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("prompt-"))
+        })
+        .filter_map(|event| event["delta"].as_str())
+        .collect();
+    assert_eq!(user_deltas, vec!["first turn", "second turn"]);
 
     // The state reservation rejects a second concurrent/retried follow-up
     // after the first has claimed the task, whether it is still queued/running

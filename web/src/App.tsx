@@ -149,7 +149,7 @@ function App() {
       const controller = new AbortController()
       replayAbort.current = controller
       setStreamError(undefined)
-      setTimeline(task.text ? [{ kind: "user", id: `prompt-${task.task_id}`, text: task.text }] : [])
+      setTimeline([])
 
       void streamTaskEvents(
         settings,
@@ -198,7 +198,6 @@ function App() {
 
     try {
       const userId = randomUUID()
-      setTimeline((current) => [...current, { kind: "user", id: userId, text }])
 
       let returnedTaskRef: string | undefined
       const taskRef = selectedTask?.task_ref

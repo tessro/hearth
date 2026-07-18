@@ -40,6 +40,16 @@ pub enum AgentEvent {
     TextMessageContent { message_id: String, delta: String },
     #[serde(rename = "TEXT_MESSAGE_END", rename_all = "camelCase")]
     TextMessageEnd { message_id: String },
+    #[serde(rename = "REASONING_START", rename_all = "camelCase")]
+    ReasoningStart { message_id: String },
+    #[serde(rename = "REASONING_MESSAGE_START", rename_all = "camelCase")]
+    ReasoningMessageStart { message_id: String, role: String },
+    #[serde(rename = "REASONING_MESSAGE_CONTENT", rename_all = "camelCase")]
+    ReasoningMessageContent { message_id: String, delta: String },
+    #[serde(rename = "REASONING_MESSAGE_END", rename_all = "camelCase")]
+    ReasoningMessageEnd { message_id: String },
+    #[serde(rename = "REASONING_END", rename_all = "camelCase")]
+    ReasoningEnd { message_id: String },
     #[serde(rename = "TOOL_CALL_START", rename_all = "camelCase")]
     ToolCallStart {
         tool_call_id: String,
@@ -119,6 +129,15 @@ mod tests {
         assert_eq!(wire["toolCallId"], "t1");
         assert_eq!(wire["toolCallName"], "shell");
         assert!(wire.get("parentMessageId").is_none());
+
+        let event = AgentEvent::ReasoningMessageContent {
+            message_id: "r1".into(),
+            delta: "considering".into(),
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "REASONING_MESSAGE_CONTENT");
+        assert_eq!(wire["messageId"], "r1");
+        assert_eq!(wire["delta"], "considering");
     }
 
     #[test]

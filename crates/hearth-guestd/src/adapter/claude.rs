@@ -8,7 +8,8 @@
 //! before shipping — see docs/agent-plane-verification.md. The adapter refuses
 //! a CLI version it does not pin (§2.2).
 
-use super::{Adapter, AdapterEvent, RunOutput};
+use super::{flush_events, Adapter, AdapterEvent, EventSink, RunOutput};
+use crate::store::new_ulid;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use hearth_agent_proto::events::AgentEvent;
@@ -68,6 +69,7 @@ impl Adapter for ClaudeAdapter {
         _thread_id: &str,
         native_thread: Option<&str>,
         input: &Value,
+        event_sink: EventSink,
     ) -> Result<RunOutput> {
         let text = input
             .get("text")
@@ -105,7 +107,7 @@ impl Adapter for ClaudeAdapter {
         stdin.shutdown().await?;
         drop(stdin);
 
-        let mut events = Vec::new();
+        let mut translated = Translation::default();
         let mut session_id = native_thread.map(str::to_string);
         loop {
             let Some(line) = read_line_capped(&mut reader, LINE_CAP).await? else {
@@ -118,15 +120,19 @@ impl Adapter for ClaudeAdapter {
                 Ok(msg) => msg,
                 Err(_) => continue,
             };
-            match translate(&msg, &mut session_id, &mut events) {
+            let flow = translated.update(&msg, &mut session_id);
+            flush_events(&mut translated.events, &event_sink)?;
+            match flow {
                 Flow::Continue => {}
                 Flow::Stop => break,
             }
         }
+        translated.close_message();
+        flush_events(&mut translated.events, &event_sink)?;
         let _ = child.start_kill();
         let _ = child.wait().await;
         Ok(RunOutput {
-            events,
+            events: translated.events,
             native_thread: session_id,
         })
     }
@@ -137,105 +143,205 @@ enum Flow {
     Stop,
 }
 
-fn translate(msg: &Value, session_id: &mut Option<String>, out: &mut Vec<AdapterEvent>) -> Flow {
-    let kind = msg.get("type").and_then(Value::as_str).unwrap_or_default();
-    match kind {
-        "system" => {
-            if msg.get("subtype").and_then(Value::as_str) == Some("init") {
-                if let Some(id) = msg.get("session_id").and_then(Value::as_str) {
-                    *session_id = Some(id.to_string());
-                }
-            }
-            Flow::Continue
+struct Translation {
+    events: Vec<AdapterEvent>,
+    turn_id: String,
+    message_id: Option<String>,
+    message_count: u64,
+    tool_count: u64,
+}
+
+impl Default for Translation {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            turn_id: new_ulid(),
+            message_id: None,
+            message_count: 0,
+            tool_count: 0,
         }
-        "assistant" => {
-            let content = msg
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_array);
-            if let Some(blocks) = content {
-                for block in blocks {
-                    match block.get("type").and_then(Value::as_str) {
-                        Some("text") => {
-                            let delta = block
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            out.push(AdapterEvent::Event(AgentEvent::TextMessageContent {
-                                message_id: "claude-msg".to_string(),
-                                delta: delta.to_string(),
-                            }));
-                        }
-                        Some("tool_use") => {
-                            let id = block
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("claude-tool")
-                                .to_string();
-                            let name = block
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("tool")
-                                .to_string();
-                            out.push(AdapterEvent::Event(AgentEvent::ToolCallStart {
-                                tool_call_id: id.clone(),
-                                tool_call_name: name,
-                                parent_message_id: None,
-                            }));
-                            if let Some(args) = block.get("input") {
-                                out.push(AdapterEvent::Event(AgentEvent::ToolCallArgs {
-                                    tool_call_id: id.clone(),
-                                    delta: args.to_string(),
-                                }));
-                            }
-                            out.push(AdapterEvent::Event(AgentEvent::ToolCallEnd {
-                                tool_call_id: id,
-                            }));
-                        }
-                        _ => {}
+    }
+}
+
+impl Translation {
+    fn update(&mut self, msg: &Value, session_id: &mut Option<String>) -> Flow {
+        let kind = msg.get("type").and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            "system" => {
+                if msg.get("subtype").and_then(Value::as_str) == Some("init") {
+                    if let Some(id) = msg.get("session_id").and_then(Value::as_str) {
+                        *session_id = Some(id.to_string());
                     }
                 }
+                Flow::Continue
             }
-            Flow::Continue
-        }
-        // The MCP permission-prompt hook surfaces as a control request →
-        // task awaiting_input (the run ends interrupted, §3.1).
-        "control_request" | "permission_request" => {
-            let prompt = msg
-                .get("request")
-                .cloned()
-                .or_else(|| msg.get("permission").cloned())
-                .unwrap_or_else(|| json!({ "kind": "permission", "raw": msg }));
-            out.push(AdapterEvent::AwaitingInput {
-                prompt: json!({ "kind": "permission", "request": prompt }),
-            });
-            Flow::Stop
-        }
-        "result" => {
-            match msg.get("subtype").and_then(Value::as_str) {
-                Some("success") | None => {
-                    let result = msg
-                        .get("result")
-                        .cloned()
-                        .unwrap_or_else(|| json!({ "summary": "" }));
-                    out.push(AdapterEvent::Finished {
-                        result: json!({ "summary": result }),
-                    });
+            "assistant" => {
+                let content = msg
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array);
+                if let Some(blocks) = content {
+                    for block in blocks {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                let delta = block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                self.text(delta);
+                            }
+                            Some("tool_use") => {
+                                self.close_message();
+                                let id =
+                                    format!("claude-tool-{}-{}", self.turn_id, self.tool_count);
+                                self.tool_count += 1;
+                                let name = block
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool")
+                                    .to_string();
+                                self.events
+                                    .push(AdapterEvent::Event(AgentEvent::ToolCallStart {
+                                        tool_call_id: id.clone(),
+                                        tool_call_name: name,
+                                        parent_message_id: None,
+                                    }));
+                                if let Some(args) = block.get("input") {
+                                    self.events.push(AdapterEvent::Event(
+                                        AgentEvent::ToolCallArgs {
+                                            tool_call_id: id.clone(),
+                                            delta: args.to_string(),
+                                        },
+                                    ));
+                                }
+                                self.events
+                                    .push(AdapterEvent::Event(AgentEvent::ToolCallEnd {
+                                        tool_call_id: id,
+                                    }));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                Some(other) => {
-                    out.push(AdapterEvent::Failed {
-                        message: format!("claude result {other}"),
-                    });
-                }
+                self.close_message();
+                Flow::Continue
             }
-            Flow::Stop
+            // The MCP permission-prompt hook surfaces as a control request →
+            // task awaiting_input (the run ends interrupted, §3.1).
+            "control_request" | "permission_request" => {
+                self.close_message();
+                let prompt = msg
+                    .get("request")
+                    .cloned()
+                    .or_else(|| msg.get("permission").cloned())
+                    .unwrap_or_else(|| json!({ "kind": "permission", "raw": msg }));
+                self.events.push(AdapterEvent::AwaitingInput {
+                    prompt: json!({ "kind": "permission", "request": prompt }),
+                });
+                Flow::Stop
+            }
+            "result" => {
+                self.close_message();
+                match msg.get("subtype").and_then(Value::as_str) {
+                    Some("success") | None => {
+                        let result = msg
+                            .get("result")
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "summary": "" }));
+                        self.events.push(AdapterEvent::Finished {
+                            result: json!({ "summary": result }),
+                        });
+                    }
+                    Some(other) => {
+                        self.events.push(AdapterEvent::Failed {
+                            message: format!("claude result {other}"),
+                        });
+                    }
+                }
+                Flow::Stop
+            }
+            _ => {
+                self.events.push(AdapterEvent::Event(AgentEvent::Raw {
+                    event: msg.clone(),
+                    source: Some("claude".to_string()),
+                }));
+                Flow::Continue
+            }
         }
-        _ => {
-            out.push(AdapterEvent::Event(AgentEvent::Raw {
-                event: msg.clone(),
-                source: Some("claude".to_string()),
+    }
+
+    fn text(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.message_id.is_none() {
+            let message_id = format!("claude-message-{}-{}", self.turn_id, self.message_count);
+            self.message_count += 1;
+            self.events
+                .push(AdapterEvent::Event(AgentEvent::TextMessageStart {
+                    message_id: message_id.clone(),
+                    role: "assistant".to_string(),
+                }));
+            self.message_id = Some(message_id);
+        }
+        self.events
+            .push(AdapterEvent::Event(AgentEvent::TextMessageContent {
+                message_id: self.message_id.clone().expect("message just opened"),
+                delta: delta.to_string(),
             }));
-            Flow::Continue
+    }
+
+    fn close_message(&mut self) {
+        if let Some(message_id) = self.message_id.take() {
+            self.events
+                .push(AdapterEvent::Event(AgentEvent::TextMessageEnd {
+                    message_id,
+                }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_and_tools_are_complete_unique_agui_segments() {
+        let mut translated = Translation::default();
+        let mut session = None;
+        translated.update(
+            &json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "text", "text": "before" },
+                    { "type": "tool_use", "name": "Bash", "input": { "command": "true" } },
+                    { "type": "text", "text": "after" }
+                ] }
+            }),
+            &mut session,
+        );
+        let starts: Vec<&str> = translated
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Event(AgentEvent::TextMessageStart { message_id, .. }) => {
+                    Some(message_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        assert_eq!(
+            translated
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AdapterEvent::Event(AgentEvent::TextMessageEnd { .. })
+                ))
+                .count(),
+            2
+        );
     }
 }

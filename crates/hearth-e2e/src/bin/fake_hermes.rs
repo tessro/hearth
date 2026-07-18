@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 const SESSION_ID: &str = "fe9e3089-ccac-4609-b717-47f82bf41f81";
 
@@ -64,7 +65,11 @@ fn main() {
                 let text = message["params"]["prompt"][0]["text"]
                     .as_str()
                     .unwrap_or_default();
-                if text.contains("approval") {
+                if text.contains("slow thought") {
+                    thought_chunk(&mut output, SESSION_ID, "considering the request");
+                    std::thread::sleep(Duration::from_millis(500));
+                    message_chunk(&mut output, SESSION_ID, "finished thinking");
+                } else if text.contains("approval") {
                     permission(&mut output, SESSION_ID);
                     let response: Value =
                         serde_json::from_str(&input.next().unwrap().unwrap()).unwrap();
@@ -137,6 +142,17 @@ fn message_chunk(output: &mut impl Write, session_id: &str, text: &str) {
         session_id,
         json!({
             "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text },
+        }),
+    );
+}
+
+fn thought_chunk(output: &mut impl Write, session_id: &str, text: &str) {
+    update(
+        output,
+        session_id,
+        json!({
+            "sessionUpdate": "agent_thought_chunk",
             "content": { "type": "text", "text": text },
         }),
     );

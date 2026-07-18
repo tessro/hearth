@@ -7,7 +7,7 @@
 //! draining it; you cannot inject into a running turn, so wake-ups and
 //! responses queue until the current run ends and then enter as new runs.
 
-use crate::adapter::{Adapter, AdapterEvent};
+use crate::adapter::{Adapter, AdapterEvent, EventSink};
 use crate::store::{fail_meta, make_cursor, new_ulid, now, resolve_cursor, Store, TaskMeta};
 use anyhow::{anyhow, bail, Result};
 use hearth_agent_proto::events::AgentEvent;
@@ -516,7 +516,12 @@ impl Engine {
         input: Value,
     ) -> Result<()> {
         let run_id = new_ulid();
-        let (agent, native_thread, thread_id) = {
+        let user_text = input
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string);
+        let (agent, native_thread, thread_id, user_message_id) = {
             let mut meta = cell.meta.lock().unwrap();
             // A cancel is a hard stop: never resurrect a canceled task, even if
             // a turn was popped just before `cancel` cleared the queue. Other
@@ -528,6 +533,11 @@ impl Engine {
             }
             meta.state = TaskState::Running;
             meta.updated_at = now();
+            let user_message_id = if meta.runs.is_empty() {
+                format!("prompt-{task_id}")
+            } else {
+                format!("prompt-{run_id}")
+            };
             meta.runs.push(RunRecord {
                 run_id: run_id.clone(),
                 outcome: None,
@@ -539,6 +549,7 @@ impl Engine {
                 meta.agent.clone(),
                 meta.native_thread.clone(),
                 meta.thread_id.clone(),
+                user_message_id,
             )
         };
         self.append(
@@ -550,6 +561,37 @@ impl Engine {
             },
         )
         .await?;
+        // User turns are part of the durable AG-UI transcript, not UI-local
+        // optimistic state. Persist them before any adapter output so a replay
+        // after navigating away reconstructs the conversation in wire order.
+        if let Some(text) = user_text {
+            self.append(
+                cell,
+                &run_id,
+                AgentEvent::TextMessageStart {
+                    message_id: user_message_id.clone(),
+                    role: "user".to_string(),
+                },
+            )
+            .await?;
+            self.append(
+                cell,
+                &run_id,
+                AgentEvent::TextMessageContent {
+                    message_id: user_message_id.clone(),
+                    delta: text,
+                },
+            )
+            .await?;
+            self.append(
+                cell,
+                &run_id,
+                AgentEvent::TextMessageEnd {
+                    message_id: user_message_id,
+                },
+            )
+            .await?;
+        }
         self.publish(cell, TaskState::Running).await;
         // The run is now durable in the event log: a wake-up's inbox entry can
         // be released. (A crash before this point leaves the entry for recover.)
@@ -564,9 +606,29 @@ impl Engine {
         // Wake-ups carry provenance-framed text; other inputs are task text or
         // a resume payload the adapter interprets natively.
         let adapter_input = input.clone();
-        let output = adapter
-            .run(&thread_id, native_thread.as_deref(), &adapter_input)
-            .await;
+        let (event_sink, mut live_events) = EventSink::channel();
+        let persist_events = async {
+            while let Some(event) = live_events.recv().await {
+                // Cancellation may finalize the task while the native CLI is
+                // still winding down. Drain and discard its remaining events
+                // so the adapter can exit without resurrecting the task.
+                if cell.meta.lock().unwrap().state.is_terminal() {
+                    continue;
+                }
+                self.append(cell, &run_id, event).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let (output, persisted) = tokio::join!(
+            adapter.run(
+                &thread_id,
+                native_thread.as_deref(),
+                &adapter_input,
+                event_sink,
+            ),
+            persist_events,
+        );
+        persisted?;
         let output = match output {
             Ok(output) => output,
             Err(err) => {

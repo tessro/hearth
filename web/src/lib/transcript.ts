@@ -1,8 +1,6 @@
 import type { HearthEvent } from "@/lib/hearth-api"
 
-export type TimelineItem =
-  | { kind: "user"; id: string; text: string }
-  | { kind: "event"; id: string; event: HearthEvent }
+export type TimelineItem = { kind: "event"; id: string; event: HearthEvent }
 
 export type TranscriptEntry =
   | {
@@ -29,18 +27,6 @@ const stringField = (event: HearthEvent, key: string) => {
   return typeof value === "string" ? value : ""
 }
 
-const rawThought = (event: HearthEvent) => {
-  if (event.type !== "RAW" || !event.event || typeof event.event !== "object") {
-    return undefined
-  }
-  const raw = event.event as Record<string, unknown>
-  if (raw.sessionUpdate !== "agent_thought_chunk") return undefined
-  const content = raw.content
-  if (!content || typeof content !== "object") return undefined
-  const text = (content as Record<string, unknown>).text
-  return typeof text === "string" ? text : undefined
-}
-
 export const buildTranscript = (timeline: TimelineItem[]) => {
   const entries: TranscriptEntry[] = []
   const messages = new Map<string, Extract<TranscriptEntry, { kind: "message" }>>()
@@ -50,30 +36,21 @@ export const buildTranscript = (timeline: TimelineItem[]) => {
     if (reasoning) reasoning.streaming = false
     reasoning = undefined
   }
+  const finishMessages = () => {
+    for (const message of messages.values()) message.streaming = false
+  }
 
   for (const item of timeline) {
-    if (item.kind === "user") {
-      const entry: TranscriptEntry = {
-        kind: "message",
-        id: item.id,
-        role: "user",
-        content: item.text,
-        streaming: false,
-      }
-      entries.push(entry)
-      finishReasoning()
-      continue
-    }
-
     const event = item.event
     const messageId = stringField(event, "messageId")
     const toolCallId = stringField(event, "toolCallId")
 
     switch (event.type) {
       case "TEXT_MESSAGE_START": {
+        if (!messageId) break
         const entry: Extract<TranscriptEntry, { kind: "message" }> = {
           kind: "message",
-          id: messageId || item.id,
+          id: messageId,
           role: stringField(event, "role") === "user" ? "user" : "assistant",
           content: "",
           streaming: true,
@@ -84,19 +61,8 @@ export const buildTranscript = (timeline: TimelineItem[]) => {
         break
       }
       case "TEXT_MESSAGE_CONTENT": {
-        let entry = messages.get(messageId)
-        if (!entry) {
-          entry = {
-            kind: "message",
-            id: messageId || item.id,
-            role: "assistant",
-            content: "",
-            streaming: true,
-          }
-          messages.set(entry.id, entry)
-          entries.push(entry)
-        }
-        entry.content += stringField(event, "delta")
+        const entry = messages.get(messageId)
+        if (entry) entry.content += stringField(event, "delta")
         finishReasoning()
         break
       }
@@ -105,11 +71,40 @@ export const buildTranscript = (timeline: TimelineItem[]) => {
         if (entry) entry.streaming = false
         break
       }
+      case "REASONING_START": {
+        break
+      }
+      case "REASONING_MESSAGE_START": {
+        if (!messageId) break
+        finishReasoning()
+        reasoning = {
+          kind: "reasoning",
+          id: messageId,
+          content: "",
+          streaming: true,
+        }
+        entries.push(reasoning)
+        break
+      }
+      case "REASONING_MESSAGE_CONTENT": {
+        if (reasoning?.id === messageId) reasoning.content += stringField(event, "delta")
+        break
+      }
+      case "REASONING_MESSAGE_END": {
+        if (reasoning?.id === messageId) finishReasoning()
+        break
+      }
+      case "REASONING_END": {
+        finishReasoning()
+        break
+      }
       case "TOOL_CALL_START": {
+        const toolCallName = stringField(event, "toolCallName")
+        if (!toolCallId || !toolCallName) break
         const entry: Extract<TranscriptEntry, { kind: "tool" }> = {
           kind: "tool",
-          id: toolCallId || item.id,
-          name: stringField(event, "toolCallName") || "tool",
+          id: toolCallId,
+          name: toolCallName,
           input: "",
           state: "input-streaming",
         }
@@ -129,20 +124,11 @@ export const buildTranscript = (timeline: TimelineItem[]) => {
         break
       }
       case "TOOL_CALL_RESULT": {
-        let entry = tools.get(toolCallId)
-        if (!entry) {
-          entry = {
-            kind: "tool",
-            id: toolCallId || item.id,
-            name: "tool",
-            input: "",
-            state: "output-available",
-          }
-          tools.set(entry.id, entry)
-          entries.push(entry)
+        const entry = tools.get(toolCallId)
+        if (entry) {
+          entry.output = stringField(event, "content")
+          entry.state = "output-available"
         }
-        entry.output = stringField(event, "content")
-        entry.state = "output-available"
         finishReasoning()
         break
       }
@@ -163,25 +149,17 @@ export const buildTranscript = (timeline: TimelineItem[]) => {
           id: item.id,
           message: stringField(event, "message") || "The run failed",
         })
+        finishMessages()
+        finishReasoning()
+        break
+      }
+      case "RUN_FINISHED": {
+        finishMessages()
         finishReasoning()
         break
       }
       default: {
-        const thought = rawThought(event)
-        if (thought) {
-          if (!reasoning) {
-            reasoning = {
-              kind: "reasoning",
-              id: item.id,
-              content: "",
-              streaming: true,
-            }
-            entries.push(reasoning)
-          }
-          reasoning.content += thought
-        } else if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
-          finishReasoning()
-        }
+        break
       }
     }
   }
