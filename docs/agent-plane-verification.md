@@ -1,7 +1,7 @@
 # Agent Plane — Verification Report
 
 Status: **implemented and self-verified, including a live KVM guest**
-(2026-07-16). Companion to
+(2026-07-18). Companion to
 `docs/agent-plane.md`. Records what the acceptance tests actually exercise, and
 — honestly — what they cannot, plus how a future session could close each gap.
 
@@ -35,7 +35,7 @@ verb policy, socket broker, `wait`/`agent-endpoints` verbs, guest telemetry in
 
 ## Verified here (automated, on production code paths)
 
-Run: `cargo test --release` (235 tests) and
+Run: `devenv shell -- make check` (259 tests, plus one opt-in web-SDK test) and
 `cargo clippy --release --all-targets -- -D warnings` (clean).
 Before invoking the top-level live binaries, run `cargo build --release --bin
 hearth-agentd --bin hearthctl`: Cargo's test command refreshes test harnesses
@@ -53,7 +53,7 @@ the VM boot itself and the real CLIs:
 | 0 | `phase0_transport_auth.rs` | Agent-in-charge verb channel over the hybrid `<vm>.sock_1024`; broker verbs refused on the guest channel; per-UID policy allows the allowlist and denies `destroy`; `agent-endpoints` lists only agent VMs; guestd rejects a missing or version-skewed port-1027 hello. **The full broker path (hearthd binds/​connects, `SCM_RIGHTS`-passes the fd, agentd adopts it) is real.** |
 | 1 | `phase1_readiness.rs` | `wait` resolves on the guestd boot report with no marker; `status` surfaces guestd version, agents, `last_seen`; unknown service errors cleanly instead of hanging. |
 | 2 | `phase2_tasks.rs` | Start → stream (durable user/assistant text and tool-call AG-UI events) → complete; follow-up user turns survive replay; approval **interrupt → new run on the same thread** with both run outcomes recorded; cancel; **cursor staleness by incarnation**. |
-| 3 | `phase3_agui_http.rs` | Real HTTP/SSE: task → interrupt → resume and completed-task follow-up via `forwardedProps.task_ref`; lossless replay to two independent UIs; bearer auth required end-to-end; CORS origin echoed. |
+| 3 | `phase3_agui_http.rs` | Real HTTP/SSE: task → interrupt → resume and completed-task follow-up via `forwardedProps.task_ref`; lossless replay to two independent UIs; bearer auth required end-to-end; CORS origin echoed. The opt-in `make agui-conformance` test drives the same endpoint with the pinned, unmodified TypeScript `HttpAgent`. |
 | 4 | `phase4_delegation.rs` | Delegate over MCP; **crash agentd while the callee is `awaiting_input`**; restart; initiator woken **exactly once** (dedup by `delivery_id`); respond; collect result; grant + rejection both ledgered. |
 | 5 | `phase5_claude.rs` | The claude adapter registered alongside codex; stream + complete; permission prompt → `awaiting_input` → resume, on the same engine and traces as codex. |
 | 6 | `phase6_hermes.rs` | A Hermes-only guest advertises only Hermes; agentd selects its first healthy boot-reported adapter; ACP v1 message/tool/thought updates map to AG-UI and a deliberately slow `REASONING_MESSAGE_CONTENT` is durable before `RUN_FINISHED`; `session/new` receives the per-thread Hearth MCP shim; a wake-up uses `session/load`; a server-initiated ACP permission request becomes `awaiting_input` and `task.respond` answers it on the still-live prompt. |
@@ -218,31 +218,20 @@ access would let a future session prove it.
    restart from that GUI, then define the task transition (expiry/failure versus
    a future persistent Runs API) before promising indefinite offline approvals.
 
-4. **Unmodified AG-UI `HttpAgent` conformance.** Phase 3 drives the endpoint
-   with a raw HTTP/SSE client that mirrors what `HttpAgent` does on the wire,
-   not the TypeScript SDK itself.
-   *To verify:* a Node environment with `@ag-ui/client`; point a real
-   `HttpAgent` at `POST /v1/agents/<name>/agui` with the bearer token and assert
-   it drives a run, an interrupt, and a resume. The event field casing
-   (`SCREAMING_SNAKE` type, camelCase fields) is already the AG-UI shape
-   (`crates/hearth-agent-proto/src/events.rs`), so this is a conformance check,
-   not new development.
+4. **Live systemd hardening + `LoadCredential`.** The checked-in unit no longer
+   shares hearthd's runtime directory: it owns `/run/hearth-agentd`, runs with
+   primary group `hearth`, and creates its control socket as
+   `0660 hearth-agent:hearth`. The install path also supplies an explicit
+   user-matched verb policy, which takes priority over the broad `hearth` group
+   rule and limits agentd to broker/discovery verbs. Portable and NixOS setup
+   examples are in `docs/operations.md`.
+   *Still to verify live:* declare the `hearth-agent` user and credentials on
+   NixOS, launch the unit, prove `LoadCredential` startup and broker access,
+   inspect `systemd-analyze security hearth-agentd`, and confirm the agentd uid
+   is denied machine-plane life-cycle verbs while a `hearth` operator can open
+   `/run/hearth-agentd/agent.sock`.
 
-5. **systemd unit hardening + `LoadCredential` + real `hearth-agent` user.**
-   `systemd/hearth-agentd.service` declares the hardening and credential wiring
-   §4 requires, but it must not be enabled as written. Both `hearth.service`
-   and `hearth-agentd.service` claim `RuntimeDirectory=hearth`, so the
-   unprivileged unit could change ownership of the shared broker directory.
-   Further, agentd chmods its control socket to `0660` but does not assign the
-   documented `root:hearth` ownership; when run as `hearth-agent`, operators in
-   the `hearth` group would not own the socket through that primary group.
-   *To verify after fixing the unit/socket ownership:* declare the
-   `hearth-agent` user and credentials in NixOS, launch the unit, assert it can
-   reach hearthd through its supplementary `hearth` group, inspect
-   `systemd-analyze security hearth-agentd`, and confirm an unrelated uid is
-   denied machine-plane lifecycle verbs.
-
-6. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
+5. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
    rotation is unit-tested (`store.rs`) and the restore→`ReportAck{restored:
    true}`→`rotate_incarnation` wiring is in place (`hearthd` marks pending
    restore; guestd rotates on the ack), but the *machine-plane* `restore` path
@@ -252,7 +241,7 @@ access would let a future session prove it.
    fresh `task.status` re-syncs. The guest-side half is already proven by
    `phase2_tasks.rs::stale_cursor_is_rejected_by_incarnation`.
 
-7. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
+6. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only
    so the boundary stays honest: guests can still reach each other over
    `hearth0` at the IP layer; the agent plane simply never uses that path.

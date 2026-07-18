@@ -2,13 +2,13 @@
 //! client drives task → interrupt → resume; SSE detach/reattach replays
 //! losslessly; two UIs watch one task; auth is required end-to-end.
 //!
-//! The client here is a raw HTTP/SSE client that mirrors what an unmodified
-//! AG-UI `HttpAgent` does on the wire (POST `RunAgentInput`, parse `data:`
-//! `BaseEvent`s). Conformance against the real TS `HttpAgent` is noted in
-//! docs/agent-plane-verification.md.
+//! Most tests use a dependency-free HTTP/SSE client. The ignored conformance
+//! test runs the pinned, unmodified TypeScript `HttpAgent`; `make
+//! agui-conformance` opts into that web dependency.
 
 use hearth_e2e::{agui_post, http_json, http_sse, AgentSpec, Harness, HarnessOptions, HttpOptions};
 use serde_json::{json, Value};
+use tokio::process::Command;
 
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -71,6 +71,23 @@ fn task_ref_from(events: &[Value]) -> Option<String> {
             None
         }
     })
+}
+
+#[tokio::test]
+#[ignore = "requires web/node_modules; run make agui-conformance"]
+async fn unmodified_http_agent_interrupts_resumes_and_follows_up() {
+    let bind = format!("127.0.0.1:{}", free_port());
+    let _h = harness(&bind).await;
+    let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+    let status = Command::new("node")
+        .arg("scripts/verify-http-agent.mjs")
+        .arg(format!("http://{bind}/v1/agents/worker/agui"))
+        .arg("s3cret-token")
+        .current_dir(web)
+        .status()
+        .await
+        .expect("run the unmodified @ag-ui/client HttpAgent");
+    assert!(status.success(), "HttpAgent conformance process failed");
 }
 
 #[tokio::test]

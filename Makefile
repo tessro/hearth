@@ -3,6 +3,7 @@ BINDIR      ?= $(PREFIX)/bin
 LIBDIR      ?= $(PREFIX)/lib
 GUESTPAYLOADDIR ?= $(LIBDIR)/hearth/guest
 UNITDIR     ?= /etc/systemd/system
+CONFDIR     ?= /etc/hearth
 BRIDGE      ?= hearth0
 
 CARGO       ?= cargo
@@ -10,7 +11,7 @@ INSTALL     ?= install
 
 BUILDAH     ?= buildah
 
-.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts check fmt test clippy dev install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
+.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts check agui-conformance fmt test clippy dev install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
 
 build: host-bins
 
@@ -56,6 +57,18 @@ vm-base: guest-bin
 	$(BUILDAH) bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 
 check: fmt clippy test
+
+# The Rust suite has a dependency-free HTTP/SSE client. This extra conformance
+# pass uses the pinned, unmodified TypeScript HttpAgent from the web workspace.
+# Keep it opt-in because a fresh Rust-only checkout may not have run pnpm yet.
+agui-conformance:
+	@test -d web/node_modules/@ag-ui/client || { \
+		echo "error: web dependencies are missing; run 'pnpm --dir web install' first" >&2; \
+		exit 1; \
+	}
+	$(CARGO) test --release --locked -p hearth-e2e --test phase3_agui_http \
+		unmodified_http_agent_interrupts_resumes_and_follows_up -- \
+		--ignored --exact --nocapture
 
 fmt:
 	$(CARGO) fmt --all -- --check
@@ -109,8 +122,15 @@ install-guest-payload:
 # `make install` stays machine-plane-only.
 install-agentd: install-bin
 	$(INSTALL) -D -m 0644 systemd/hearth-agentd.service $(DESTDIR)$(UNITDIR)/hearth-agentd.service
-	@echo "Installed hearth-agentd + hearth-agentd.service."
-	@echo "Next: create the hearth-agent user, stage /etc/hearth/agent/{http-token,ref-key},"
+	@if [ -e "$(DESTDIR)$(CONFDIR)/verb-policy.toml" ]; then \
+		echo "Preserved existing $(CONFDIR)/verb-policy.toml."; \
+	else \
+		$(INSTALL) -D -m 0644 systemd/hearth-agentd-verb-policy.toml "$(DESTDIR)$(CONFDIR)/verb-policy.toml"; \
+	fi
+	@echo "Installed hearth-agentd and its unit; ensured a verb policy file exists."
+	@echo "If the policy already existed, confirm it has the hearth-agent rule from"
+	@echo "systemd/hearth-agentd-verb-policy.toml before restarting hearthd."
+	@echo "Next: create the hearth-agent user, stage $(CONFDIR)/agent/{http-token,ref-key},"
 	@echo "      then: systemctl enable --now hearth-agentd.service"
 
 install: install-bin install-guest-payload

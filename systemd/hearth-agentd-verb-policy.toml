@@ -1,0 +1,14 @@
+# Match by user so the rule works with a system-assigned uid. Explicit entries
+# take priority over the built-in hearth-group rule.
+[[peer]]
+user = "hearth-agent"
+verbs = [
+  "ping",
+  "version",
+  "ls",
+  "status",
+  "rename",
+  "agent-endpoints",
+  "guest-listener",
+  "guest-connect",
+]

@@ -1,6 +1,7 @@
-//! The local control socket (docs/agent-plane.md §4.1): `/run/hearth/agent.sock`
-//! (`0660 root:hearth`), line-JSON, the same framing as hearthd. This is what
-//! `hearthctl agent …` speaks. Verbs mirror the task API plus `agent-ls`.
+//! The local control socket (docs/agent-plane.md §4.1):
+//! `/run/hearth-agentd/agent.sock` (`0660 hearth-agent:hearth`), line-JSON, the
+//! same framing as hearthd. This is what `hearthctl agent …` speaks. Verbs
+//! mirror the task API plus `agent-ls`.
 //!
 //! The control socket is the operator/UI seat: it presents refs as "ui" and is
 //! itself a delegator (a human driving the fleet), so it can start tasks on any

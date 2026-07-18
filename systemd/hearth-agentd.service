@@ -12,11 +12,13 @@ Type=simple
 # Dedicated unprivileged user (docs/agent-plane.md §4). agentd never touches
 # disks, images, or systemd-run; it speaks only the brokered sockets.
 User=hearth-agent
-Group=hearth-agent
-# Supplementary group so agentd can open hearthd's `0660 root:hearth` control
-# socket for the broker/discovery verbs.
-SupplementaryGroups=hearth
+# This grants access to hearthd's `0660 root:hearth` socket and makes agentd's
+# own control socket available to hearth-group operators. The explicit
+# hearth-agent entry in /etc/hearth/verb-policy.toml still limits this uid to
+# the broker and discovery verbs.
+Group=hearth
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0007
 
 # Secrets via LoadCredential (§4): systemd stages them read-only under
 # $CREDENTIALS_DIRECTORY, never in argv or the environment. Populate the source
@@ -45,11 +47,12 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
-# Only its own state dir and the shared runtime dir (for the control socket)
-# are writable.
+# Keep agentd out of hearthd's RuntimeDirectory. If two units manage the same
+# path, either one can change its owner or remove it when the unit stops.
 StateDirectory=hearth-agentd
-RuntimeDirectory=hearth
-RuntimeDirectoryMode=0770
+StateDirectoryMode=0750
+RuntimeDirectory=hearth-agentd
+RuntimeDirectoryMode=0750
 ReadWritePaths=/var/lib/hearth-agentd
 
 [Install]

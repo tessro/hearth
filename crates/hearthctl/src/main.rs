@@ -34,7 +34,7 @@ struct Cli {
         long,
         global = true,
         env = "HEARTH_AGENT_SOCKET",
-        default_value = "/run/hearth/agent.sock"
+        default_value = "/run/hearth-agentd/agent.sock"
     )]
     agent_socket: Utf8PathBuf,
     #[arg(long, global = true)]

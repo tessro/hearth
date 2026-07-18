@@ -20,7 +20,7 @@ pub struct Config {
     #[arg(
         long,
         env = "HEARTH_AGENT_SOCKET",
-        default_value = "/run/hearth/agent.sock"
+        default_value = "/run/hearth-agentd/agent.sock"
     )]
     pub control_socket: Utf8PathBuf,
     /// Append-only delegation ledger directory (§4.4).

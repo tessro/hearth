@@ -376,7 +376,7 @@ not file-permission gymnastics.
 
 ### 4.1 Local control socket
 
-`/run/hearth/agent.sock` (`0660 root:hearth`), line-JSON, same
+`/run/hearth-agentd/agent.sock` (`0660 hearth-agent:hearth`), line-JSON, same
 `Request`/`Response`/streaming framing as hearthd. This is what
 `hearthctl agent …` speaks. Verbs mirror §3.5 plus `agent-ls`.
 
@@ -676,7 +676,7 @@ the agent plane itself is wedged.
    address resolution stays authoritative); restore signal to guestd.
 
 **hearthctl**: `hearthctl agent ls|run|ps|status|events|respond|cancel|attach`
-against `/run/hearth/agent.sock`, human + `--json` as usual.
+against `/run/hearth-agentd/agent.sock`, human + `--json` as usual.
 
 **vm-base / linter**: install guestd + unit in vm-base; linter warns on
 absence, with the hard requirement enforced at `agent = true`

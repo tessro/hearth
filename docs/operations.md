@@ -156,6 +156,91 @@ sudo make install-bin
 sudo systemctl restart hearth
 ```
 
+### Optional agent-plane host service
+
+`hearth-agentd` runs as its own user. It reads two secrets through systemd's
+credential store and uses `/run/hearth-agentd/agent.sock` for `hearthctl agent`
+commands. Install it only on hosts that need the agent plane:
+
+```sh
+# Build first as your normal user.
+make build
+
+# One-time host setup. The hearth group already owns /run/hearth.sock on a
+# normal Hearth install; add operator accounts to it as needed.
+sudo groupadd --system hearth 2>/dev/null || true
+sudo useradd --system --gid hearth --home-dir /var/lib/hearth-agentd \
+  --shell /usr/sbin/nologin hearth-agent
+sudo install -d -m 0700 /etc/hearth/agent
+sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/hearth/agent/http-token'
+sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/hearth/agent/ref-key'
+
+# This installs the unit and creates /etc/hearth/verb-policy.toml only when no
+# policy exists. If you have a custom policy, merge the hearth-agent entry from
+# systemd/hearth-agentd-verb-policy.toml yourself.
+sudo make install-agentd
+sudo systemctl restart hearth.service # reload the verb policy
+sudo systemctl enable --now hearth-agentd.service
+hearthctl agent ls
+```
+
+The unit uses `Group=hearth` so operators in that group can open the agent
+socket. The explicit `hearth-agent` user rule in the verb policy takes priority
+over the broad operator-group rule and denies machine life-cycle verbs such as
+`create`, `start`, and `destroy`.
+
+On NixOS, declare the same user, policy, credentials, and unit. Keep the secret
+files out of the Nix store; the example assumes another secret manager creates
+the two `/etc/hearth/agent/*` source files:
+
+```nix
+users.groups.hearth = {};
+users.users.hearth-agent = {
+  isSystemUser = true;
+  group = "hearth";
+  home = "/var/lib/hearth-agentd";
+};
+
+environment.etc."hearth/verb-policy.toml".source =
+  /path/to/hearth/systemd/hearth-agentd-verb-policy.toml;
+
+systemd.services.hearth-agentd = {
+  description = "Hearth agent-plane host daemon";
+  after = [ "hearth.service" "network-online.target" ];
+  wants = [ "hearth.service" ];
+  wantedBy = [ "multi-user.target" ];
+  serviceConfig = {
+    Type = "simple";
+    User = "hearth-agent";
+    Group = "hearth";
+    UMask = "0007";
+    LoadCredential = [
+      "http-token:/etc/hearth/agent/http-token"
+      "ref-key:/etc/hearth/agent/ref-key"
+    ];
+    ExecStart = "/usr/local/bin/hearth-agentd --token-file %d/http-token --ref-key-file %d/ref-key";
+    Restart = "on-failure";
+    RestartSec = 2;
+    NoNewPrivileges = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    PrivateTmp = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectControlGroups = true;
+    RestrictNamespaces = true;
+    RestrictSUIDSGID = true;
+    MemoryDenyWriteExecute = true;
+    LockPersonality = true;
+    StateDirectory = "hearth-agentd";
+    StateDirectoryMode = "0750";
+    RuntimeDirectory = "hearth-agentd";
+    RuntimeDirectoryMode = "0750";
+    ReadWritePaths = [ "/var/lib/hearth-agentd" ];
+  };
+};
+```
+
 `hearthctl host check` reports each directory, command, the guest
 kernel, `/dev/kvm`, the bridge, and the `kvm`/`vhost_vsock` modules. Green there
 means `create`/`start` will not fail on a missing prerequisite. `hearthctl image

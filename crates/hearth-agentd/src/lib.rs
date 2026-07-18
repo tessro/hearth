@@ -132,7 +132,7 @@ async fn bind_control(path: &camino::Utf8Path) -> Result<tokio::net::UnixListene
     Ok(listener)
 }
 
-/// `0660 root:hearth` per §4.1, matching hearthd's socket.
+/// `0660 hearth-agent:hearth` under the systemd unit from §4.1.
 fn set_control_permissions(path: &camino::Utf8Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path.as_str(), std::fs::Permissions::from_mode(0o660))?;

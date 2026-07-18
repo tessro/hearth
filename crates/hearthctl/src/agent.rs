@@ -1,6 +1,7 @@
 //! `hearthctl agent …` — the operator/UI client for hearth-agentd's control
-//! socket (docs/agent-plane.md §10). Line-JSON over `/run/hearth/agent.sock`,
-//! same framing as the machine plane, but with the agent verb set.
+//! socket (docs/agent-plane.md §10). Line-JSON over
+//! `/run/hearth-agentd/agent.sock`, same framing as the machine plane, but with
+//! the agent verb set.
 
 use anyhow::{anyhow, bail, Result};
 use camino::Utf8PathBuf;
