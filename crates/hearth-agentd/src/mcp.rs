@@ -292,7 +292,7 @@ fn tool_schemas() -> Vec<Value> {
 
 fn tool_description(name: &str) -> &'static str {
     match name {
-        "set_session_name" => "Replace this session's display name with a short, descriptive name.",
+        "set_session_name" => "Replace this session's display name with a short, descriptive name. Call at the beginning of every session, and when there is a substantive change in the session's purpose.",
         "list_agents" => "List agent-enabled VMs, their adapters, and task counts.",
         "delegate" => {
             "Delegate a task to another agent; optionally wait_seconds for a first result."
