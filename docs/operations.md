@@ -380,6 +380,11 @@ dynamic ranges separate.
 
 ## 7. Releases
 
+CI reads Nix build results from the public `tessro` Cachix cache. To let
+trusted main-branch and release runs add new results, create a write token for
+that cache and store it as the `CACHIX_AUTH_TOKEN` GitHub Actions repository
+secret. Pull requests use the cache read-only.
+
 The checked-in Cargo version is the last stable release. Run the Release
 workflow with a `major`, `minor`, or `patch` bump. It makes a candidate version
 commit and builds that exact commit across the Rust, Nix, package, install, VM,

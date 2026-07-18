@@ -72,6 +72,8 @@ jobs:
     with:
       source_bundle: release-candidate
       source_sha: ${{ needs.prepare.outputs.candidate_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
     permissions:
       contents: read
 
