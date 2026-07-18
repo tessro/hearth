@@ -114,8 +114,7 @@ release-check: release-stage release-portable-stage
 		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=native scripts/verify-release.sh
 	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" \
 		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=portable scripts/verify-release.sh
-	systemd-analyze verify "$(RELEASE_STAGE)/lib/systemd/system/hearth.service" \
-		"$(RELEASE_STAGE)/lib/systemd/system/hearth-agentd.service"
+	HEARTH_STAGE_DIR="$(CURDIR)/$(RELEASE_STAGE)" scripts/verify-systemd-units.sh
 	scripts/test-dev-restart.sh
 	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" scripts/test-reproducible-archive.sh
 

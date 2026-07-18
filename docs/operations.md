@@ -380,11 +380,30 @@ dynamic ranges separate.
 
 ## 7. Releases
 
-Only `vX.Y.Z` tags release, and the tag must equal `[workspace.package].version`.
-Pull requests and tags run the same Rust, Nix, package, install, VM, unit, static
-link, and stable-archive checks. CI builds `.deb` on Debian-family Linux, `.rpm`
-on Fedora-family Linux, the portable tarball with static host tools, and Nix
-packages in Nix.
+The checked-in Cargo version is the last stable release. Run the Release
+workflow with a `major`, `minor`, or `patch` bump. It makes a candidate version
+commit and builds that exact commit across the Rust, Nix, package, install, VM,
+unit, static-link, and stable-archive jobs. CI builds `.deb` on Debian-family
+Linux, `.rpm` on Fedora-family Linux, the portable tarball with static host
+tools, and Nix packages in Nix.
+
+Keep `dry_run` on to test the full build without changing the repository:
+
+```sh
+gh workflow run release.yml --ref main -f bump=minor -f dry_run=true
+gh run watch
+# After it finishes, use the run ID shown by `gh run list`:
+gh run download RUN_ID -n release-bundle
+```
+
+A dry run uploads `release-bundle` with the packages, archive, checksums, and
+SBOM, then discards the candidate commit. For a release, run the same command
+with `dry_run=false`. After every build passes, the protected publish job checks
+that `main` has not moved, atomically pushes the tested version commit and its
+`vX.Y.Z` tag, attests the files, and publishes the GitHub Release. The first
+release starts from the checked-in `0.0.0`, so use `bump=minor` for `v0.1.0`.
+Repository rules must let GitHub Actions update `main` and create release tags.
+Use the `release` environment to require approval before the publish job.
 
 The release contains the three package files, `SHA256SUMS`, an SPDX JSON SBOM,
 and GitHub build attestations. Verify a file with `sha256sum -c SHA256SUMS` and

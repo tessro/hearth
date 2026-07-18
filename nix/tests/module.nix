@@ -1,6 +1,7 @@
 { pkgs, hearthModule }:
 
 let
+  hearthVersion = (pkgs.lib.importTOML ../../Cargo.toml).workspace.package.version;
   fakeKernel = pkgs.runCommand "hearth-test-kernel" { } ''
     mkdir -p $out/lib/hearth/kernel
     touch $out/lib/hearth/kernel/vmlinux
@@ -30,7 +31,7 @@ in
     nodes.machine = common;
     testScript = ''
       machine.wait_for_unit("hearth.service")
-      machine.succeed("hearthctl ping | grep 'hearthd 0.1.0'")
+      machine.succeed("hearthctl ping | grep 'hearthd ${hearthVersion}'")
       machine.succeed("getent group hearth | grep operator")
       machine.succeed("test -S /run/hearth.sock")
       machine.succeed("test -d /var/lib/hearth/services")

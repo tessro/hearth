@@ -416,7 +416,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hearth-agent-proto"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "hearth-proto",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-agentd"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-e2e"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-guestd"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-proto"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "hearthctl"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "hearthd"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -22,7 +22,8 @@ The one current host gets a short manual cutover note at the end of this file.
 
 - Put the release version in `[workspace.package]` in `Cargo.toml`.
 - Make each crate use `version.workspace = true`.
-- Require a release tag named `vX.Y.Z` to match the Cargo version exactly.
+- Let the release workflow bump the chosen version component in a candidate
+  commit, then create the matching `vX.Y.Z` tag only after that commit passes.
 - Release builds report `X.Y.Z`.
 - Local builds may report `X.Y.Z+<short-git-sha>`.
 - Set the workspace repository URL to `https://github.com/tessro/hearth`.
@@ -315,13 +316,15 @@ Run:
 6. NixOS VM tests
 7. Stable-archive comparison
 
-Use the same release targets in pull-request CI and tagged release CI. Do not
+Use the same release targets in pull-request CI and release-candidate CI. Do not
 keep a second set of release-only build commands.
 
-### Tagged release workflow
+### Stable release workflow
 
-Trigger on pushed tags that match the GitHub glob `v*.*.*`. The first job then
-requires the exact regular expression `^v[0-9]+\.[0-9]+\.[0-9]+$`.
+Trigger by hand with a `major`, `minor`, or `patch` choice and a dry-run
+checkbox. Build an exact candidate commit before changing `main`. A dry run
+uploads the release bundle and stops. A real run pushes the tested commit and
+matching `vX.Y.Z` tag only after every build passes.
 
 Release gates:
 
@@ -421,5 +424,5 @@ The work is complete when:
    binaries from the extracted prefix.
 5. A developer can change Rust code and run one build-and-restart command
    without changing the installed system package.
-6. Pushing a valid `vX.Y.Z` tag builds, tests, attests, and publishes all release
-   files automatically, while any failed gate prevents the GitHub Release.
+6. A non-dry release run bumps, builds, tests, pushes, tags, attests, and
+   publishes all release files, while any failed gate leaves `main` unchanged.
