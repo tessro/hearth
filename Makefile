@@ -8,29 +8,38 @@ INSTALL     ?= install
 
 BUILDAH     ?= buildah
 
-.PHONY: build test clippy dev install install-bin install-agentd uninstall vm-base guest-bin guest-bin-musl reload enable start stop restart status logs ping clean
+.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts check fmt test clippy dev install install-bin install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
 
-build:
-	$(CARGO) build --release
+build: host-bins
 
-# Guest target for hearth-guestd. musl gives a static binary that drops into any
-# distro image regardless of libc (docs/agent-plane.md §2); requires the musl
-# std (`rustup target add x86_64-unknown-linux-musl`). Override for other arches.
+# Host-side release executables. hearth-guestd is intentionally excluded: its
+# deployable artifact is always built for musl by `guest-bin`.
+host-bins:
+	$(CARGO) build --release --locked -p hearthd -p hearthctl -p hearth-agentd
+
+agentd-bin:
+	$(CARGO) build --release --locked -p hearth-agentd
+
+# The guest artifact is always a static musl binary so it can run in any VM
+# image without inheriting the host's libc or Nix store interpreter.
 GUEST_MUSL_TARGET ?= x86_64-unknown-linux-musl
-# Nix's musl cross wrapper defaults to a dynamic musl interpreter in the Nix
-# store. Enforce the static contract this target promises on every toolchain.
-GUEST_MUSL_RUSTFLAGS ?= -C target-feature=+crt-static -C link-arg=-static
+GUEST_BIN         := target/$(GUEST_MUSL_TARGET)/release/hearth-guestd
+STAGED_GUEST_BIN  := example/vm-base/hearth-guestd
 
-# Build hearth-guestd and stage it into the vm-base build context. Defaults to a
-# host-libc (glibc) build, correct for the ubuntu-based vm-base and buildable
-# without the musl std installed. Use `guest-bin-musl` for the portable static
-# binary that drops into any distro image.
-guest-bin: build
-	$(INSTALL) -D -m 0755 target/release/hearth-guestd example/vm-base/hearth-guestd
+guest-bin:
+	$(CARGO) build --release --locked -p hearth-guestd --target $(GUEST_MUSL_TARGET)
+	@if readelf -lW "$(GUEST_BIN)" | grep -q ' INTERP '; then \
+		echo "error: $(GUEST_BIN) is dynamically linked; refusing to stage it" >&2; \
+		exit 1; \
+	fi
+	$(INSTALL) -D -m 0755 "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
+	@cmp --silent "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
+	@file "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
 
-guest-bin-musl:
-	RUSTFLAGS="$(GUEST_MUSL_RUSTFLAGS)" $(CARGO) build --release -p hearth-guestd --target $(GUEST_MUSL_TARGET)
-	$(INSTALL) -D -m 0755 target/$(GUEST_MUSL_TARGET)/release/hearth-guestd example/vm-base/hearth-guestd
+# Produce the two binaries that must be deployed together for the agent plane.
+# Packaging/version metadata intentionally lives outside this target for now.
+agent-plane-artifacts: agentd-bin guest-bin
+	@sha256sum target/release/hearth-agentd "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
 
 # Build the shared VM base layer as a plain local buildah image. Workload images
 # (example/hermes-vm, example/agent-vm) are `FROM localhost/vm-base`, so build
@@ -43,11 +52,16 @@ guest-bin-musl:
 vm-base: guest-bin
 	$(BUILDAH) bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 
+check: fmt clippy test
+
+fmt:
+	$(CARGO) fmt --all -- --check
+
 test:
-	$(CARGO) test --release
+	$(CARGO) test --release --locked
 
 clippy:
-	$(CARGO) clippy --release --all-targets -- -D warnings
+	$(CARGO) clippy --release --locked --all-targets -- -D warnings
 
 # Run hearthd in the foreground out of target/release. Override BRIDGE for a
 # different bridge name.
@@ -64,7 +78,7 @@ DOCDIR ?= $(PREFIX)/share/doc/hearth
 # Install just the binaries. Use this on NixOS (and anywhere else that manages
 # systemd units declaratively): $(UNITDIR) is read-only there, so `install`'s
 # unit copy fails, but updating hearthd/hearthctl is all a code deploy needs.
-install-bin: build
+install-bin: host-bins
 	$(INSTALL) -D -m 0755 target/release/hearthd      $(DESTDIR)$(BINDIR)/hearthd
 	$(INSTALL) -D -m 0755 target/release/hearthctl    $(DESTDIR)$(BINDIR)/hearthctl
 	$(INSTALL) -D -m 0755 target/release/hearth-agentd $(DESTDIR)$(BINDIR)/hearth-agentd

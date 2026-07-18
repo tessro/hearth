@@ -17,8 +17,8 @@ New workspace crates:
 - `hearth-guestd` — the in-guest daemon: durable task registry (segmented event
   logs, incarnations, outbox, dedup), codex, claude, and Hermes adapters, the
   task-verb server (port 1027), boot report + heartbeat + upcall loops, and the
-  dumb MCP stdio↔vsock shim. Targets glibc by default and musl via
-  `make guest-bin-musl`.
+  dumb MCP stdio↔vsock shim. Its deployable artifact is always a static musl
+  binary built via `make guest-bin`.
 - `hearth-agentd` — the unprivileged host daemon: control socket, hearthd
   broker client (fd receipt), delegation ledger + signed refs, AG-UI HTTP + SSE,
   the MCP server, and durable outbox→ack→dedup wake-up delivery.
@@ -71,11 +71,11 @@ in-process acceptance harness:
 - `hearthctl host check` passes every prerequisite, including `/dev/kvm` as a
   character device, `kvm`, `vhost_vsock`, the `hearth0` bridge, guest kernel,
   recovery keyring, and all required host commands.
-- `hearth-guestd` was cross-compiled with the locked nixpkgs musl toolchain via
-  `make guest-bin-musl`; `file` reports `static-pie linked`, and the staged
-  vm-base binary is byte-identical to the target artifact. The Makefile now
-  forces `crt-static` because Nix's musl cross wrapper otherwise emits a
-  dynamically linked binary whose interpreter lives in `/nix/store`.
+- `hearth-guestd` was cross-compiled with the pinned musl toolchain via `make
+  guest-bin`; `file` reports a statically linked executable, and the staged
+  vm-base binary is byte-identical to the target artifact. The Cargo target
+  configuration forces `crt-static` and the Makefile refuses to stage any
+  binary with a dynamic interpreter.
 - A root-ownership-preserving Buildah image was materialized and imported as
   `agent-plane-smoke-clean`. On a rootless NixOS host the working invocation is
   to run `hearthctl image build` *inside* `buildah unshare`, without passing
@@ -160,7 +160,7 @@ in-process acceptance harness:
 2. `SCM_RIGHTS` control-message lengths compile on both glibc and musl libc
    layouts.
 3. AF_VSOCK connect readiness is retained until real I/O consumes it.
-4. `guest-bin-musl` enforces a genuinely static guest artifact on Nix.
+4. `guest-bin` enforces a genuinely static guest artifact on Nix.
 5. `/dev/kvm` is checked as a character device instead of a regular file.
 6. Boot-config drift comparison tolerates systemd's resolved executable path
    and flattened whitespace representation while still requiring Hearth's
@@ -265,13 +265,11 @@ access would let a future session prove it.
   Explicit `cargo build --release --bin hearth-agentd --bin hearthctl` relinked
   the live executables; after restarting agentd, adapter discovery and the real
   task passed.
-- The locked dev shell does not currently include a musl Rust target. The first
-  live static build used an already-realized Nix 1.94 cross wrapper, which was
-  later garbage-collected; attempting to realize the current registry's Nix
-  1.95 cross compiler failed inside nixpkgs with a Rust bootstrap symlink
-  collision. No `rustup` state was added to the NixOS host. Pin a working musl
-  Rust toolchain in `devenv.nix` (or restore a binary-cacheable wrapper) before
-  rebuilding the final portable guest artifact and image.
+- The earlier locked dev shell omitted the musl Rust target and fell back to a
+  garbage-collectable nixpkgs cross compiler that later failed to realize.
+  `rust-toolchain.toml` now pins the Rust toolchain and musl standard library;
+  `devenv.nix` supplies the musl linker without modifying user-global `rustup`
+  state.
 
 - `/etc/dnsmasq.d/hearth` is absent on this host. Hearth therefore cannot write
   its requested static lease drop-in and the live agent VM uses dnsmasq's
