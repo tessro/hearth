@@ -117,7 +117,7 @@ release-native-check: release-stage
 release-portable-check: release-portable-stage
 	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" \
 		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=portable scripts/verify-release.sh
-	scripts/test-dev-restart.sh
+	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" scripts/test-dev-restart.sh
 	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" scripts/test-reproducible-archive.sh
 
 release-check: release-native-check release-portable-check
