@@ -53,6 +53,13 @@ const eventTaskRef = (event: HearthEvent) => {
   return typeof taskRef === "string" ? taskRef : undefined
 }
 
+const eventSessionName = (event: HearthEvent) => {
+  if (event.type !== "CUSTOM" || event.name !== "hearth.session_name") return undefined
+  if (!event.value || typeof event.value !== "object") return undefined
+  const name = (event.value as Record<string, unknown>).name
+  return typeof name === "string" ? name : undefined
+}
+
 function App() {
   const [settings, setSettings] = useState<ConnectionSettings>(storedSettings)
   const [connected, setConnected] = useState(false)
@@ -62,6 +69,7 @@ function App() {
   const [tasks, setTasks] = useState<TaskSummary[]>([])
   const [selectedAgentName, setSelectedAgentName] = useState<string>()
   const [selectedTask, setSelectedTask] = useState<TaskSummary>()
+  const [sessionName, setSessionName] = useState<string>()
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [busy, setBusy] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -77,6 +85,9 @@ function App() {
     [agents, selectedAgentName],
   )
   const transcript = useMemo(() => buildTranscript(timeline), [timeline])
+  const displayedSessionName = selectedTask
+    ? selectedTask.session_name ?? selectedTask.text
+    : sessionName
 
   const refresh = useCallback(
     async (nextSettings = settings, quiet = false) => {
@@ -134,13 +145,25 @@ function App() {
     )
   }, [selectedTask?.task_id])
 
+  const applySessionName = useCallback((name: string) => {
+    setSessionName(name)
+    setSelectedTask((current) => (current ? { ...current, session_name: name } : current))
+    setTasks((current) =>
+      current.map((task) =>
+        task.task_id === selectedTask?.task_id ? { ...task, session_name: name } : task,
+      ),
+    )
+  }, [selectedTask?.task_id])
+
   const appendEvent = useCallback(
     (id: string, event: HearthEvent) => {
       setTimeline((current) => [...current, { kind: "event", id, event }])
       const state = eventState(event)
       if (state) applyTaskState(state)
+      const name = eventSessionName(event)
+      if (name) applySessionName(name)
     },
-    [applyTaskState],
+    [applySessionName, applyTaskState],
   )
 
   const replayTask = useCallback(
@@ -170,6 +193,7 @@ function App() {
     setBusy(false)
     setSelectedAgentName(task.agent_vm)
     setSelectedTask(task)
+    setSessionName(task.session_name ?? task.text)
     replayTask(task)
   }
 
@@ -178,6 +202,7 @@ function App() {
     setBusy(false)
     setStreamError(undefined)
     setSelectedTask(undefined)
+    setSessionName(undefined)
     setSelectedAgentName(agent.name)
     setTimeline([])
     setDraftId((current) => current + 1)
@@ -193,6 +218,7 @@ function App() {
     replayAbort.current?.abort()
     setStreamError(undefined)
     setBusy(true)
+    if (!selectedTask) setSessionName(text)
     detachingRun.current = false
     let httpAgent: HttpAgent | undefined
 
@@ -231,6 +257,7 @@ function App() {
           task_ref: nextRef,
         }
         setSelectedTask(hydrated)
+        setSessionName(hydrated.session_name ?? hydrated.text)
       }
       await refresh(settings, true)
     } catch (error) {
@@ -274,6 +301,7 @@ function App() {
     setAgents([])
     setTasks([])
     setSelectedTask(undefined)
+    setSessionName(undefined)
     setSelectedAgentName(undefined)
     setTimeline([])
   }
@@ -323,6 +351,7 @@ function App() {
         onStop={stopRun}
         onSubmit={submit}
         streamError={streamError}
+        sessionName={displayedSessionName}
         task={selectedTask}
         transcript={transcript}
       />

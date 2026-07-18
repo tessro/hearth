@@ -164,6 +164,11 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
             let keep = args.get("keep").and_then(Value::as_u64).unwrap_or(20) as usize;
             Ok(json!({ "removed": engine.gc(keep)? }))
         }
+        AgentVerb::SetSessionName => Ok(serde_json::to_value(
+            engine
+                .set_session_name(str_arg(args, "thread_id")?, str_arg(args, "name")?)
+                .await?,
+        )?),
         AgentVerb::InjectTurn => {
             let delivery_id = str_arg(args, "delivery_id")?;
             let thread_id = str_arg(args, "thread_id")?;

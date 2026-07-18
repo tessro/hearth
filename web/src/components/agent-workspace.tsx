@@ -36,6 +36,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
+import { TypingSessionName } from "@/components/typing-session-name"
 import { cn } from "@/lib/utils"
 import type { AgentInfo, TaskState, TaskSummary } from "@/lib/hearth-api"
 import { permissionText, type TranscriptEntry } from "@/lib/transcript"
@@ -46,6 +47,7 @@ interface AgentWorkspaceProps {
   transcript: TranscriptEntry[]
   busy: boolean
   composerKey: string
+  sessionName?: string
   streamError?: string
   onSubmit: (text: string) => Promise<void>
   onStop: () => void
@@ -154,6 +156,7 @@ export function AgentWorkspace({
   transcript,
   busy,
   composerKey,
+  sessionName,
   streamError,
   onSubmit,
   onStop,
@@ -169,6 +172,8 @@ export function AgentWorkspace({
   const lastEntry = transcript.at(-1)
   const waitingForAgent =
     busy && lastEntry?.kind === "message" && lastEntry.role === "user"
+  const displayName =
+    sessionName ?? task?.session_name ?? task?.text ?? agent?.name ?? "Choose an agent"
 
   return (
     <main className="flex min-h-0 min-w-0 flex-col bg-neutral-900 text-neutral-100">
@@ -179,7 +184,9 @@ export function AgentWorkspace({
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h1 className="truncate text-sm font-semibold">{agent?.name ?? task?.agent_vm ?? "Choose an agent"}</h1>
+              <h1 className="min-w-0 text-sm font-semibold">
+                <TypingSessionName name={displayName} />
+              </h1>
               {task ? (
                 <Badge className={cn("h-5 border text-[10px]", stateClass[task.state])} variant="outline">
                   {task.state === "running" ? <span className="size-1.5 animate-pulse rounded-full bg-current" /> : null}
@@ -190,6 +197,8 @@ export function AgentWorkspace({
             <p className="truncate text-xs text-neutral-500">
               {task
                 ? `${task.agent} · ${task.runs.length} ${task.runs.length === 1 ? "run" : "runs"} · ${task.task_id.slice(0, 12)}`
+                : busy && sessionName && agent
+                  ? `${agent.name} · starting session`
                 : agent
                   ? `${agent.adapters.join(", ")} · new task`
                   : "Select a ready VM from the fleet"}

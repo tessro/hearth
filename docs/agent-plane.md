@@ -463,8 +463,9 @@ state for conversation history.
 Initial conformance subset: run lifecycle, text, tool calls, `CUSTOM`.
 Hearth-specific moments ride namespaced `CUSTOM` events:
 `hearth.permission_request` (payload: the approval prompt; immediately
-precedes the run ending `interrupted`), `hearth.state` (task state
-transitions), `hearth.truncation`.
+precedes the run ending `interrupted`), `hearth.session_name` (the agent
+replaced the thread's display name), `hearth.state` (task state transitions),
+`hearth.truncation`.
 
 Representative mapping (adapters own the details; pinned per CLI version):
 
@@ -557,6 +558,7 @@ turn injection (back in).
 
 | Tool | Behavior |
 |---|---|
+| `set_session_name(name)` | replace the calling thread's display name in its own guestd and emit durable `CUSTOM hearth.session_name`; the shim-supplied thread id is authoritative |
 | `list_agents()` | agent-enabled VMs, their adapters, current task counts |
 | `delegate(agent, task, wait_seconds=0)` | policy check → ledger write → `task.start` on callee's guestd → returns `{task_ref, state}`; with `wait_seconds`, long-polls first and may return terminal state + result in one call. Denial returns (and ledgers) a rejection. |
 | `wait_for(task_ref, timeout_seconds)` | long-poll until state change / input-required / terminal; returns state, summary of new events, next cursor. The streaming workhorse. |

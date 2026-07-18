@@ -35,6 +35,10 @@ pub struct TaskMeta {
     pub state: TaskState,
     pub incarnation: String,
     pub text: String,
+    /// Agent-selected human-readable name; absent means the initial text is
+    /// still the session's display name. Optional for existing on-disk tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +72,7 @@ impl TaskMeta {
             thread_id: self.thread_id.clone(),
             agent: self.agent.clone(),
             text: self.text.clone(),
+            session_name: self.session_name.clone(),
             state: self.state,
             incarnation: self.incarnation.clone(),
             last_seq,
@@ -636,6 +641,7 @@ mod tests {
             state: TaskState::Running,
             incarnation: "INC1".into(),
             text: String::new(),
+            session_name: None,
             created_at: now(),
             updated_at: now(),
             result_json: None,

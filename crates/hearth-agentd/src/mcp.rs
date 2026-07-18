@@ -9,7 +9,9 @@
 
 use crate::core::Agentd;
 use anyhow::{anyhow, Context, Result};
-use hearth_agent_proto::{read_line_capped, AgentVerb, MAX_LINE_BYTES, MCP_TOOLS};
+use hearth_agent_proto::{
+    read_line_capped, AgentVerb, MAX_LINE_BYTES, MAX_SESSION_NAME_CHARS, MCP_TOOLS,
+};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +107,25 @@ impl McpServer {
         args: &Map<String, Value>,
     ) -> Result<Value> {
         match name {
+            "set_session_name" => {
+                if shim_thread.is_empty() {
+                    return Err(anyhow!(
+                        "session.unbound: the MCP shim did not identify a session thread"
+                    ));
+                }
+                let requested_name = str_arg(args, "name")?;
+                let mut extra = Map::new();
+                extra.insert("thread_id".to_string(), json!(shim_thread));
+                extra.insert("name".to_string(), json!(requested_name));
+                let renamed =
+                    crate::relay::call(&self.agentd.hearthd, vm, AgentVerb::SetSessionName, extra)
+                        .await?;
+                let stored_name = renamed
+                    .get("session_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(requested_name);
+                Ok(json!({ "name": stored_name }))
+            }
             "list_agents" => self.agentd.list_agents().await,
             "delegate" => {
                 let target = str_arg(args, "agent")?;
@@ -271,6 +292,7 @@ fn tool_schemas() -> Vec<Value> {
 
 fn tool_description(name: &str) -> &'static str {
     match name {
+        "set_session_name" => "Replace this session's display name with a short, descriptive name.",
         "list_agents" => "List agent-enabled VMs, their adapters, and task counts.",
         "delegate" => {
             "Delegate a task to another agent; optionally wait_seconds for a first result."
@@ -287,6 +309,19 @@ fn tool_description(name: &str) -> &'static str {
 fn tool_input_schema(name: &str) -> Value {
     let ref_prop = json!({ "task_ref": { "type": "string" } });
     match name {
+        "set_session_name" => json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SESSION_NAME_CHARS,
+                    "description": "The complete new display name for this session."
+                },
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        }),
         "list_agents" => json!({ "type": "object", "properties": {} }),
         "delegate" => json!({
             "type": "object",

@@ -14,6 +14,7 @@ use hearth_agent_proto::events::AgentEvent;
 use hearth_agent_proto::task::{
     Delivery, EventRecord, Initiator, RunOutcome, RunRecord, TaskState, TaskSummary,
 };
+use hearth_agent_proto::MAX_SESSION_NAME_CHARS;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,6 +202,7 @@ impl Engine {
             state: TaskState::Queued,
             incarnation,
             text: text.to_string(),
+            session_name: None,
             created_at: now(),
             updated_at: now(),
             result_json: None,
@@ -299,6 +301,47 @@ impl Engine {
             json!({ "wakeup": true, "delivery_id": delivery_id, "text": framed_text }),
         )?;
         Ok(true)
+    }
+
+    /// Replace the human-readable name for the task bound to `thread_id`.
+    /// The metadata makes refresh/restart durable; the custom event wakes live
+    /// attaches and lets replaying clients observe the same change in order.
+    pub async fn set_session_name(&self, thread_id: &str, name: &str) -> Result<TaskSummary> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("request.invalid: session name must not be empty");
+        }
+        if name.chars().count() > MAX_SESSION_NAME_CHARS {
+            bail!(
+                "request.invalid: session name must be at most {MAX_SESSION_NAME_CHARS} characters"
+            );
+        }
+        if name.chars().any(char::is_control) {
+            bail!("request.invalid: session name must not contain control characters");
+        }
+
+        let task_id = self
+            .thread_index
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("thread.not_found: no task on thread {thread_id}"))?;
+        let cell = self.cell(&task_id)?;
+        let run_id = {
+            let mut meta = cell.meta.lock().unwrap();
+            meta.session_name = Some(name.to_string());
+            meta.updated_at = now();
+            self.store.write_meta(&meta)?;
+            meta.runs
+                .last()
+                .map(|run| run.run_id.clone())
+                .unwrap_or_default()
+        };
+        self.append(&cell, &run_id, AgentEvent::session_name(name))
+            .await?;
+        self.rewrite_index();
+        self.status(&task_id)
     }
 
     pub fn cancel(&self, task_id: &str) -> Result<TaskSummary> {

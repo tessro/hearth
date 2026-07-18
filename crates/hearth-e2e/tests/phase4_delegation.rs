@@ -5,6 +5,7 @@
 //! with a full ledger + audit trail. A non-allowlisted VM's `delegate` is
 //! rejected and ledgered.
 
+use hearth_agent_proto::events::CUSTOM_SESSION_NAME;
 use hearth_agent_proto::AgentVerb;
 use hearth_e2e::{guest_verb, AgentSpec, Harness, HarnessOptions, McpClient};
 use serde_json::{json, Map, Value};
@@ -70,6 +71,37 @@ async fn wait_runs(h: &Harness, vm: &str, task_id: &str, want: usize) -> bool {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     false
+}
+
+#[tokio::test]
+async fn calling_agent_can_replace_its_durable_session_name_over_mcp() {
+    let h = Harness::start(opts()).await.unwrap();
+    let (task_id, thread_id) = start_task(&h, "boss", "Investigate the slow checkout").await;
+    let mut mcp = McpClient::connect(&h, "boss", &thread_id).await.unwrap();
+
+    let renamed = mcp
+        .call_tool(
+            "set_session_name",
+            json!({ "name": "Trace checkout latency" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed["name"], json!("Trace checkout latency"));
+
+    let status = task_status(&h, "boss", &task_id).await;
+    assert_eq!(status["session_name"], json!("Trace checkout latency"));
+
+    let mut guest = h.guest_connect("boss").await.unwrap();
+    let mut args = Map::new();
+    args.insert("task_id".to_string(), json!(task_id));
+    let replay = guest_verb(&mut guest, AgentVerb::TaskEvents, args)
+        .await
+        .unwrap();
+    assert!(replay["events"].as_array().unwrap().iter().any(|record| {
+        record["event"]["type"] == json!("CUSTOM")
+            && record["event"]["name"] == json!(CUSTOM_SESSION_NAME)
+            && record["event"]["value"]["name"] == json!("Trace checkout latency")
+    }));
 }
 
 #[tokio::test]

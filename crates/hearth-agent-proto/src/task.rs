@@ -119,6 +119,10 @@ pub struct TaskSummary {
     /// The initial user turn. This lets operator surfaces label and restore a
     /// task without reconstructing input text from adapter output events.
     pub text: String,
+    /// An agent-selected display name for this session. Operator surfaces use
+    /// the initial text as the fallback until one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     pub state: TaskState,
     pub incarnation: String,
     /// Seq of the newest event, so callers can build a follow cursor.

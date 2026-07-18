@@ -29,6 +29,7 @@ export interface TaskSummary {
   agent: string
   agent_vm: string
   text: string
+  session_name?: string
   state: TaskState
   incarnation: string
   last_seq: number

@@ -21,7 +21,10 @@ use std::fmt;
 
 /// Version of the agent-plane wire protocol. Sent in every hello; a mismatch is
 /// a clean error, never a guess (the workaround #9 rule, applied from day 1).
-pub const AGENT_PROTOCOL_VERSION: u32 = 2;
+pub const AGENT_PROTOCOL_VERSION: u32 = 3;
+
+/// Maximum human-readable session name accepted from the MCP surface.
+pub const MAX_SESSION_NAME_CHARS: usize = 120;
 
 /// Longest accepted line on any agent-plane line-JSON channel. Guests are
 /// assumed adversarial; a reader must fail a connection that exceeds this
@@ -158,6 +161,8 @@ pub enum AgentVerb {
     TaskList,
     #[serde(rename = "task.gc")]
     TaskGc,
+    #[serde(rename = "session.set-name")]
+    SetSessionName,
     #[serde(rename = "inject.turn")]
     InjectTurn,
 }
@@ -176,6 +181,7 @@ impl AgentVerb {
         AgentVerb::TaskCancel,
         AgentVerb::TaskList,
         AgentVerb::TaskGc,
+        AgentVerb::SetSessionName,
         AgentVerb::InjectTurn,
     ];
 
@@ -193,6 +199,7 @@ impl AgentVerb {
             Self::TaskCancel => "task.cancel",
             Self::TaskList => "task.list",
             Self::TaskGc => "task.gc",
+            Self::SetSessionName => "session.set-name",
             Self::InjectTurn => "inject.turn",
         }
     }
@@ -224,8 +231,9 @@ impl AgentRequest {
     }
 }
 
-/// MCP tools agentd serves for agent-to-agent delegation (§7.1).
+/// MCP tools agentd serves to agents (§7.1).
 pub const MCP_TOOLS: &[&str] = &[
+    "set_session_name",
     "list_agents",
     "delegate",
     "wait_for",
@@ -302,13 +310,14 @@ mod tests {
                 | AgentVerb::TaskCancel
                 | AgentVerb::TaskList
                 | AgentVerb::TaskGc
+                | AgentVerb::SetSessionName
                 | AgentVerb::InjectTurn => {}
             }
         }
         for verb in AgentVerb::ALL {
             witness(verb);
         }
-        assert_eq!(AgentVerb::ALL.len(), 13);
+        assert_eq!(AgentVerb::ALL.len(), 14);
         let mut names: Vec<&str> = AgentVerb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();
@@ -329,7 +338,7 @@ mod tests {
     #[test]
     fn boot_report_frame_matches_spec_shape() {
         let frame: GuestFrame = serde_json::from_str(
-            r#"{"hello": {"proto": 2, "component": "guestd", "version": "0.1.0"},
+            r#"{"hello": {"proto": 3, "component": "guestd", "version": "0.1.0"},
                 "report": {"ready": true, "addrs": ["192.168.122.31/24"],
                            "hostname": "web-a",
                            "agents": [{"name": "codex", "ok": true}],

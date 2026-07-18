@@ -159,6 +159,9 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
             Ok(json!({ "tasks": all }))
         }
         AgentVerb::TaskGc => Err(anyhow!("task.gc: run per-agent via the guest")),
+        AgentVerb::SetSessionName => Err(anyhow!(
+            "verb.denied: session.set-name is MCP-shim-internal"
+        )),
         AgentVerb::InjectTurn => Err(anyhow!("verb.denied: inject.turn is guestd-internal")),
         AgentVerb::TaskAttach => unreachable!("attach handled before dispatch"),
     }

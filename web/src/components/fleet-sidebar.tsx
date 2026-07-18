@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { TypingSessionName } from "@/components/typing-session-name"
 import { cn } from "@/lib/utils"
 import type { AgentInfo, TaskState, TaskSummary } from "@/lib/hearth-api"
 
@@ -182,9 +183,10 @@ export function FleetSidebar({
               >
                 <div className="flex items-center gap-2">
                   <span className={cn("size-1.5 shrink-0 rounded-full", stateDot[task.state])} />
-                  <span className="line-clamp-1 text-xs font-medium">
-                    {task.text || `Task ${task.task_id.slice(0, 8)}`}
-                  </span>
+                  <TypingSessionName
+                    className="min-w-0 flex-1 text-xs font-medium"
+                    name={(task.session_name ?? task.text) || `Task ${task.task_id.slice(0, 8)}`}
+                  />
                 </div>
                 <div className="mt-1.5 flex items-center gap-2 pl-3.5 text-[11px] text-neutral-600">
                   <span className="truncate">{task.agent_vm}</span>

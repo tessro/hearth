@@ -9,6 +9,7 @@ use serde_json::Value;
 
 /// Namespaced `CUSTOM` event names for Hearth-specific moments.
 pub const CUSTOM_PERMISSION_REQUEST: &str = "hearth.permission_request";
+pub const CUSTOM_SESSION_NAME: &str = "hearth.session_name";
 pub const CUSTOM_STATE: &str = "hearth.state";
 pub const CUSTOM_TRUNCATION: &str = "hearth.truncation";
 
@@ -102,6 +103,14 @@ impl AgentEvent {
             value: prompt.clone(),
         }
     }
+
+    /// A durable replacement for the thread's human-readable display name.
+    pub fn session_name(name: &str) -> Self {
+        AgentEvent::Custom {
+            name: CUSTOM_SESSION_NAME.to_string(),
+            value: serde_json::json!({ "name": name }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +165,7 @@ mod tests {
                 name: CUSTOM_PERMISSION_REQUEST.into(),
                 value: serde_json::json!({"prompt": "rm -rf /tmp/x?"}),
             },
+            AgentEvent::session_name("Investigate checkout latency"),
         ];
         for event in events {
             let wire = serde_json::to_string(&event).unwrap();
