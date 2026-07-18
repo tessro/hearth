@@ -21,12 +21,6 @@
     elfutils
     openssl
 
-    # Expose only the linker executable. Adding musl.dev directly would inject
-    # musl headers and libraries into native build-script compilation.
-    (writeShellScriptBin "musl-gcc" ''
-      export REALGCC=${stdenv.cc.cc}/bin/gcc
-      exec ${musl.dev}/bin/musl-gcc "$@"
-    '')
   ];
 
   languages.rust = {

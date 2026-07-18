@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(
     name = "hearth-guestd",
-    version,
+    version = hearth_guestd::VERSION,
     about = "In-guest Hearth agent-plane daemon"
 )]
 struct Cli {

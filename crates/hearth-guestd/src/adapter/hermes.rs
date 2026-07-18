@@ -145,7 +145,7 @@ impl HermesAdapter {
                     "clientCapabilities": {},
                     "clientInfo": {
                         "name": "hearth-guestd",
-                        "version": env!("CARGO_PKG_VERSION"),
+                        "version": crate::VERSION,
                     },
                 }),
             )

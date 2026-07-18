@@ -258,19 +258,19 @@ deliberately omits it) keeps working exactly as today, indefinitely:
   `AF_VSOCK` listener bug means it does not work at all). guestd replaces
   socat in new images; it does not obsolete old ones.
 
-Upgrade paths, in order of preference:
+Install and upgrade paths:
 
 1. **Rebuild + respawn** (hearth-native): rebuild the image on the new
    vm-base — guestd arrives for free — then `destroy`/`spawn`. Right whenever
    VM-local state is disposable, which is the design assumption everywhere
    else in Hearth.
-2. **Live retrofit over SSH** (escape hatch): guestd is a static binary plus
-   a unit file, and the mandatory SSH recovery access can install and start
-   it on a running VM with **no reboot** — the vsock device is already there,
-   so the first boot report arrives seconds after `systemctl start`. Flip
-   `guestd = true` on the manifest/service afterward. Deliberately *not* a
-   `hearthctl` verb: it is an operator escape hatch, not a supported fleet
-   operation, and the surface stays bounded.
+2. **Update an existing guestd over SSH**: `hearthctl upgrade [name]` copies the
+   packaged static binary through the logged-in operator's SSH agent, replaces
+   `/usr/local/bin/hearth-guestd` atomically, and restarts the existing unit.
+   It verifies the new boot report and rolls back the binary on failure. The
+   fleet form skips stopped, guestd-less, unreachable, and active-task VMs;
+   `--force` overrides only the active-task guard. This deliberately does not
+   install or change a unit, retrofit old images, or mutate manifests.
 
 Linter policy is a gradient, mirroring `min_kernel_contract`: the linter
 **warns** on a missing guestd (old vm-base) rather than failing the build,

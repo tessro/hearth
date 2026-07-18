@@ -109,6 +109,7 @@ start with it.
 # 1. Build and install the binaries, the systemd unit, and this doc.
 sudo make install
 #    -> /usr/local/bin/{hearthd,hearthctl}
+#    -> /usr/local/lib/hearth/guest/hearth-guestd
 #    -> /etc/systemd/system/hearth.service
 #    -> /usr/local/share/doc/hearth/operations.md
 
@@ -135,7 +136,7 @@ hearthctl host check          # paths/commands/modules/keyring, ok=true each
 run the unit from `/run` or your system config:
 
 ```sh
-sudo make install-bin                       # -> /usr/local/bin/{hearthd,hearthctl}
+sudo make install-bin install-guest-payload # -> host binaries + guest updater payload
 sudo cp systemd/hearth.service /run/systemd/system/   # runtime unit (survives until next boot)
 sudo systemctl daemon-reload && sudo systemctl enable --now hearth.service
 # For a persistent setup, add a systemd.services.hearth block to configuration.nix
@@ -209,3 +210,51 @@ Running VMs are transient systemd units and survive a daemon restart;
 `hearthd` reconciles them on start (see the `boot_config` note in §4). A guest
 kernel bump (rare) means rebuilding with `scripts/build-guest-kernel.sh` and
 restarting the affected VMs so they boot the new `current` kernel.
+
+### Updating hearth-guestd in existing VMs
+
+`make install` also installs the static musl guest payload outside the host's
+`PATH`, under `PREFIX/lib/hearth/guest/hearth-guestd`. Upgrade one running VM,
+or every eligible running VM, over the logged-in operator's normal OpenSSH
+connection:
+
+```sh
+hearthctl upgrade hermes-a
+hearthctl upgrade
+```
+
+The command connects as `agent`, so the matching key should already be
+available through `ssh-agent` (a forwarded laptop agent is fine) and the VM's
+host key should already be in the operator's normal `known_hosts`. SSH runs in
+batch mode: it never falls back to a password prompt. The guest's passwordless
+`sudo` installs the candidate atomically at `/usr/local/bin/hearth-guestd`,
+restarts the existing `hearth-guestd.service`, and leaves the unit and its
+drop-ins untouched. Hearth waits for a fresh boot report with the expected
+version. A failed start or health check restores
+`/usr/local/bin/hearth-guestd.previous`.
+
+Development builds append their source commit to the package version, for
+example `0.1.0+8c14e42`. The guest reports that same version, so upgrade output
+identifies both the old and new guestd commits.
+
+With no VM name, stopped VMs, guestd-less VMs, VMs without a resolved address,
+and VMs with a running/queued agent task are informational skips. Managed-SSH
+registry metadata is advisory: for every otherwise eligible VM, the command
+attempts the operator's ordinary SSH access. An explicitly named VM that is not
+eligible is an error. The active-task check reads guestd's durable task state
+over that SSH connection, so it does not require access to the host's agentd
+socket. Use `--force` to permit restarting guestd while a task is active; that
+task will be recorded as `failed(guestd_restart)`. Awaiting-input and terminal
+tasks do not block an upgrade.
+
+For a development build or a payload not installed under the same `PREFIX` as
+`hearthctl`, override the source explicitly:
+
+```sh
+hearthctl upgrade hermes-a \
+  --from ./target/x86_64-unknown-linux-musl/release/hearth-guestd
+```
+
+This command updates only VMs that already run and report a guestd. It does not
+install a unit, retrofit guestd-less images, start stopped VMs, or alter image
+manifests.

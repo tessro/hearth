@@ -23,7 +23,7 @@ pub async fn run(transport: Transport, thread_id: &str) -> Result<()> {
 
     // The one and only frame the shim authors: a hello selecting the MCP
     // channel and naming this session's thread.
-    let mut hello = Hello::new("mcp-shim", env!("CARGO_PKG_VERSION"));
+    let mut hello = Hello::new("mcp-shim", crate::VERSION);
     hello.channel = Some(HelloChannel::Mcp);
     hello.thread_id = Some(thread_id.to_string());
     host_write

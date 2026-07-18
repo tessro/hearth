@@ -113,9 +113,7 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
     let args = &req.args;
     match req.verb {
         AgentVerb::Ping => Ok(json!({ "pong": true, "component": "guestd" })),
-        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(env!(
-            "CARGO_PKG_VERSION"
-        ))),
+        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(crate::VERSION)),
         AgentVerb::AgentLs => Ok(json!({ "agents": engine.adapters() })),
         AgentVerb::TaskStart => {
             let agent = str_arg(args, "agent")?;

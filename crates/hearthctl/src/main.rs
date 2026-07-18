@@ -16,6 +16,7 @@ mod image_build;
 mod image_lint;
 mod oci;
 mod spawn;
+mod upgrade;
 mod wait;
 
 #[derive(Debug, Parser)]
@@ -192,6 +193,18 @@ enum Command {
         /// Give up after this many seconds.
         #[arg(long, default_value_t = 300)]
         timeout: u64,
+    },
+    /// Replace hearth-guestd in one running VM, or every eligible running VM.
+    Upgrade {
+        /// VM to upgrade. Omit to consider every registered VM.
+        name: Option<String>,
+        /// Guest binary to install. Defaults to the payload beside the installed
+        /// hearthctl under PREFIX/lib/hearth/guest/hearth-guestd.
+        #[arg(long = "from", value_name = "PATH")]
+        source: Option<Utf8PathBuf>,
+        /// Upgrade even when the VM has a running or queued agent task.
+        #[arg(long)]
+        force: bool,
     },
     /// Operate the agent plane via hearth-agentd (docs/agent-plane.md §10).
     Agent {
@@ -382,6 +395,22 @@ async fn main() -> Result<()> {
         return wait::run(&cli.socket, name, marker.as_deref(), *timeout).await;
     }
 
+    if let Command::Upgrade {
+        name,
+        source,
+        force,
+    } = &cli.command
+    {
+        return upgrade::run(
+            &cli.socket,
+            name.as_deref(),
+            source.as_deref(),
+            *force,
+            cli.json,
+        )
+        .await;
+    }
+
     if let Command::Agent { command } = &cli.command {
         return agent::run(&cli.agent_socket, command, cli.json).await;
     }
@@ -478,6 +507,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             args([("name", json!(name)), ("follow", json!(follow))]),
         ),
         Command::Wait { .. } => return Err(anyhow!("wait is handled locally")),
+        Command::Upgrade { .. } => return Err(anyhow!("upgrade is handled locally")),
         Command::Agent { .. } => return Err(anyhow!("agent is handled locally")),
         Command::Image { command } => match command {
             ImageCommand::Ls => (Verb::ImageLs, empty_args()),
@@ -1056,6 +1086,45 @@ mod tests {
         match cli.command {
             Command::Spawn { no_start, .. } => assert!(!no_start),
             other => panic!("expected spawn command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_parses_single_and_fleet_forms() {
+        let single = Cli::try_parse_from([
+            "hearthctl",
+            "upgrade",
+            "hermes-a",
+            "--from",
+            "./hearth-guestd",
+            "--force",
+        ])
+        .unwrap();
+        match single.command {
+            Command::Upgrade {
+                name,
+                source,
+                force,
+            } => {
+                assert_eq!(name.as_deref(), Some("hermes-a"));
+                assert_eq!(source, Some(Utf8PathBuf::from("./hearth-guestd")));
+                assert!(force);
+            }
+            other => panic!("expected upgrade command, got {other:?}"),
+        }
+
+        let fleet = Cli::try_parse_from(["hearthctl", "upgrade"]).unwrap();
+        match fleet.command {
+            Command::Upgrade {
+                name,
+                source,
+                force,
+            } => {
+                assert!(name.is_none());
+                assert!(source.is_none());
+                assert!(!force);
+            }
+            other => panic!("expected upgrade command, got {other:?}"),
         }
     }
 

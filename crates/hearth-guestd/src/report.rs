@@ -60,7 +60,7 @@ async fn report_once(
     let mut reader = BufReader::new(read);
 
     let frame = GuestFrame {
-        hello: Some(Hello::new("guestd", env!("CARGO_PKG_VERSION"))),
+        hello: Some(Hello::new("guestd", crate::VERSION)),
         report: Some(BootReport {
             ready: true,
             addrs: addrs.to_vec(),
@@ -142,7 +142,7 @@ async fn deliver_outbox(transport: &Transport, engine: &Arc<Engine>) -> Result<b
     let mut reader = BufReader::new(read);
 
     // Hello selecting the upcall channel (§2.4 / §7.2).
-    let mut hello = Hello::new("guestd", env!("CARGO_PKG_VERSION"));
+    let mut hello = Hello::new("guestd", crate::VERSION);
     hello.channel = Some(HelloChannel::Upcall);
     write
         .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())

@@ -1,5 +1,7 @@
 PREFIX      ?= /usr/local
 BINDIR      ?= $(PREFIX)/bin
+LIBDIR      ?= $(PREFIX)/lib
+GUESTPAYLOADDIR ?= $(LIBDIR)/hearth/guest
 UNITDIR     ?= /etc/systemd/system
 BRIDGE      ?= hearth0
 
@@ -8,7 +10,7 @@ INSTALL     ?= install
 
 BUILDAH     ?= buildah
 
-.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts check fmt test clippy dev install install-bin install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
+.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts check fmt test clippy dev install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
 
 build: host-bins
 
@@ -32,6 +34,7 @@ guest-bin:
 		echo "error: $(GUEST_BIN) is dynamically linked; refusing to stage it" >&2; \
 		exit 1; \
 	fi
+	@"$(GUEST_BIN)" --version
 	$(INSTALL) -D -m 0755 "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
 	@cmp --silent "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
 	@file "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
@@ -83,6 +86,11 @@ install-bin: host-bins
 	$(INSTALL) -D -m 0755 target/release/hearthctl    $(DESTDIR)$(BINDIR)/hearthctl
 	$(INSTALL) -D -m 0755 target/release/hearth-agentd $(DESTDIR)$(BINDIR)/hearth-agentd
 
+# Install the portable guest-only payload outside PATH. hearthctl derives this
+# location from its own PREFIX and uses it as the default `upgrade --from`.
+install-guest-payload: guest-bin
+	$(INSTALL) -D -m 0755 "$(GUEST_BIN)" "$(DESTDIR)$(GUESTPAYLOADDIR)/hearth-guestd"
+
 # Install the agent-plane host daemon unit (opt-in — the machine plane runs
 # without it). Requires a `hearth-agent` system user and the secret source files
 # LoadCredential= points at; see docs/agent-plane.md §4. Installed separately so
@@ -93,11 +101,11 @@ install-agentd: install-bin
 	@echo "Next: create the hearth-agent user, stage /etc/hearth/agent/{http-token,ref-key},"
 	@echo "      then: systemctl enable --now hearth-agentd.service"
 
-install: install-bin
+install: install-bin install-guest-payload
 	$(INSTALL) -D -m 0644 docs/operations.md $(DESTDIR)$(DOCDIR)/operations.md 2>/dev/null || true
 	@if $(INSTALL) -D -m 0644 systemd/hearth.service $(DESTDIR)$(UNITDIR)/hearth.service 2>/dev/null; then \
 		if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi; \
-		echo "Installed hearthd + hearthctl + hearth.service."; \
+		echo "Installed hearthd + hearthctl + guest payload + hearth.service."; \
 		echo "Next: hearthctl host check   then   systemctl enable --now hearth.service"; \
 		echo "Build the guest kernel first if you have not: scripts/build-guest-kernel.sh (see docs/operations.md)."; \
 	else \
@@ -110,6 +118,7 @@ install: install-bin
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/hearthd $(DESTDIR)$(BINDIR)/hearthctl $(DESTDIR)$(BINDIR)/hearth-agentd
+	rm -f $(DESTDIR)$(GUESTPAYLOADDIR)/hearth-guestd
 	rm -f $(DESTDIR)$(UNITDIR)/hearth.service $(DESTDIR)$(UNITDIR)/hearth-agentd.service
 	rm -f $(DESTDIR)$(DOCDIR)/operations.md
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
