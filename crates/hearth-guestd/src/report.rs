@@ -59,12 +59,13 @@ async fn report_once(
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
 
+    let mut reported_hostname = current_hostname().unwrap_or_else(|| hostname.to_string());
     let frame = GuestFrame {
         hello: Some(Hello::new("guestd", crate::VERSION)),
         report: Some(BootReport {
             ready: true,
             addrs: addrs.to_vec(),
-            hostname: hostname.to_string(),
+            hostname: reported_hostname.clone(),
             agents: agents.to_vec(),
             boot_id: boot_id.to_string(),
         }),
@@ -91,6 +92,28 @@ async fn report_once(
     // Heartbeat until the connection drops.
     loop {
         tokio::time::sleep(HEARTBEAT).await;
+        if let Some(hostname) = current_hostname().filter(|h| h != &reported_hostname) {
+            let frame = GuestFrame {
+                hello: None,
+                report: Some(BootReport {
+                    ready: true,
+                    addrs: addrs.to_vec(),
+                    hostname: hostname.clone(),
+                    agents: agents.to_vec(),
+                    boot_id: boot_id.to_string(),
+                }),
+                heartbeat: None,
+            };
+            write
+                .write_all((serde_json::to_string(&frame)? + "\n").as_bytes())
+                .await?;
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(());
+            }
+            reported_hostname = hostname;
+            continue;
+        }
         let frame = GuestFrame {
             hello: None,
             report: None,
@@ -102,6 +125,13 @@ async fn report_once(
             .write_all((serde_json::to_string(&frame)? + "\n").as_bytes())
             .await?;
     }
+}
+
+fn current_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Run the upcall/outbox loop forever: deliver every pending outbox entry to

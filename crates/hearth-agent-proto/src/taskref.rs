@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRefClaims {
     pub v: u32,
-    /// Target service (VM) name — resolves routing without scanning guests.
+    /// Fixed target VM id — resolves routing without scanning guests.
     pub target: String,
     pub task_id: String,
-    /// Who may present this ref: a service name, or "ui" for HTTP clients.
+    /// Who may present this ref: a fixed VM id, or "ui" for HTTP clients.
     pub initiator: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator_thread: Option<String>,

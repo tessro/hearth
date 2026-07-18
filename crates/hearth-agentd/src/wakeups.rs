@@ -44,20 +44,20 @@ impl Listeners {
         let mut active = self.active.lock().await;
         active.retain(|_, handle| !handle.is_finished());
         for endpoint in endpoints {
-            if !endpoint.running || active.contains_key(&endpoint.name) {
+            if !endpoint.running || active.contains_key(&endpoint.id) {
                 continue;
             }
-            match self.agentd.hearthd.guest_listener(&endpoint.name).await {
+            match self.agentd.hearthd.guest_listener(&endpoint.id).await {
                 Ok(listener) => {
                     let this = Arc::clone(self);
-                    let vm = endpoint.name.clone();
+                    let vm = endpoint.id.clone();
                     let handle = tokio::spawn(async move {
                         this.accept_loop(vm, listener).await;
                     });
-                    active.insert(endpoint.name, handle);
+                    active.insert(endpoint.id, handle);
                 }
                 Err(err) => {
-                    warn!(vm = %endpoint.name, error = %err, "failed to broker listener");
+                    warn!(hostname = %endpoint.hostname, id = %endpoint.id, error = %err, "failed to broker listener");
                 }
             }
         }

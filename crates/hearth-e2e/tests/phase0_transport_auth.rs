@@ -37,7 +37,7 @@ async fn agent_in_charge_verb_channel_works_over_hybrid_socket() {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|s| s["name"].as_str())
+        .filter_map(|s| s["hostname"].as_str())
         .collect();
     assert!(names.contains(&"boss") && names.contains(&"worker"));
 }
@@ -93,7 +93,7 @@ async fn agent_endpoints_lists_only_agent_enabled_vms() {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|a| a["name"].as_str())
+        .filter_map(|a| a["hostname"].as_str())
         .collect();
     assert!(names.contains(&"boss") && names.contains(&"worker"));
 }

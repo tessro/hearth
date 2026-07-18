@@ -80,7 +80,7 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
             let target = str_arg(args, "agent")?;
             let text = str_arg(args, "text")?;
             // The control socket is always a permitted delegator.
-            if !agentd.is_delegator(CONTROL_PRESENTER) {
+            if !agentd.is_delegator(CONTROL_PRESENTER, None) {
                 // "ui" is implicitly allowed from the control socket.
             }
             agentd
@@ -141,7 +141,7 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
                 }
                 if let Ok(value) = crate::relay::call(
                     &agentd.hearthd,
-                    &endpoint.name,
+                    &endpoint.id,
                     AgentVerb::TaskList,
                     Map::new(),
                 )
@@ -150,7 +150,8 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
                     if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
                         for task in tasks {
                             let mut task = task.clone();
-                            task["agent_vm"] = json!(endpoint.name);
+                            task["agent_id"] = json!(endpoint.id);
+                            task["agent_hostname"] = json!(endpoint.hostname);
                             all.push(task);
                         }
                     }
@@ -161,6 +162,9 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
         AgentVerb::TaskGc => Err(anyhow!("task.gc: run per-agent via the guest")),
         AgentVerb::SetSessionName => Err(anyhow!(
             "verb.denied: session.set-name is MCP-shim-internal"
+        )),
+        AgentVerb::SetHostname => Err(anyhow!(
+            "verb.denied: host.set-hostname is hearthd-internal"
         )),
         AgentVerb::InjectTurn => Err(anyhow!("verb.denied: inject.turn is guestd-internal")),
         AgentVerb::TaskAttach => unreachable!("attach handled before dispatch"),

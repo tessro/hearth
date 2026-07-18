@@ -217,6 +217,14 @@ async fn agui_run(
     cors: &[(String, String)],
     agent_vm: &str,
 ) -> Result<()> {
+    let requested_id = agentd
+        .hearthd
+        .agent_endpoints()
+        .await?
+        .into_iter()
+        .find(|endpoint| endpoint.hostname == agent_vm)
+        .map(|endpoint| endpoint.id)
+        .ok_or_else(|| anyhow!("agent.not_enabled: {agent_vm:?} is not an agent-enabled VM"))?;
     let input: Value = serde_json::from_slice(&req.body).context("parse RunAgentInput")?;
     let messages = input.get("messages").and_then(Value::as_array);
     let user_text = messages
@@ -249,7 +257,7 @@ async fn agui_run(
         }
         Some(token) => {
             let claims = agentd.resolve_ref(&token, "ui")?;
-            if claims.target != agent_vm {
+            if claims.target != requested_id {
                 return Err(anyhow!(
                     "task.target_mismatch: task belongs to {:?}, not {:?}",
                     claims.target,
@@ -375,7 +383,7 @@ async fn list_tasks(agentd: &Arc<Agentd>) -> Result<Value> {
         }
         if let Ok(value) = relay::call(
             &agentd.hearthd,
-            &endpoint.name,
+            &endpoint.id,
             AgentVerb::TaskList,
             Map::new(),
         )
@@ -384,9 +392,10 @@ async fn list_tasks(agentd: &Arc<Agentd>) -> Result<Value> {
             if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
                 for task in tasks {
                     let mut task = task.clone();
-                    task["agent_vm"] = json!(endpoint.name);
+                    task["agent_id"] = json!(endpoint.id);
+                    task["agent_hostname"] = json!(endpoint.hostname);
                     if let Some(task_id) = task.get("task_id").and_then(Value::as_str) {
-                        let task_ref = agentd.mint_ref(&endpoint.name, task_id, "ui", None);
+                        let task_ref = agentd.mint_ref(&endpoint.id, task_id, "ui", None);
                         task["task_ref"] = json!(task_ref);
                     }
                     all.push(task);

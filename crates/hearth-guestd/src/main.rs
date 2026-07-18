@@ -29,7 +29,7 @@ struct Cli {
     /// Emulated hybrid-vsock directory (unix transport only).
     #[arg(long, global = true, env = "HEARTH_GUESTD_UNIX_DIR")]
     unix_dir: Option<Utf8PathBuf>,
-    /// This VM's service name (unix transport only; identity is the socket
+    /// This VM's fixed id (unix transport only; identity is the socket
     /// path in production).
     #[arg(long, global = true, env = "HEARTH_GUESTD_VM")]
     vm: Option<String>,

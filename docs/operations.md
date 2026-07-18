@@ -59,8 +59,8 @@ not require a daemon restart. Per-VM `--ssh-key` and `--authorized-keys-file`
 values are additive. If the host file and request are both empty, create fails
 before allocating or forming a disk unless `--allow-no-ssh` is explicit.
 `hearthctl ls` and `status` report `configured`, `intentionally-disabled`, or
-`legacy-unknown`; pre-feature service records remain bootable but warn as
-`legacy-unknown` because Hearth cannot prove what their existing disks contain.
+`legacy-unknown`; manually migrated service records may show `legacy-unknown`
+because Hearth cannot prove what their existing disks contain.
 
 ### Guest kernel — `scripts/build-guest-kernel.sh` needs these
 
@@ -91,9 +91,10 @@ operator provides:
   `dhcp-range` MUST NOT overlap Hearth's static slice.
 - **A drop-in dir Hearth can write**, default `/etc/dnsmasq.d/hearth`
   (override `HEARTH_DNSMASQ_DROPIN_DIR`). Point dnsmasq at it, e.g.
-  `conf-dir=/etc/dnsmasq.d/hearth`. On `create` Hearth writes `<service>.conf`
-  with a `dhcp-host=<mac>,<ip>` line and SIGHUPs dnsmasq; on `destroy` it removes
-  it and SIGHUPs again. If the dir is absent, static leases are skipped with a
+  `conf-dir=/etc/dnsmasq.d/hearth`. On `create` Hearth writes `<id>.conf`
+  with a `dhcp-host=<mac>,<ip>,<hostname>` line and SIGHUPs dnsmasq; `rename`
+  updates that DNS label, and `destroy` removes the file. If the dir is absent,
+  static leases are skipped with a
   warning and VMs fall back to dynamic DHCP — they still boot.
 
 **Static-range constraint.** Hearth allocates each VM a reserved address from
@@ -247,7 +248,7 @@ Development builds append their source commit to the package version, for
 example `0.1.0+8c14e42`. The guest reports that same version, so upgrade output
 identifies both the old and new guestd commits.
 
-With no VM name, stopped VMs, guestd-less VMs, VMs without a resolved address,
+With no VM hostname, stopped VMs, guestd-less VMs, VMs without a resolved address,
 and VMs with a running/queued agent task are informational skips. Managed-SSH
 registry metadata is advisory: for every otherwise eligible VM, the command
 attempts the operator's ordinary SSH access. An explicitly named VM that is not

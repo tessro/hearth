@@ -67,9 +67,9 @@ pub fn allocate_ip(start: Ipv4Addr, count: u32, used: &BTreeSet<Ipv4Addr>) -> Op
 }
 
 /// The single `dhcp-host=` line a static-lease drop-in contains. dnsmasq pins
-/// `mac` to `ip` so the guest gets a stable, Hearth-chosen address.
-pub fn dhcp_host_line(mac: &str, ip: &str) -> String {
-    format!("dhcp-host={mac},{ip}\n")
+/// `mac` to `ip` and publishes `hostname` through dnsmasq DNS.
+pub fn dhcp_host_line(mac: &str, ip: &str, hostname: &str) -> String {
+    format!("dhcp-host={mac},{ip},{hostname}\n")
 }
 
 /// A service's publish surface with its resolved address, the input to
@@ -301,8 +301,8 @@ mod tests {
     #[test]
     fn dhcp_host_line_pins_mac_to_ip() {
         assert_eq!(
-            dhcp_host_line("52:54:00:8c:22:12", "10.26.8.16"),
-            "dhcp-host=52:54:00:8c:22:12,10.26.8.16\n"
+            dhcp_host_line("52:54:00:8c:22:12", "10.26.8.16", "web"),
+            "dhcp-host=52:54:00:8c:22:12,10.26.8.16,web\n"
         );
     }
 }

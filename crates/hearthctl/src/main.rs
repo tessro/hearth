@@ -76,6 +76,11 @@ enum Command {
         #[arg(long)]
         agent: bool,
     },
+    /// Change a VM's hostname without changing its fixed machine id.
+    Rename {
+        name: String,
+        hostname: String,
+    },
     /// Build (if needed), create, and start one VM from a template in a single
     /// command. Repeatable flags provision each VM independently.
     Spawn {
@@ -115,9 +120,6 @@ enum Command {
         /// Explicitly permit a VM with no managed SSH authorized keys.
         #[arg(long)]
         allow_no_ssh: bool,
-        /// VM hostname (default: the service name).
-        #[arg(long)]
-        hostname: Option<String>,
         #[arg(long)]
         cpu: Option<u32>,
         #[arg(long = "mem")]
@@ -346,7 +348,6 @@ async fn main() -> Result<()> {
         ssh_key,
         authorized_keys_file,
         allow_no_ssh,
-        hostname,
         cpu,
         memory_mib,
         disk_gib,
@@ -373,7 +374,6 @@ async fn main() -> Result<()> {
                 ssh_key: ssh_key.clone(),
                 authorized_keys_file: authorized_keys_file.clone(),
                 allow_no_ssh: *allow_no_ssh,
-                hostname: hostname.clone(),
                 cpu: *cpu,
                 memory_mib: *memory_mib,
                 disk_gib: *disk_gib,
@@ -454,7 +454,7 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             agent_in_charge,
             agent,
         } => {
-            let mut args = args([("name", json!(name)), ("image", json!(image))]);
+            let mut args = args([("hostname", json!(name)), ("image", json!(image))]);
             insert_opt(&mut args, "cpu", cpu.map(|v| json!(v)));
             insert_opt(&mut args, "memory_mib", memory_mib.map(|v| json!(v)));
             insert_opt(&mut args, "disk_gib", disk_gib.map(|v| json!(v)));
@@ -478,6 +478,10 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             (Verb::Create, args)
         }
         Command::Spawn { .. } => return Err(anyhow!("spawn is handled locally")),
+        Command::Rename { name, hostname } => (
+            Verb::Rename,
+            args([("name", json!(name)), ("hostname", json!(hostname))]),
+        ),
         Command::Destroy { name } => (Verb::Destroy, args([("name", json!(name))])),
         Command::Start { name } => (Verb::Start, args([("name", json!(name))])),
         Command::Stop { name } => (Verb::Stop, args([("name", json!(name))])),
@@ -645,11 +649,13 @@ fn render_ls(result: Option<&Value>) -> Result<()> {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_header([
-        "NAME", "ENABLED", "RUNNING", "GUESTD", "SSH", "IMAGE", "CPU", "MEM", "CID", "ADDRESS",
+        "HOSTNAME", "ID", "ENABLED", "RUNNING", "GUESTD", "SSH", "IMAGE", "CPU", "MEM", "CID",
+        "ADDRESS",
     ]);
     for svc in services {
         table.add_row([
-            cell(svc, "name"),
+            cell(svc, "hostname"),
+            cell(svc, "id"),
             cell(svc, "enabled"),
             cell(svc, "running"),
             guestd_cell(svc),
@@ -686,7 +692,7 @@ fn render_images(result: Option<&Value>) -> Result<()> {
 
 fn render_publishes(result: Option<&Value>) -> Result<()> {
     let service = result
-        .and_then(|v| v.get("name"))
+        .and_then(|v| v.get("hostname"))
         .and_then(Value::as_str)
         .unwrap_or("");
     let empty = Vec::new();
@@ -984,13 +990,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(verb, Verb::Create);
-        assert_eq!(args.get("name"), Some(&json!("web")));
+        assert_eq!(args.get("hostname"), Some(&json!("web")));
         assert_eq!(args.get("image"), Some(&json!("debian")));
         assert_eq!(args.get("cpu"), Some(&json!(4)));
         assert_eq!(args.get("memory_mib"), Some(&json!(4096)));
         assert_eq!(args.get("disk_gib"), Some(&json!(30)));
         assert_eq!(args.get("is_agent_in_charge"), Some(&json!(true)));
         assert_eq!(args["provision"]["allow_no_ssh"], json!(true));
+    }
+
+    #[test]
+    fn rename_maps_old_and_new_hostnames() {
+        let (verb, args) = to_request(&Command::Rename {
+            name: "web".to_string(),
+            hostname: "api".to_string(),
+        })
+        .unwrap();
+        assert_eq!(verb, Verb::Rename);
+        assert_eq!(args.get("name"), Some(&json!("web")));
+        assert_eq!(args.get("hostname"), Some(&json!("api")));
     }
 
     #[test]

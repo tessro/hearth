@@ -47,7 +47,7 @@ pub struct Config {
     /// is allowed.
     #[arg(long, env = "HEARTH_AGENT_CORS_ORIGINS", default_value = "")]
     pub cors_origins: String,
-    /// Delegation allowlist: service names permitted to delegate (§7.3).
+    /// Delegation allowlist: fixed VM ids permitted to delegate (§7.3).
     #[arg(long, env = "HEARTH_AGENT_DELEGATORS", default_value = "")]
     pub delegators: String,
     /// Signed-ref lifetime, seconds.

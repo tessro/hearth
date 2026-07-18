@@ -64,7 +64,8 @@ impl Hearthd {
             .into_iter()
             .filter_map(|entry| {
                 Some(AgentEndpoint {
-                    name: entry.get("name")?.as_str()?.to_string(),
+                    id: entry.get("id")?.as_str()?.to_string(),
+                    hostname: entry.get("hostname")?.as_str()?.to_string(),
                     running: entry
                         .get("running")
                         .and_then(Value::as_bool)
@@ -89,14 +90,22 @@ impl Hearthd {
             .collect())
     }
 
-    /// Broker: bind `<vm>.sock_1026` and receive the listening fd, wrapped as a
+    pub async fn set_hostname(&self, id: &str, hostname: &str) -> Result<Value> {
+        self.call(
+            Verb::Rename,
+            args(&[("id", json!(id)), ("hostname", json!(hostname))]),
+        )
+        .await
+    }
+
+    /// Broker: bind `<id>.sock_1026` and receive the listening fd, wrapped as a
     /// tokio listener that receives guestd upcalls + MCP frames.
-    pub async fn guest_listener(&self, vm: &str) -> Result<tokio::net::UnixListener> {
+    pub async fn guest_listener(&self, id: &str) -> Result<tokio::net::UnixListener> {
         let mut stream = self.connect().await?;
         let req = Request::new(
             Ulid::new().to_string(),
             Verb::GuestListener,
-            args(&[("name", json!(vm)), ("port", json!(PORT_AGENT))]),
+            args(&[("id", json!(id)), ("port", json!(PORT_AGENT))]),
         );
         write_request(&mut stream, &req).await?;
         let resp = read_response(&mut stream).await?;
@@ -116,12 +125,12 @@ impl Hearthd {
     /// Broker: connect `<vm>.sock` (CHV hybrid vsock), receive the connected
     /// fd, and perform the in-band `CONNECT 1027` handshake so the returned
     /// stream speaks directly to that guest's task-verb server.
-    pub async fn guest_connect(&self, vm: &str) -> Result<UnixStream> {
+    pub async fn guest_connect(&self, id: &str) -> Result<UnixStream> {
         let mut stream = self.connect().await?;
         let req = Request::new(
             Ulid::new().to_string(),
             Verb::GuestConnect,
-            args(&[("name", json!(vm))]),
+            args(&[("id", json!(id))]),
         );
         write_request(&mut stream, &req).await?;
         let resp = read_response(&mut stream).await?;
@@ -169,7 +178,8 @@ impl Hearthd {
 
 #[derive(Debug, Clone)]
 pub struct AgentEndpoint {
-    pub name: String,
+    pub id: String,
+    pub hostname: String,
     pub running: bool,
     pub is_agent_in_charge: bool,
     pub ready: bool,

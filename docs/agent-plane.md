@@ -415,7 +415,7 @@ content, and restart costs nothing but reconnects. It is deliberately **not
 authorization-stateless**:
 
 - **Task refs.** Every externally visible task handle is an opaque signed
-  reference: `{v, target_service, task_id, initiator, initiator_thread,
+  reference: `{v, target_id, task_id, initiator_id, initiator_thread,
   expiry}` + HMAC (key via `LoadCredential=`; current + previous key accepted
   to allow rotation). Refs are self-routing — agentd resolves the target VM
   from the ref without scanning guests — and unforgeable: a guest cannot
@@ -505,32 +505,33 @@ workaround #9 rule, applied from day 1).
 CHV's vsock device is the Firecracker-style **hybrid** model — there is no
 host-side `AF_VSOCK` at all:
 
-- **Host → guest**: connect to `/run/hearth/vsock/<vm>.sock`, send
+- **Host → guest**: connect to `/run/hearth/vsock/<id>.sock`, send
   `CONNECT <port>\n`, await `OK …\n`, then raw stream. Guestd listens on
   in-guest `AF_VSOCK` port 1027 (guest kernel: `CONFIG_VIRTIO_VSOCKETS=y`).
 - **Guest → host**: guest connects to CID 2 port P; CHV hands it to whoever
-  is listening on the host unix socket `/run/hearth/vsock/<vm>.sock_P`.
+  is listening on the host unix socket `/run/hearth/vsock/<id>.sock_P`.
 
 Port map (constants in `hearth-agent-proto`):
 
 | Port | Direction | Host endpoint | Purpose |
 |---|---|---|---|
-| 1024 | guest → host | `<vm>.sock_1024`, bound by **hearthd** | hearthd verb channel (agent-in-charge only — existing contract) |
-| 1025 | guest → host | `<vm>.sock_1025`, bound by **hearthd** | boot report / readiness / heartbeat / restore signal |
-| 1026 | guest → host | `<vm>.sock_1026`, bound by **hearthd, FD-passed to agentd** | MCP frames + guestd upcalls (hello selects channel) |
+| 1024 | guest → host | `<id>.sock_1024`, bound by **hearthd** | hearthd verb channel (agent-in-charge only — existing contract) |
+| 1025 | guest → host | `<id>.sock_1025`, bound by **hearthd** | boot report / readiness / heartbeat / restore signal |
+| 1026 | guest → host | `<id>.sock_1026`, bound by **hearthd, FD-passed to agentd** | MCP frames + guestd upcalls (hello selects channel) |
 | 1027 | host → guest | guestd in-guest listener | task verbs, attach streams, `inject.turn` |
 
-**Identity is the socket path.** Whichever VM's socket a connection arrives
-on *is* the caller — VMM-attested, no tokens between host and guest. The
-delegation allowlist (§7) keys on it directly.
+**Identity is the fixed id in the socket path.** Whichever VM's socket a
+connection arrives on is the caller. Hostnames remain discovery labels and may
+change without changing task refs, ledger grants, or delegation authority. The
+delegation allowlist (§7) should contain fixed ids.
 
 **Socket broker, not a shared directory.** `/run/hearth/vsock/` stays
 root-owned `0750`. agentd never opens paths in it. Instead, over its
 restricted hearthd channel it requests:
 
-- `guest-listener {vm, port}` → hearthd binds `<vm>.sock_<port>` (validating
+- `guest-listener {id, port}` → hearthd binds `<id>.sock_<port>` (validating
   the port is agent-plane) and passes the listening FD via `SCM_RIGHTS`;
-- `guest-connect {vm}` → hearthd connects `<vm>.sock` and passes the
+- `guest-connect {id}` → hearthd connects `<id>.sock` and passes the
   connected FD; agentd performs the `CONNECT 1027` handshake in-band.
 
 This closes the hole a group-writable (`2770`) directory would open — a
@@ -558,6 +559,7 @@ turn injection (back in).
 
 | Tool | Behavior |
 |---|---|
+| `set_hostname(hostname)` | change the calling VM's discovery hostname; its fixed id and active tasks do not change; guest hostname update is best-effort |
 | `set_session_name(name)` | replace the calling thread's display name in its own guestd and emit durable `CUSTOM hearth.session_name`; the shim-supplied thread id is authoritative |
 | `list_agents()` | agent-enabled VMs, their adapters, current task counts |
 | `delegate(agent, task, wait_seconds=0)` | policy check → ledger write → `task.start` on callee's guestd → returns `{task_ref, state}`; with `wait_seconds`, long-polls first and may return terminal state + result in one call. Denial returns (and ledgers) a rejection. |
@@ -660,9 +662,9 @@ the agent plane itself is wedged.
 
 1. **Per-peer-UID verb policy.** Today `peer_credentials()` feeds audit
    fields only; dispatch is unauthorized. Add a config-driven map
-   `uid/gid → allowed verbs`, default-allow for root/`hearth` group
-   (compatibility), and a minimal set for `hearth-agent`: `ping`, `version`,
-   `ls`, `status`, `agent-endpoints`, `guest-listener`, `guest-connect`.
+   `uid/gid → allowed verbs`, default-allow for root/`hearth` group, and a
+   minimal set for `hearth-agent`: `ping`, `version`, `ls`, `status`, `rename`,
+   `agent-endpoints`, `guest-listener`, `guest-connect`.
    (A separate read-only discovery socket is the acceptable alternative;
    the policy keeps one socket and matches "policy at the daemon".)
 2. **Socket broker verbs** (`guest-listener`, `guest-connect`) with

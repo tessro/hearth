@@ -103,9 +103,9 @@ impl Host for RealHost {
         fs::create_dir_all(cfg.run_dir.join("vms")).await?;
         fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
         fs::create_dir_all(&cfg.log_dir).await?;
-        unlink_stale(&cfg.vm_socket(&service.name)).await?;
-        unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
-        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
+        unlink_stale(&cfg.vm_socket(&service.id)).await?;
+        unlink_stale(&cfg.vm_vsock_socket(&service.id)).await?;
+        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.id)).await?;
         systemd_run_chv(service, cloud_hypervisor_argv(cfg, service, image)).await
     }
 
@@ -118,9 +118,9 @@ impl Host for RealHost {
         fs::create_dir_all(cfg.run_dir.join("vms")).await?;
         fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
         fs::create_dir_all(&cfg.log_dir).await?;
-        unlink_stale(&cfg.vm_socket(&service.name)).await?;
-        unlink_stale(&cfg.vm_vsock_socket(&service.name)).await?;
-        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.name)).await?;
+        unlink_stale(&cfg.vm_socket(&service.id)).await?;
+        unlink_stale(&cfg.vm_vsock_socket(&service.id)).await?;
+        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.id)).await?;
         systemd_run_chv(
             service,
             cloud_hypervisor_restore_argv(cfg, service, snapshot_dir),
@@ -277,7 +277,7 @@ async fn provision_raw_disk(disk: &Utf8Path, plan: &ProvisionPlan) -> Result<()>
 }
 
 async fn systemd_run_chv(service: &Service, argv: Vec<String>) -> Result<()> {
-    let unit = format!("hearth-vm-{}", service.name);
+    let unit = unit_name(&service.id);
     // A transient unit outlives the hearthd that created it, and one that
     // crash-looped into `failed` stays loaded. Either leaves the name claimed,
     // so a fresh `systemd-run --unit=<name>` fails with "already loaded or has a
@@ -328,7 +328,7 @@ fn image_argv(
     let mut args = vec![
         "cloud-hypervisor".to_string(),
         "--api-socket".to_string(),
-        cfg.vm_socket(&service.name).to_string(),
+        cfg.vm_socket(&service.id).to_string(),
         "--kernel".to_string(),
         cfg.guest_kernel.to_string(),
     ];
@@ -342,12 +342,12 @@ fn image_argv(
         "--cmdline".to_string(),
         kernel_cmdline(manifest),
         "--net".to_string(),
-        format!("tap={},mac={}", tap_name(&service.name), service.mac),
+        format!("tap={},mac={}", tap_name(&service.id), service.mac),
     ]);
     append_vsock(&mut args, cfg, service);
     args.extend([
         "--serial".to_string(),
-        format!("file={}", cfg.console_path(&service.name)),
+        format!("file={}", cfg.console_path(&service.id)),
         "--console".to_string(),
         "off".to_string(),
         "--cpus".to_string(),
@@ -366,7 +366,7 @@ fn append_vsock(args: &mut Vec<String>, cfg: &Config, service: &Service) {
         format!(
             "cid={},socket={}",
             service.vsock_cid,
-            cfg.vm_vsock_socket(&service.name)
+            cfg.vm_vsock_socket(&service.id)
         ),
     ]);
 }
@@ -386,11 +386,11 @@ pub fn cloud_hypervisor_restore_argv(
     vec![
         "cloud-hypervisor".to_string(),
         "--api-socket".to_string(),
-        cfg.vm_socket(&service.name).to_string(),
+        cfg.vm_socket(&service.id).to_string(),
         "--restore".to_string(),
         format!("source_url=file://{snapshot_dir},resume=true"),
         "--serial".to_string(),
-        format!("file={}", cfg.console_path(&service.name)),
+        format!("file={}", cfg.console_path(&service.id)),
         "--console".to_string(),
         "off".to_string(),
     ]

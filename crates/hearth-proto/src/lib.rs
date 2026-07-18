@@ -12,6 +12,7 @@ pub enum Verb {
     Ls,
     Status,
     Create,
+    Rename,
     Destroy,
     Start,
     Stop,
@@ -53,6 +54,7 @@ impl Verb {
         Verb::Ls,
         Verb::Status,
         Verb::Create,
+        Verb::Rename,
         Verb::Destroy,
         Verb::Start,
         Verb::Stop,
@@ -83,6 +85,7 @@ impl Verb {
             Self::Ls => "ls",
             Self::Status => "status",
             Self::Create => "create",
+            Self::Rename => "rename",
             Self::Destroy => "destroy",
             Self::Start => "start",
             Self::Stop => "stop",
@@ -372,6 +375,7 @@ mod tests {
                 | Verb::Ls
                 | Verb::Status
                 | Verb::Create
+                | Verb::Rename
                 | Verb::Destroy
                 | Verb::Start
                 | Verb::Stop
@@ -398,7 +402,7 @@ mod tests {
         for verb in Verb::ALL {
             witness(verb);
         }
-        assert_eq!(Verb::ALL.len(), 26, "Verb::ALL must list every variant");
+        assert_eq!(Verb::ALL.len(), 27, "Verb::ALL must list every variant");
         let mut names: Vec<&str> = Verb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();

@@ -69,7 +69,8 @@ only; it never learns what a task is.
 
 Long-running Rust daemon. Itself a systemd unit (`hearth.service`). Responsibilities:
 
-- Owns the service registry (`/etc/hearth/services/*.toml`) and the runtime mapping `service-name → { systemd unit, CHV API socket path, vsock CID, disk path, ... }`.
+- Owns the service registry (`/etc/hearth/services/*.toml`). Each VM has a fixed,
+  generated id for host resources and a mutable hostname for commands and DNS.
 - Listens on `/run/hearth.sock` (host) and on a vsock port (host CID 2, fixed port) for the agent-in-charge.
 - Accepts line-delimited JSON requests; validates against a verb allowlist; dispatches to:
   - `systemd-run` for VM process lifecycle (start/stop the CHV process itself).
@@ -89,17 +90,18 @@ Verbs (initial set):
 
 ```
 hearthctl ls                              # list services + state
-hearthctl status <name>                   # detailed status of one service
-hearthctl create <name> --from <image>    # provision new VM
-hearthctl destroy <name>                  # stop and remove VM, disk, config
-hearthctl start <name>                    # boot VM (idempotent)
-hearthctl stop <name>                     # graceful shutdown
-hearthctl restart <name>                  # graceful restart
-hearthctl reboot <name>                   # ACPI reboot inside guest
-hearthctl snapshot <name> [--tag t]       # CHV memory+disk snapshot
-hearthctl restore <name> [--tag t]        # restore from snapshot
-hearthctl resize <name> [--cpu N] [--mem M]  # live resize via CHV API
-hearthctl logs <name> [--follow]          # serial-console output
+hearthctl status <hostname>               # detailed status of one VM
+hearthctl create <hostname> --from <image> # provision new VM and generate its id
+hearthctl rename <old> <new>              # change hostname; retain fixed id
+hearthctl destroy <hostname>              # stop and remove VM, disk, config
+hearthctl start <hostname>                # boot VM (idempotent)
+hearthctl stop <hostname>                 # graceful shutdown
+hearthctl restart <hostname>              # graceful restart
+hearthctl reboot <hostname>               # ACPI reboot inside guest
+hearthctl snapshot <hostname> [--tag t]   # CHV memory+disk snapshot
+hearthctl restore <hostname> [--tag t]    # restore from snapshot
+hearthctl resize <hostname> [--cpu N] [--mem M] # live resize via CHV API
+hearthctl logs <hostname> [--follow]      # serial-console output
 hearthctl image ls                        # list base images
 hearthctl image build --name n --dockerfile ./Dockerfile --context . --disk 40
 hearthctl image rm <name>                 # remove base image
@@ -107,12 +109,14 @@ hearthctl image rm <name>                 # remove base image
 
 ### Per-VM Cloud Hypervisor processes
 
-One `cloud-hypervisor` process per VM, supervised by systemd as a transient unit named `hearth-vm-<name>.service`. Each has:
+One `cloud-hypervisor` process per VM, supervised by systemd as a transient unit
+named `hearth-vm-<id>.service`. Each has:
 
-- An API socket at `/run/hearth/vms/<name>.sock`.
+- An API socket at `/run/hearth/vms/<id>.sock`.
 - A vsock CID assigned by hearth.
 - A standalone qcow2 disk provisioned from the base image at create time.
-- Serial console redirected to a file at `/var/log/hearth/<name>.console` (this is what `hearthctl logs` tails).
+- Serial console redirected to `/var/log/hearth/<id>.console` (this is what
+  `hearthctl logs` tails).
 - Direct-kernel boot with the shared Hearth guest kernel, `root=/dev/vda`, and
   `init=<resolved OCI command>` from the image manifest.
 
@@ -146,7 +150,7 @@ Line-delimited JSON over a unix domain socket. One request per line, one respons
 **Response (failure):**
 
 ```json
-{"id": "01HXYZ...", "ok": false, "error": {"code": "service.not_found", "message": "no service named mail"}}
+{"id": "01HXYZ...", "ok": false, "error": {"code": "service.not_found", "message": "no service with hostname mail"}}
 ```
 
 **Streaming responses** (used by `logs --follow`) emit multiple lines tagged with the same `id`, terminated by a `{"id": ..., "ok": true, "stream": "end"}` line.
@@ -155,10 +159,11 @@ Why line-JSON not HTTP/gRPC: trivial to debug with `socat - UNIX:/run/hearth.soc
 
 ## Service model
 
-A service is a VM. Defined by a TOML file in `/etc/hearth/services/<name>.toml`:
+A service is a VM. Its record lives at `/etc/hearth/services/<id>.toml`:
 
 ```toml
-name        = "mail"
+id          = "vm-0123456789abcdef0123456789abcdef"
+hostname    = "mail"
 enabled     = true
 image       = "mail-vm"                   # image + manifest live in /var/lib/hearth/images/
 cpu         = 2
@@ -178,13 +183,17 @@ max_retries = 5
 backoff_sec = 10
 ```
 
-The registry is the source of truth for "what VMs exist." Runtime state (PID, current API socket, last-known status) is derived, not stored.
+The id never changes. It keys service files, allocations, disks, sockets, units,
+logs, snapshots, agent task refs, and delegation records. The hostname may
+change. It keys operator commands and the dnsmasq DNS record. The registry is
+the source of truth for what VMs exist; runtime state is derived.
 
 ## Lifecycle
 
 ### Create
 
-1. Validate name (kebab-case, not already in registry), merge the host recovery
+1. Validate the hostname (one DNS label, not already in the registry), generate
+   a fixed id, merge the host recovery
    keyring with request keys, and reject an empty or malformed effective set
    unless `allow_no_ssh` is explicit.
 2. Allocate vsock CID (next free integer ≥ 100) and MAC (locally administered range).
@@ -192,14 +201,16 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 4. Apply the per-service provisioning plan (hostname, machine-id, managed
    `/home/agent/.ssh/authorized_keys`, optional files), verify SSH file
    contents/mode/ownership,
-   then convert the scratch to `/var/lib/hearth/disks/<name>.qcow2`.
-5. Write `/etc/hearth/services/<name>.toml` with `enabled = false`.
-6. Return; do not boot. `hearthctl start <name>` is a separate step.
+   then convert the scratch to `/var/lib/hearth/disks/<id>.qcow2`.
+5. Write `/etc/hearth/services/<id>.toml` with `enabled = false`.
+6. Return; do not boot. `hearthctl start <hostname>` is a separate step.
 
 ### Boot (start)
 
 1. Read service config.
-2. Pre-create the per-VM tap (`ip tuntap add dev hrt-<name> mode tap`, then attach to `hearth0` and set up), then `systemd-run --unit=hearth-vm-<name> --collect --property=Restart=<policy> --property=TimeoutStopSec=30s cloud-hypervisor --api-socket /run/hearth/vms/<name>.sock --kernel /var/lib/hearth/kernels/current/vmlinux --disk path=<disk>.qcow2 --cmdline "console=ttyS0 root=/dev/vda rootfstype=ext4 rw init=<manifest-init>" --net tap=hrt-<name>,mac=<mac> --vsock cid=<cid>,socket=/run/hearth/vsock/<name>.sock --serial file=/var/log/hearth/<name>.console --console off --cpus boot=<cpu> --memory size=<mem>M --balloon size=0,free_page_reporting=on`.
+2. Create the tap, transient unit, CHV API socket, vsock socket, and console log
+   from the fixed id, then start Cloud Hypervisor with the recorded disk, MAC,
+   CID, CPU, and memory settings.
 3. Wait for CHV API socket to be ready (poll with timeout).
 4. Mark `enabled = true` in registry (so reboot survives host restart).
 5. Return current status.
@@ -208,7 +219,8 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 
 1. `PUT /api/v1/vm.shutdown` on the per-VM API socket (ACPI signal to guest).
 2. Wait up to `TimeoutStopSec` for the systemd unit to go inactive (i.e., CHV process to exit).
-3. If timeout, escalate: `PUT /api/v1/vm.power-off` (hard stop), then `systemctl stop hearth-vm-<name>` if still up.
+3. If timeout, escalate: `PUT /api/v1/vm.power-off` (hard stop), then
+   `systemctl stop hearth-vm-<id>` if still up.
 4. Mark `enabled = false` in registry.
 
 ### Reboot
@@ -217,7 +229,9 @@ The registry is the source of truth for "what VMs exist." Runtime state (PID, cu
 
 ### Snapshot / Restore
 
-CHV's `vm.snapshot` produces a directory with memory state + disk metadata. Hearth stores under `/var/lib/hearth/snapshots/<name>/<tag>/`. Restore is `vm.restore` against that directory. Note: this is *memory-snapshot* style (pause → snapshot → resume), not qcow2-layered.
+CHV's `vm.snapshot` produces a directory with memory state + disk metadata.
+Hearth stores it under `/var/lib/hearth/snapshots/<id>/<tag>/`. Restore is
+`vm.restore` against that directory.
 
 ### Resize
 
@@ -227,14 +241,15 @@ CHV's `vm.snapshot` produces a directory with memory state + disk metadata. Hear
 
 1. Stop if running.
 2. Remove disk, snapshot directory, console log.
-3. Remove `/etc/hearth/services/<name>.toml`.
+3. Remove `/etc/hearth/services/<id>.toml`.
 4. Free vsock CID and MAC in the registry's allocation map.
 
 ## Networking
 
 One host bridge `hearth0` carries all VM traffic. Hearth does not manage the bridge — it expects it to exist on the host, declared in the NixOS module that ships alongside hearth (which also stands up dnsmasq for DHCP + DNS and the nftables rules for NAT to upstream).
 
-Each VM gets a persistent tap named `hrt-<service>`, created by hearthd at start time and attached to `hearth0`. The tap is named explicitly rather than letting CHV pick — CHV's `--net` doesn't accept `bridge=`, so the bridge attachment happens outside CHV before launch.
+Each VM gets a tap derived from its fixed id, created by hearthd at start time
+and attached to `hearth0`.
 
 Guest network configuration is part of the image contract; the standard base
 uses systemd-networkd with DHCP. The dnsmasq instance on `hearth0` answers.
@@ -295,13 +310,14 @@ Day 1 model is intentionally minimal:
 
 - **Host-local socket** (`/run/hearth.sock`): protected by Unix filesystem permissions (`0660`, owned by `root:hearth`). Any human user in the `hearth` group can issue any verb.
 - **Vsock channel**: dispatches machine-plane verbs only for connections on the agent-in-charge VM's `<vm>.sock_1024` socket. That channel can issue any verb in the allowlist, including lifecycle; the socket-broker verbs are refused on it.
-- **Verb allowlist + per-peer-UID policy**: enforced at hearthd. A config-driven map (`/etc/hearth/verb-policy.toml`) grants specific uids/gids a restricted verb set; the built-in default keeps root and the `hearth` group at full access. This is what lets `hearth-agentd` run as an unprivileged `hearth-agent` user with exactly `ping`/`version`/`ls`/`status`/`agent-endpoints`/`guest-listener`/`guest-connect` and nothing else — the socket broker (`guest-listener`/`guest-connect`) passes brokered fds via `SCM_RIGHTS` so agentd never opens the root-owned vsock directory itself.
+- **Verb allowlist + per-peer-UID policy**: enforced at hearthd. A config-driven map (`/etc/hearth/verb-policy.toml`) grants specific uids/gids a restricted verb set; the built-in default keeps root and the `hearth` group at full access. This is what lets `hearth-agentd` run as an unprivileged `hearth-agent` user with exactly `ping`/`version`/`ls`/`status`/`rename`/`agent-endpoints`/`guest-listener`/`guest-connect` and nothing else — the socket broker (`guest-listener`/`guest-connect`) passes brokered fds via `SCM_RIGHTS` so agentd never opens the root-owned vsock directory itself.
 
 Audit log: every request, including caller identity (uid for unix-socket, CID for vsock), verb, args, result code, and duration, written to journald with structured fields. `journalctl -u hearth.service` is the canonical audit view.
 
 ## Supervision model
 
-VM processes are not their own systemd units on disk. hearthd issues `systemd-run --unit=hearth-vm-<name> --collect ...` per VM. systemd handles:
+VM processes are not their own systemd units on disk. hearthd issues
+`systemd-run --unit=hearth-vm-<id> --collect ...` per VM. systemd handles:
 
 - cgroup isolation,
 - restart policy (configurable per-service),

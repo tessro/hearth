@@ -195,11 +195,12 @@ mod tests {
             r#"
 [[peer]]
 uid = 993
-verbs = ["ping", "version", "ls", "status", "agent-endpoints", "guest-listener", "guest-connect"]
+verbs = ["ping", "version", "ls", "status", "rename", "agent-endpoints", "guest-listener", "guest-connect"]
 "#,
         )
         .unwrap();
         assert!(policy.allows(Some(993), Some(0), &Verb::Ping));
+        assert!(policy.allows(Some(993), Some(0), &Verb::Rename));
         assert!(policy.allows(Some(993), Some(0), &Verb::GuestConnect));
         assert!(!policy.allows(Some(993), Some(0), &Verb::Destroy));
         assert!(!policy.allows(Some(993), Some(0), &Verb::Create));

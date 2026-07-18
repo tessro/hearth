@@ -11,7 +11,11 @@ use tokio::fs;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
-    pub name: String,
+    /// Fixed machine identity. This keys all host resources and agent-plane
+    /// authority; changing the hostname never changes this value.
+    pub id: String,
+    /// Mutable DNS label used by operators and service discovery.
+    pub hostname: String,
     pub enabled: bool,
     pub image: String,
     pub cpu: u32,
@@ -26,10 +30,9 @@ pub struct Service {
     /// setting it requires a guestd-declaring image at create time.
     #[serde(default)]
     pub agent: bool,
-    // Recorded per-VM disk filename (e.g. `web.raw` or `mail.qcow2`). Older
-    // services predate this field; `Config::disk_path` falls back to the legacy
-    // `{name}.qcow2` when it is absent. Must stay a scalar (before the tables
-    // below) so `toml::to_string_pretty` serializes it.
+    // Recorded per-VM disk filename (e.g. `web.raw` or `mail.qcow2`). When this
+    // is absent, `Config::disk_path` uses `{id}.qcow2`. Must stay a scalar
+    // (before the tables below) so `toml::to_string_pretty` serializes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<String>,
     // Managed host->guest port forwards (REFACTOR_PROPOSAL.md §4.3). An array of
@@ -315,8 +318,17 @@ pub struct Allocations {
 
 #[derive(Debug, Clone)]
 pub struct Registry {
+    /// Services indexed by their mutable hostname.
     pub services: BTreeMap<String, Service>,
     pub allocations: Allocations,
+}
+
+pub fn validate_hostname(name: &str) -> Result<()> {
+    validate_name(name)?;
+    if name.len() > 63 {
+        bail!("hostnames must be at most 63 characters");
+    }
+    Ok(())
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -324,14 +336,31 @@ pub fn validate_name(name: &str) -> Result<()> {
     if re.is_match(name) {
         Ok(())
     } else {
-        bail!("service names must be kebab-case and start with a letter")
+        bail!("names must be kebab-case and start with a letter")
     }
+}
+
+pub fn validate_id(id: &str) -> Result<()> {
+    let re = Regex::new(r"^vm-[0-9a-f]{32}$").unwrap();
+    if re.is_match(id) {
+        Ok(())
+    } else {
+        bail!("VM ids must have the form vm- followed by 32 lowercase hex digits")
+    }
+}
+
+pub fn generate_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("vm-{}", hex::encode(bytes))
 }
 
 impl Registry {
     pub async fn load(cfg: &Config) -> Result<Self> {
         fs::create_dir_all(&cfg.services_dir).await?;
         let mut services = BTreeMap::new();
+        let mut ids = BTreeSet::new();
         let mut entries = fs::read_dir(&cfg.services_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = Utf8PathBuf::from_path_buf(entry.path())
@@ -343,9 +372,16 @@ impl Registry {
                 .await
                 .with_context(|| format!("read {path}"))?;
             let svc: Service = toml::from_str(&text).with_context(|| format!("parse {path}"))?;
-            validate_name(&svc.name)?;
-            if services.insert(svc.name.clone(), svc).is_some() {
-                bail!("duplicate service name in registry");
+            validate_id(&svc.id)?;
+            validate_hostname(&svc.hostname)?;
+            if !ids.insert(svc.id.clone()) {
+                bail!("duplicate VM id in registry: {}", svc.id);
+            }
+            if path.file_stem() != Some(svc.id.as_str()) {
+                bail!("service file {path} must be named {}.toml", svc.id);
+            }
+            if services.insert(svc.hostname.clone(), svc).is_some() {
+                bail!("duplicate service hostname in registry");
             }
         }
         let allocations = match fs::read_to_string(&cfg.allocations).await {
@@ -353,6 +389,7 @@ impl Registry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Allocations::default(),
             Err(e) => return Err(e).context("read allocations"),
         };
+        validate_allocation_ids(&allocations)?;
         Self::validate_agent_in_charge(&services)?;
         Ok(Self {
             services,
@@ -360,20 +397,30 @@ impl Registry {
         })
     }
 
-    pub fn get(&self, name: &str) -> Result<&Service> {
+    pub fn get(&self, hostname: &str) -> Result<&Service> {
+        self.services.get(hostname).ok_or_else(|| {
+            coded(
+                "service.not_found",
+                format!("no service with hostname {hostname}"),
+            )
+        })
+    }
+
+    pub fn get_by_id(&self, id: &str) -> Result<&Service> {
         self.services
-            .get(name)
-            .ok_or_else(|| coded("service.not_found", format!("no service named {name}")))
+            .values()
+            .find(|svc| svc.id == id)
+            .ok_or_else(|| coded("service.not_found", format!("no service with id {id}")))
     }
 
     pub async fn write_service(cfg: &Config, svc: &Service) -> Result<()> {
         fs::create_dir_all(&cfg.services_dir).await?;
-        let path = service_path(&cfg.services_dir, &svc.name);
+        let path = service_path(&cfg.services_dir, &svc.id);
         atomic_write_toml(&path, svc).await
     }
 
-    pub async fn remove_service(cfg: &Config, name: &str) -> Result<()> {
-        let path = service_path(&cfg.services_dir, name);
+    pub async fn remove_service(cfg: &Config, id: &str) -> Result<()> {
+        let path = service_path(&cfg.services_dir, id);
         match fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -393,7 +440,7 @@ impl Registry {
     /// the service still boots with dynamic DHCP, it just gets no reservation.
     pub fn allocate(
         &mut self,
-        name: &str,
+        id: &str,
         static_start: std::net::Ipv4Addr,
         static_count: u32,
     ) -> (u32, String, Option<String>) {
@@ -425,18 +472,18 @@ impl Registry {
             .collect();
         let ip =
             crate::net::allocate_ip(static_start, static_count, &used_ips).map(|ip| ip.to_string());
-        self.allocations.vsock_cids.insert(name.to_string(), cid);
-        self.allocations.macs.insert(name.to_string(), mac.clone());
+        self.allocations.vsock_cids.insert(id.to_string(), cid);
+        self.allocations.macs.insert(id.to_string(), mac.clone());
         if let Some(ip) = &ip {
-            self.allocations.ips.insert(name.to_string(), ip.clone());
+            self.allocations.ips.insert(id.to_string(), ip.clone());
         }
         (cid, mac, ip)
     }
 
-    pub fn free(&mut self, name: &str) {
-        self.allocations.vsock_cids.remove(name);
-        self.allocations.macs.remove(name);
-        self.allocations.ips.remove(name);
+    pub fn free(&mut self, id: &str) {
+        self.allocations.vsock_cids.remove(id);
+        self.allocations.macs.remove(id);
+        self.allocations.ips.remove(id);
     }
 
     fn validate_agent_in_charge(services: &BTreeMap<String, Service>) -> Result<()> {
@@ -448,8 +495,20 @@ impl Registry {
     }
 }
 
-pub fn service_path(dir: &Utf8Path, name: &str) -> Utf8PathBuf {
-    dir.join(format!("{name}.toml"))
+fn validate_allocation_ids(allocations: &Allocations) -> Result<()> {
+    for id in allocations
+        .vsock_cids
+        .keys()
+        .chain(allocations.macs.keys())
+        .chain(allocations.ips.keys())
+    {
+        validate_id(id).with_context(|| format!("invalid allocation key {id}"))?;
+    }
+    Ok(())
+}
+
+pub fn service_path(dir: &Utf8Path, id: &str) -> Utf8PathBuf {
+    dir.join(format!("{id}.toml"))
 }
 
 async fn atomic_write_toml<T: Serialize>(path: &Utf8Path, value: &T) -> Result<()> {
@@ -693,7 +752,8 @@ mod tests {
     fn service_with_publish_round_trips_through_toml() {
         let mut svc: Service = toml::from_str(
             r#"
-name = "hermes"
+id = "vm-00000000000000000000000000000001"
+hostname = "hermes"
 enabled = false
 image = "hermes-vm"
 cpu = 4
@@ -721,7 +781,8 @@ mac = "52:54:00:12:34:56"
     #[test]
     fn service_without_provision_section_still_parses() {
         let text = r#"
-name = "mail"
+id = "vm-00000000000000000000000000000002"
+hostname = "mail"
 enabled = true
 image = "base"
 cpu = 2
@@ -738,10 +799,33 @@ mac = "52:54:00:12:34:56"
     }
 
     #[test]
+    fn legacy_name_only_service_schema_is_rejected() {
+        let legacy = r#"
+name = "web"
+enabled = false
+image = "base"
+cpu = 2
+memory_mib = 2048
+disk_gib = 20
+vsock_cid = 100
+mac = "52:54:00:12:34:56"
+"#;
+        assert!(toml::from_str::<Service>(legacy).is_err());
+    }
+
+    #[test]
+    fn legacy_name_keyed_allocations_are_rejected() {
+        let mut allocations = Allocations::default();
+        allocations.vsock_cids.insert("web".to_string(), 100);
+        assert!(validate_allocation_ids(&allocations).is_err());
+    }
+
+    #[test]
     fn service_with_provision_round_trips_through_toml() {
         let mut svc: Service = toml::from_str(
             r#"
-name = "hermes"
+id = "vm-00000000000000000000000000000003"
+hostname = "hermes"
 enabled = false
 image = "hermes-vm"
 cpu = 4

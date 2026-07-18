@@ -81,11 +81,13 @@ pub struct Harness {
     /// restart is content-preserving.
     agentd_args: Vec<String>,
     agentd_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    agent_names: Vec<String>,
     _tmp: tempfile::TempDir,
 }
 
 impl Harness {
     pub async fn start(opts: HarnessOptions) -> Result<Self> {
+        let agent_names = opts.agents.iter().map(|a| a.name.clone()).collect();
         let tmp = tempfile::tempdir()?;
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf())
             .map_err(|_| anyhow!("non-utf8 tmp path"))?;
@@ -106,7 +108,7 @@ impl Harness {
             &policy,
             format!(
                 "[[peer]]\nuid = {uid}\nverbs = [\"ping\", \"version\", \"ls\", \"status\", \
-                 \"wait\", \"agent-endpoints\", \"guest-listener\", \"guest-connect\"]\n"
+                 \"wait\", \"rename\", \"agent-endpoints\", \"guest-listener\", \"guest-connect\"]\n"
             ),
         )
         .await?;
@@ -176,7 +178,7 @@ impl Harness {
             )?;
             let transport = hearth_guestd::transport::Transport::Unix {
                 dir: vsock_dir.clone(),
-                vm: spec.name.clone(),
+                vm: vm_id(&spec.name),
             };
             let name = spec.name.clone();
             tokio::spawn(async move {
@@ -236,6 +238,7 @@ impl Harness {
             http,
             agentd_args,
             agentd_handle: std::sync::Mutex::new(Some(handle)),
+            agent_names,
             _tmp: tmp,
         };
 
@@ -269,7 +272,7 @@ impl Harness {
 
     /// Direct guestd ping over the CHV-hybrid emulation (host→guest, port 1027).
     pub async fn wait_guest_ready(&self, vm: &str) -> Result<()> {
-        let path = self.vsock_dir.join(format!("{vm}.sock"));
+        let path = self.vsock_dir.join(format!("{}.sock", vm_id(vm)));
         for _ in 0..200 {
             if let Ok(mut stream) = UnixStream::connect(path.as_str()).await {
                 if hybrid::connect_handshake(&mut stream, hearth_agent_proto::PORT_GUESTD)
@@ -301,7 +304,7 @@ impl Harness {
     /// agent-plane hello. Protocol-negative tests use this to prove guestd
     /// refuses missing or incompatible first frames.
     pub async fn guest_connect_transport_only(&self, vm: &str) -> Result<UnixStream> {
-        let path = self.vsock_dir.join(format!("{vm}.sock"));
+        let path = self.vsock_dir.join(format!("{}.sock", vm_id(vm)));
         let mut stream = UnixStream::connect(path.as_str())
             .await
             .with_context(|| format!("connect guest {vm}"))?;
@@ -312,7 +315,7 @@ impl Harness {
     /// Connect to a guest's machine-plane verb channel (`<vm>.sock_1024`) — the
     /// agent-in-charge path (Phase 0).
     pub async fn guest_verb_channel(&self, vm: &str) -> Result<UnixStream> {
-        let path = self.vsock_dir.join(format!("{vm}.sock_1024"));
+        let path = self.vsock_dir.join(format!("{}.sock_1024", vm_id(vm)));
         UnixStream::connect(path.as_str())
             .await
             .with_context(|| format!("connect {vm} verb channel"))
@@ -389,20 +392,23 @@ impl Harness {
     }
 }
 
-fn harness_agent_names(_h: &Harness) -> Vec<String> {
-    // Names are recovered from the service files written at start; re-read them.
-    let dir = _h.root.join("services");
-    let mut names = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir.as_std_path()) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(stem) = name.strip_suffix(".toml") {
-                names.push(stem.to_string());
-            }
-        }
-    }
+fn harness_agent_names(h: &Harness) -> Vec<String> {
+    let mut names = h.agent_names.clone();
     names.sort();
     names
+}
+
+pub fn vm_id(hostname: &str) -> String {
+    fn fnv(seed: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(seed, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+    }
+    format!(
+        "vm-{:016x}{:016x}",
+        fnv(0xcbf29ce484222325, hostname.as_bytes()),
+        fnv(0x84222325cbf29ce4, hostname.as_bytes())
+    )
 }
 
 /// One request/response on a guest task-verb stream (after CONNECT handshake).
@@ -481,8 +487,10 @@ async fn write_service_toml(
     agent: bool,
     is_agent_in_charge: bool,
 ) -> Result<()> {
+    let id = vm_id(name);
     let toml = format!(
-        r#"name = "{name}"
+        r#"id = "{id}"
+hostname = "{name}"
 enabled = true
 image = "agent-img"
 cpu = 2
@@ -496,7 +504,7 @@ agent = {agent}
         cid = 100 + (name.len() as u32),
         mac = name.bytes().next().unwrap_or(1),
     );
-    tokio::fs::write(services.join(format!("{name}.toml")), toml).await?;
+    tokio::fs::write(services.join(format!("{id}.toml")), toml).await?;
     Ok(())
 }
 
@@ -547,7 +555,7 @@ impl McpClient {
     /// Connect as `vm`'s shim: dial the emulated host port 1026 and send the
     /// MCP-channel hello.
     pub async fn connect(h: &Harness, vm: &str, thread_id: &str) -> Result<Self> {
-        let path = h.vsock_dir.join(format!("{vm}.sock_1026"));
+        let path = h.vsock_dir.join(format!("{}.sock_1026", vm_id(vm)));
         // The broker may not have bound the listener yet; retry briefly.
         let mut stream = None;
         for _ in 0..200 {

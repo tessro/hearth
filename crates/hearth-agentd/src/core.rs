@@ -66,32 +66,25 @@ impl Agentd {
         let mut agents = Vec::new();
         for endpoint in endpoints {
             let (adapters, task_count) = if endpoint.running && endpoint.ready {
-                let adapters = relay::call(
-                    &self.hearthd,
-                    &endpoint.name,
-                    AgentVerb::AgentLs,
-                    Map::new(),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("agents").cloned())
-                .unwrap_or(json!([]));
-                let count = relay::call(
-                    &self.hearthd,
-                    &endpoint.name,
-                    AgentVerb::TaskList,
-                    Map::new(),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("tasks").and_then(Value::as_array).map(|t| t.len()))
-                .unwrap_or(0);
+                let adapters =
+                    relay::call(&self.hearthd, &endpoint.id, AgentVerb::AgentLs, Map::new())
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("agents").cloned())
+                        .unwrap_or(json!([]));
+                let count =
+                    relay::call(&self.hearthd, &endpoint.id, AgentVerb::TaskList, Map::new())
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("tasks").and_then(Value::as_array).map(|t| t.len()))
+                        .unwrap_or(0);
                 (adapters, count)
             } else {
                 (json!([]), 0)
             };
             agents.push(json!({
-                "name": endpoint.name,
+                "id": endpoint.id,
+                "hostname": endpoint.hostname,
                 "running": endpoint.running,
                 "ready": endpoint.ready,
                 "is_agent_in_charge": endpoint.is_agent_in_charge,
@@ -112,7 +105,9 @@ impl Agentd {
         target: &str,
         text: &str,
     ) -> Result<Value> {
-        if !self.is_delegator(initiator) {
+        let endpoints = self.hearthd.agent_endpoints().await?;
+        let initiator_endpoint = endpoints.iter().find(|e| e.id == initiator);
+        if !self.is_delegator(initiator, initiator_endpoint.map(|e| e.hostname.as_str())) {
             self.ledger.append(LedgerRecord::Rejected {
                 initiator: initiator.to_string(),
                 target: target.to_string(),
@@ -123,8 +118,7 @@ impl Agentd {
             bail!("delegation.rejected: {initiator:?} is not permitted to delegate");
         }
         // Confirm the target is agent-enabled before starting anything.
-        let endpoints = self.hearthd.agent_endpoints().await?;
-        if !endpoints.iter().any(|e| e.name == target) {
+        let Some(target_endpoint) = endpoints.iter().find(|e| e.hostname == target) else {
             self.ledger.append(LedgerRecord::Rejected {
                 initiator: initiator.to_string(),
                 target: target.to_string(),
@@ -133,7 +127,8 @@ impl Agentd {
             })?;
             self.audit("delegate", initiator, target, "rejected", None);
             bail!("agent.not_enabled: {target:?} is not an agent-enabled VM");
-        }
+        };
+        let target_id = target_endpoint.id.clone();
 
         // Ledger the grant BEFORE starting the task (§7.1: policy → ledger →
         // start). The task_id is minted here and pinned into task.start, so the
@@ -145,7 +140,7 @@ impl Agentd {
             task_id: task_id.clone(),
             initiator: initiator.to_string(),
             initiator_thread: initiator_thread.map(str::to_string),
-            target: target.to_string(),
+            target: target_id.clone(),
             ts: crate::ledger::now(),
         })?;
         self.audit("delegate", initiator, target, "granted", Some(&task_id));
@@ -153,7 +148,7 @@ impl Agentd {
         let mut args = Map::new();
         args.insert(
             "agent".to_string(),
-            json!(default_agent_for(&endpoints, target)),
+            json!(default_agent_for(&endpoints, &target_id)),
         );
         args.insert("text".to_string(), json!(text));
         args.insert("detach".to_string(), json!(true));
@@ -166,7 +161,8 @@ impl Agentd {
                 "thread_id": initiator_thread,
             }),
         );
-        let started = match relay::call(&self.hearthd, target, AgentVerb::TaskStart, args).await {
+        let started = match relay::call(&self.hearthd, &target_id, AgentVerb::TaskStart, args).await
+        {
             Ok(started) => started,
             Err(err) => {
                 // The task never started: revoke the grant so a stale entry
@@ -176,7 +172,7 @@ impl Agentd {
             }
         };
 
-        let task_ref = self.mint_ref(target, &task_id, initiator, initiator_thread);
+        let task_ref = self.mint_ref(&target_id, &task_id, initiator, initiator_thread);
         Ok(json!({
             "task_ref": task_ref,
             "task_id": task_id,
@@ -197,16 +193,18 @@ impl Agentd {
         text: &str,
     ) -> Result<Value> {
         let endpoints = self.hearthd.agent_endpoints().await?;
-        if !endpoints.iter().any(|e| e.name == target && e.running) {
+        let Some(target_endpoint) = endpoints.iter().find(|e| e.hostname == target && e.running)
+        else {
             bail!("agent.not_enabled: {target:?} is not a running agent-enabled VM");
-        }
+        };
+        let target_id = target_endpoint.id.clone();
         // Ledger-before-start (§7.1), same ordering as agent-to-agent delegate.
         let task_id = ulid::Ulid::new().to_string();
         self.ledger.append(LedgerRecord::Granted {
             task_id: task_id.clone(),
             initiator: presenter.to_string(),
             initiator_thread: None,
-            target: target.to_string(),
+            target: target_id.clone(),
             ts: crate::ledger::now(),
         })?;
         self.audit("task.start", presenter, target, "granted", Some(&task_id));
@@ -214,7 +212,7 @@ impl Agentd {
         let mut args = Map::new();
         args.insert(
             "agent".to_string(),
-            json!(default_agent_for(&endpoints, target)),
+            json!(default_agent_for(&endpoints, &target_id)),
         );
         args.insert("text".to_string(), json!(text));
         args.insert("detach".to_string(), json!(true));
@@ -223,14 +221,15 @@ impl Agentd {
             "initiator".to_string(),
             json!({ "kind": "ui", "service": presenter }),
         );
-        let started = match relay::call(&self.hearthd, target, AgentVerb::TaskStart, args).await {
+        let started = match relay::call(&self.hearthd, &target_id, AgentVerb::TaskStart, args).await
+        {
             Ok(started) => started,
             Err(err) => {
                 let _ = self.cancel_grant(&task_id);
                 return Err(err);
             }
         };
-        let task_ref = self.mint_ref(target, &task_id, presenter, None);
+        let task_ref = self.mint_ref(&target_id, &task_id, presenter, None);
         Ok(json!({
             "task_ref": task_ref,
             "task_id": task_id,
@@ -257,8 +256,10 @@ impl Agentd {
         })
     }
 
-    pub fn is_delegator(&self, initiator: &str) -> bool {
-        self.delegators.iter().any(|d| d == initiator)
+    pub fn is_delegator(&self, initiator_id: &str, hostname: Option<&str>) -> bool {
+        self.delegators
+            .iter()
+            .any(|d| d == initiator_id || hostname.is_some_and(|hostname| d == hostname))
     }
 
     /// Structured audit line to journald-shaped fields (§4.4). Token-level
@@ -287,7 +288,7 @@ impl Agentd {
 fn default_agent_for(endpoints: &[crate::hearthd::AgentEndpoint], target: &str) -> String {
     endpoints
         .iter()
-        .find(|endpoint| endpoint.name == target)
+        .find(|endpoint| endpoint.id == target)
         .and_then(|endpoint| endpoint.agents.iter().find(|agent| agent.ok))
         .map(|agent| agent.name.clone())
         .unwrap_or_else(|| "codex".to_string())
@@ -301,7 +302,8 @@ mod tests {
     #[test]
     fn default_agent_uses_the_targets_first_healthy_declaration() {
         let endpoints = vec![crate::hearthd::AgentEndpoint {
-            name: "hermes-vm".into(),
+            id: "vm-00000000000000000000000000000001".into(),
+            hostname: "hermes-vm".into(),
             running: true,
             is_agent_in_charge: false,
             ready: true,
@@ -320,6 +322,9 @@ mod tests {
                 },
             ],
         }];
-        assert_eq!(default_agent_for(&endpoints, "hermes-vm"), "hermes");
+        assert_eq!(
+            default_agent_for(&endpoints, "vm-00000000000000000000000000000001"),
+            "hermes"
+        );
     }
 }

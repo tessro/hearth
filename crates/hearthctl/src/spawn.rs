@@ -45,7 +45,6 @@ pub struct SpawnOptions {
     pub ssh_key: Vec<String>,
     pub authorized_keys_file: Vec<Utf8PathBuf>,
     pub allow_no_ssh: bool,
-    pub hostname: Option<String>,
     pub cpu: Option<u32>,
     pub memory_mib: Option<u64>,
     pub disk_gib: Option<u64>,
@@ -221,7 +220,6 @@ fn validate_owner(owner: &str) -> Result<()> {
 /// Resolved inputs to a `create` request. Groups the scalars so `create_args`
 /// stays a one-argument pure function (and under clippy's arg-count limit).
 struct CreateInputs<'a> {
-    name: &'a str,
     image: &'a str,
     hostname: &'a str,
     cpu: Option<u32>,
@@ -243,7 +241,6 @@ struct CreateInputs<'a> {
 /// daemon or filesystem.
 fn create_args(inputs: &CreateInputs) -> Map<String, Value> {
     let mut args = Map::new();
-    args.insert("name".to_string(), json!(inputs.name));
     args.insert("image".to_string(), json!(inputs.image));
     args.insert("hostname".to_string(), json!(inputs.hostname));
     if let Some(cpu) = inputs.cpu {
@@ -394,16 +391,9 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
         provision.push((spec, content));
     }
 
-    // --hostname wins; otherwise the service name is the hostname (§10).
-    let hostname = opts
-        .hostname
-        .clone()
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| opts.name.clone());
     let args = create_args(&CreateInputs {
-        name: &opts.name,
         image: &opts.image,
-        hostname: &hostname,
+        hostname: &opts.name,
         cpu: opts.cpu,
         memory_mib: opts.memory_mib,
         disk_gib: opts.disk_gib,
@@ -603,7 +593,6 @@ mod tests {
     #[test]
     fn create_args_minimal_omits_optional_fields() {
         let args = create_args(&CreateInputs {
-            name: "dev",
             image: "exeuntu",
             hostname: "dev",
             cpu: None,
@@ -616,9 +605,8 @@ mod tests {
             reset_ssh_hostkeys: false,
             agent: false,
         });
-        assert_eq!(args.get("name"), Some(&json!("dev")));
+        assert!(!args.contains_key("name"));
         assert_eq!(args.get("image"), Some(&json!("exeuntu")));
-        // hostname always defaults to the service name.
         assert_eq!(args.get("hostname"), Some(&json!("dev")));
         assert!(!args.contains_key("cpu"));
         assert!(!args.contains_key("memory_mib"));
@@ -645,7 +633,6 @@ mod tests {
             bind: Some("127.0.0.1".to_string()),
         }];
         let args = create_args(&CreateInputs {
-            name: "hermes-a",
             image: "hermes-vm",
             hostname: "hermes-a",
             cpu: Some(4),
@@ -690,7 +677,6 @@ mod tests {
     #[test]
     fn create_args_emits_explicit_keyless_escape_hatch() {
         let args = create_args(&CreateInputs {
-            name: "serial-only",
             image: "exeuntu",
             hostname: "serial-only",
             cpu: None,
@@ -715,7 +701,6 @@ mod tests {
             bind: None,
         }];
         let args = create_args(&CreateInputs {
-            name: "dev",
             image: "exeuntu",
             hostname: "dev",
             cpu: None,
@@ -738,7 +723,6 @@ mod tests {
         // provision block so the daemon deletes the baked host keys; the flag
         // rides in it and reset_machine_id keeps its daemon-side default.
         let args = create_args(&CreateInputs {
-            name: "dev",
             image: "exeuntu",
             hostname: "dev",
             cpu: None,

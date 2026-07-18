@@ -163,6 +163,8 @@ pub enum AgentVerb {
     TaskGc,
     #[serde(rename = "session.set-name")]
     SetSessionName,
+    #[serde(rename = "host.set-hostname")]
+    SetHostname,
     #[serde(rename = "inject.turn")]
     InjectTurn,
 }
@@ -182,6 +184,7 @@ impl AgentVerb {
         AgentVerb::TaskList,
         AgentVerb::TaskGc,
         AgentVerb::SetSessionName,
+        AgentVerb::SetHostname,
         AgentVerb::InjectTurn,
     ];
 
@@ -200,6 +203,7 @@ impl AgentVerb {
             Self::TaskList => "task.list",
             Self::TaskGc => "task.gc",
             Self::SetSessionName => "session.set-name",
+            Self::SetHostname => "host.set-hostname",
             Self::InjectTurn => "inject.turn",
         }
     }
@@ -234,6 +238,7 @@ impl AgentRequest {
 /// MCP tools agentd serves to agents (§7.1).
 pub const MCP_TOOLS: &[&str] = &[
     "set_session_name",
+    "set_hostname",
     "list_agents",
     "delegate",
     "wait_for",
@@ -311,13 +316,14 @@ mod tests {
                 | AgentVerb::TaskList
                 | AgentVerb::TaskGc
                 | AgentVerb::SetSessionName
+                | AgentVerb::SetHostname
                 | AgentVerb::InjectTurn => {}
             }
         }
         for verb in AgentVerb::ALL {
             witness(verb);
         }
-        assert_eq!(AgentVerb::ALL.len(), 14);
+        assert_eq!(AgentVerb::ALL.len(), 15);
         let mut names: Vec<&str> = AgentVerb::ALL.iter().map(|verb| verb.as_str()).collect();
         let total = names.len();
         names.sort_unstable();

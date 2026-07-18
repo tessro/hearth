@@ -360,7 +360,7 @@ async fn load_services(socket: &Utf8Path) -> Result<Vec<Service>> {
         .iter()
         .map(|value| {
             Ok(Service {
-                name: required_field(value, "name")?.to_string(),
+                name: required_field(value, "hostname")?.to_string(),
                 running: value
                     .get("running")
                     .and_then(Value::as_bool)

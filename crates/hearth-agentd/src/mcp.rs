@@ -107,6 +107,10 @@ impl McpServer {
         args: &Map<String, Value>,
     ) -> Result<Value> {
         match name {
+            "set_hostname" => {
+                let hostname = str_arg(args, "hostname")?;
+                self.agentd.hearthd.set_hostname(vm, hostname).await
+            }
             "set_session_name" => {
                 if shim_thread.is_empty() {
                     return Err(anyhow!(
@@ -292,6 +296,7 @@ fn tool_schemas() -> Vec<Value> {
 
 fn tool_description(name: &str) -> &'static str {
     match name {
+        "set_hostname" => "Change this VM's service-discovery hostname. The fixed VM id and active tasks do not change.",
         "set_session_name" => "Replace this session's display name with a short, descriptive name. Call at the beginning of every session, and when there is a substantive change in the session's purpose.",
         "list_agents" => "List agent-enabled VMs, their adapters, and task counts.",
         "delegate" => {
@@ -309,6 +314,19 @@ fn tool_description(name: &str) -> &'static str {
 fn tool_input_schema(name: &str) -> Value {
     let ref_prop = json!({ "task_ref": { "type": "string" } });
     match name {
+        "set_hostname" => json!({
+            "type": "object",
+            "properties": {
+                "hostname": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 63,
+                    "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+                }
+            },
+            "required": ["hostname"],
+            "additionalProperties": false,
+        }),
         "set_session_name" => json!({
             "type": "object",
             "properties": {
@@ -377,4 +395,23 @@ async fn warn_line<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) -> Resu
         .await?;
     stream.flush().await.context("flush mcp error")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_hostname_tool_has_a_dns_label_schema() {
+        let tools = tool_schemas();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "set_hostname")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["hostname"]["pattern"],
+            json!("^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+        );
+        assert_eq!(tool["inputSchema"]["required"], json!(["hostname"]));
+    }
 }

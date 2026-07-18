@@ -167,6 +167,11 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
                 .set_session_name(str_arg(args, "thread_id")?, str_arg(args, "name")?)
                 .await?,
         )?),
+        AgentVerb::SetHostname => {
+            let hostname = str_arg(args, "hostname")?;
+            set_hostname(hostname).await?;
+            Ok(json!({ "hostname": hostname }))
+        }
         AgentVerb::InjectTurn => {
             let delivery_id = str_arg(args, "delivery_id")?;
             let thread_id = str_arg(args, "thread_id")?;
@@ -177,6 +182,26 @@ async fn dispatch(engine: &Arc<Engine>, req: AgentRequest) -> Result<Value> {
         }
         AgentVerb::TaskAttach => unreachable!("attach handled before dispatch"),
     }
+}
+
+async fn set_hostname(hostname: &str) -> Result<()> {
+    if hostname.is_empty()
+        || hostname.len() > 63
+        || hostname
+            .bytes()
+            .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+    {
+        return Err(anyhow!("hostname.invalid: invalid DNS hostname"));
+    }
+    let file_result = tokio::fs::write("/etc/hostname", format!("{hostname}\n")).await;
+    let rc = unsafe { libc::sethostname(hostname.as_ptr().cast(), hostname.len()) };
+    if let Err(err) = file_result {
+        return Err(err.into());
+    }
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 /// `task.attach`: replay events from the cursor as stream frames, then follow

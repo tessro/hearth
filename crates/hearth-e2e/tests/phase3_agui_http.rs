@@ -109,7 +109,7 @@ async fn auth_is_required_end_to_end() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|a| a["name"] == json!("worker")));
+        .any(|a| a["hostname"] == json!("worker")));
     assert!(headers.iter().any(
         |(k, v)| k.eq_ignore_ascii_case("access-control-allow-origin") && v == "https://ui.example"
     ));

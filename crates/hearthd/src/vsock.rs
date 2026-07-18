@@ -106,9 +106,9 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
             return;
         };
         for svc in reg.services.values() {
-            if self.is_running(&svc.name).await {
-                if let Err(err) = self.ensure_guest_channels(&svc.name).await {
-                    warn!(service = %svc.name, error = %err, "failed to bind guest channels");
+            if self.is_running(&svc.id).await {
+                if let Err(err) = self.ensure_guest_channels(&svc.id).await {
+                    warn!(hostname = %svc.hostname, id = %svc.id, error = %err, "failed to bind guest channels");
                 }
             }
         }
@@ -139,7 +139,7 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
     /// must not be able to obtain fds to other VMs' sockets.
     async fn handle_guest_verbs(&self, name: &str, mut stream: UnixStream) -> Result<()> {
         let reg = self.registry().await?;
-        let Ok(svc) = reg.get(name) else {
+        let Ok(svc) = reg.get_by_id(name) else {
             warn!(service = %name, "vsock verb connection for unknown service; dropping");
             return Ok(());
         };

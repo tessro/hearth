@@ -83,9 +83,9 @@ merges per-VM `--ssh-key` / `--authorized-keys-file` inputs with its host-wide
 modes and UID/GID 1000. If no effective key exists, create fails unless
 `--allow-no-ssh` is explicit.
 
-What differs per VM: the **name** (`hermes-a` vs `hermes-b`), the **hostname**
-(defaults to the name; override with `--hostname`), the regenerated
-**machine-id**, the regenerated **SSH host keys** (vm-base ships no baked keys,
+What differs per VM: the generated fixed **id**, the mutable **hostname**
+(`hermes-a` vs `hermes-b`), the regenerated **machine-id**, the regenerated
+**SSH host keys** (vm-base ships no baked keys,
 so `ssh-hostkeys.service` mints a unique set on first boot; for a base that does
 bake them, pass `--reset-ssh-hostkeys`), the **provisioned files** (each VM's own
 `.env`), and the per-service **MAC**, **IP**, and **vsock CID** the daemon
@@ -93,7 +93,7 @@ allocates. What is shared: the immutable template **image** — the whole point.
 Nothing baked into the image carries per-VM identity or secrets.
 
 The address is a DHCP lease, so `spawn` may print a null `address` right after
-boot; rerun `hearthctl status <name>` once the lease lands.
+boot; rerun `hearthctl status <hostname>` once the lease lands.
 
 ## Guest Kernel
 

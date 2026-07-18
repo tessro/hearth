@@ -62,7 +62,7 @@ impl Host for FakeHost {
         _image: &ImageManifest,
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.calls.push(format!("systemd-run {}", service.name));
+        state.calls.push(format!("systemd-run {}", service.id));
         state.running = true;
         Ok(())
     }
@@ -74,9 +74,7 @@ impl Host for FakeHost {
         _snapshot_dir: &Utf8Path,
     ) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state
-            .calls
-            .push(format!("systemd-restore {}", service.name));
+        state.calls.push(format!("systemd-restore {}", service.id));
         state.running = true;
         Ok(())
     }

@@ -67,7 +67,7 @@ pub struct Config {
         default_value = "/var/lib/dnsmasq/dnsmasq.leases"
     )]
     pub lease_file: Utf8PathBuf,
-    /// dnsmasq drop-in dir where Hearth writes `<name>.conf` static-lease
+    /// dnsmasq drop-in dir where Hearth writes `<id>.conf` static-lease
     /// reservations (REFACTOR_PROPOSAL.md §4.2). If it is absent (a dev host
     /// without a Hearth-managed dnsmasq), reservations are skipped-with-warn and
     /// VMs fall back to dynamic DHCP.
@@ -104,46 +104,43 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn vm_socket(&self, name: &str) -> Utf8PathBuf {
-        self.run_dir.join("vms").join(format!("{name}.sock"))
+    pub fn vm_socket(&self, id: &str) -> Utf8PathBuf {
+        self.run_dir.join("vms").join(format!("{id}.sock"))
     }
 
-    pub fn vm_vsock_socket(&self, name: &str) -> Utf8PathBuf {
-        self.run_dir.join("vsock").join(format!("{name}.sock"))
+    pub fn vm_vsock_socket(&self, id: &str) -> Utf8PathBuf {
+        self.run_dir.join("vsock").join(format!("{id}.sock"))
     }
 
     /// Host-side unix socket where a guest-initiated vsock connection to host
-    /// port `port` lands under CHV's hybrid model (`<vm>.sock_<port>`, §6 of
+    /// port `port` lands under CHV's hybrid model (`<id>.sock_<port>`, §6 of
     /// docs/agent-plane.md).
-    pub fn vm_vsock_port_socket(&self, name: &str, port: u32) -> Utf8PathBuf {
-        self.run_dir
-            .join("vsock")
-            .join(format!("{name}.sock_{port}"))
+    pub fn vm_vsock_port_socket(&self, id: &str, port: u32) -> Utf8PathBuf {
+        self.run_dir.join("vsock").join(format!("{id}.sock_{port}"))
     }
 
-    /// The per-VM disk path for a service. New services record their disk
-    /// filename (`{name}.qcow2` — every boot disk is qcow2); services created
-    /// before that field existed resolve to the legacy `{name}.qcow2`.
+    /// The per-VM disk path for a service. Services normally record their disk
+    /// filename; when absent, the fixed id gives the qcow2 filename.
     pub fn disk_path(&self, svc: &Service) -> Utf8PathBuf {
         match &svc.disk {
             Some(file) => self.disks_dir.join(file),
-            None => self.disks_dir.join(format!("{}.qcow2", svc.name)),
+            None => self.disks_dir.join(format!("{}.qcow2", svc.id)),
         }
     }
 
     /// Per-VM disk path with an explicit extension (`raw` or `qcow2`). Used at
     /// create/destroy time when the concrete filename, not the service record,
     /// is what matters.
-    pub fn disk_path_ext(&self, name: &str, ext: &str) -> Utf8PathBuf {
-        self.disks_dir.join(format!("{name}.{ext}"))
+    pub fn disk_path_ext(&self, id: &str, ext: &str) -> Utf8PathBuf {
+        self.disks_dir.join(format!("{id}.{ext}"))
     }
 
-    pub fn console_path(&self, name: &str) -> Utf8PathBuf {
-        self.log_dir.join(format!("{name}.console"))
+    pub fn console_path(&self, id: &str) -> Utf8PathBuf {
+        self.log_dir.join(format!("{id}.console"))
     }
 
-    pub fn snapshot_dir(&self, name: &str, tag: &str) -> Utf8PathBuf {
-        self.snapshots_dir.join(name).join(tag)
+    pub fn snapshot_dir(&self, id: &str, tag: &str) -> Utf8PathBuf {
+        self.snapshots_dir.join(id).join(tag)
     }
 
     pub fn image_path(&self, image: &str) -> Utf8PathBuf {

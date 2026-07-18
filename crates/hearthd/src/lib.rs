@@ -20,7 +20,10 @@ use crate::{
     net::PublishTarget,
     policy::VerbPolicy,
     provision::ProvisionPlan,
-    registry::{validate_name, Allocations, Provision, Publish, Registry, RestartPolicy, Service},
+    registry::{
+        generate_id, validate_hostname, validate_name, Allocations, Provision, Publish, Registry,
+        RestartPolicy, Service,
+    },
 };
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
@@ -270,6 +273,7 @@ impl<H: Host + 'static> Daemon<H> {
                 .await
                 .map(Dispatch::One),
             Verb::Create => self.create(req.args).await.map(Dispatch::One),
+            Verb::Rename => self.rename(req.args).await.map(Dispatch::One),
             Verb::Destroy => self
                 .destroy(required_str(&req.args, "name")?)
                 .await
@@ -284,7 +288,8 @@ impl<H: Host + 'static> Daemon<H> {
                 .map(Dispatch::One),
             Verb::Restart => {
                 let name = required_str(&req.args, "name")?;
-                let _guard = self.service_guard(name).await;
+                let id = self.service_id(name).await?;
+                let _guard = self.service_guard(&id).await;
                 self.stop_unlocked(name).await?;
                 self.start_unlocked(name).await.map(Dispatch::One)
             }
@@ -318,12 +323,16 @@ impl<H: Host + 'static> Daemon<H> {
         Registry::load(&self.cfg).await
     }
 
-    async fn service_guard(&self, name: &str) -> OwnedMutexGuard<()> {
+    async fn service_id(&self, hostname: &str) -> Result<String> {
+        Ok(self.registry().await?.get(hostname)?.id.clone())
+    }
+
+    async fn service_guard(&self, id: &str) -> OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.service_locks.lock().await;
             Arc::clone(
                 locks
-                    .entry(name.to_string())
+                    .entry(id.to_string())
                     .or_insert_with(|| Arc::new(Mutex::new(()))),
             )
         };
@@ -336,19 +345,19 @@ impl<H: Host + 'static> Daemon<H> {
         let mut services = Vec::new();
         let mut probes = Vec::new();
         for svc in reg.services.values() {
-            let running = self.is_running(&svc.name).await;
+            let running = self.is_running(&svc.id).await;
             let address = resolved_address(&reg, &leases, svc);
             let mut summary = service_summary(svc, running, address.map(|(ip, _)| ip));
-            if let Some(guest) = self.guests.get(&svc.name) {
+            if let Some(guest) = self.guests.get(&svc.id) {
                 summary["guestd"] = guest.summary();
             } else if running {
                 let daemon = self.clone();
-                let name = svc.name.clone();
+                let id = svc.id.clone();
                 let index = services.len();
                 probes.push(async move {
                     let version = match tokio::time::timeout(
                         Duration::from_secs(1),
-                        daemon.probe_guestd_version(&name),
+                        daemon.probe_guestd_version(&id),
                     )
                     .await
                     {
@@ -372,10 +381,10 @@ impl<H: Host + 'static> Daemon<H> {
         Ok(json!({ "services": services }))
     }
 
-    async fn status(&self, name: &str) -> Result<Value> {
+    async fn status(&self, hostname: &str) -> Result<Value> {
         let reg = self.registry().await?;
-        let svc = reg.get(name)?;
-        let running = self.is_running(name).await;
+        let svc = reg.get(hostname)?;
+        let running = self.is_running(&svc.id).await;
         let mut value = serde_json::to_value(svc)?;
         // Never echo provisioning literal contents back: replace the serialized
         // provision block with a redacted summary (dest/mode/owner + flags).
@@ -385,7 +394,7 @@ impl<H: Host + 'static> Daemon<H> {
         // Always surface publishes (even when empty) and the guest address.
         value["publish"] = json!(svc.publish);
         let leases = self.load_leases().await;
-        value["static_lease"] = json!(reg.allocations.ips.contains_key(name));
+        value["static_lease"] = json!(reg.allocations.ips.contains_key(&svc.id));
         match resolved_address(&reg, &leases, svc) {
             Some((ip, source)) => {
                 value["address"] = json!(ip);
@@ -399,7 +408,7 @@ impl<H: Host + 'static> Daemon<H> {
         if running {
             if let Ok(info) = self
                 .host
-                .chv_get(&self.cfg.vm_socket(name), "/api/v1/vm.info")
+                .chv_get(&self.cfg.vm_socket(&svc.id), "/api/v1/vm.info")
                 .await
             {
                 value["runtime"] = info;
@@ -412,7 +421,7 @@ impl<H: Host + 'static> Daemon<H> {
         // absent — absent, not unhealthy — for guestd-less images (§2.5).
         // Guest-reported addresses are corroborating only; a divergence from
         // the lease-resolved address is surfaced, and the lease wins.
-        if let Some(guest) = self.guests.get(name) {
+        if let Some(guest) = self.guests.get(&svc.id) {
             let lease_ip = value
                 .get("address")
                 .and_then(Value::as_str)
@@ -429,7 +438,8 @@ impl<H: Host + 'static> Daemon<H> {
             value["address_divergence"] = json!(diverged);
             if diverged {
                 warn!(
-                    service = %name,
+                    hostname = %hostname,
+                    id = %svc.id,
                     lease = ?lease_ip,
                     reported = ?guest.report.addrs,
                     "guest-reported addresses diverge from lease; lease wins"
@@ -439,41 +449,17 @@ impl<H: Host + 'static> Daemon<H> {
         Ok(value)
     }
 
-    async fn probe_guestd_version(&self, name: &str) -> Result<String> {
-        let mut stream = UnixStream::connect(self.cfg.vm_vsock_socket(name).as_str())
-            .await
-            .context("connect guest vsock for version probe")?;
-        hybrid::connect_handshake(&mut stream, PORT_GUESTD)
-            .await
-            .context("connect guestd version channel")?;
-        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
-        stream
-            .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
-            .await?;
-        read_success_response(&mut stream, "guestd hello").await?;
-        let req = AgentRequest::new("ls-version-probe", AgentVerb::Version, Map::new());
-        stream
-            .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
-            .await?;
-        read_success_response(&mut stream, "guestd version")
-            .await?
-            .get("version")
-            .and_then(Value::as_str)
-            .filter(|version| !version.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("guestd version response omitted version"))
-    }
-
     async fn create(&self, args: Map<String, Value>) -> Result<Value> {
-        let name = required_str(&args, "name")?;
-        validate_name(name)?;
-        let _service_guard = self.service_guard(name).await;
+        let hostname = required_str(&args, "hostname")?;
+        validate_hostname(hostname)?;
+        let id = generate_id();
+        let _service_guard = self.service_guard(&id).await;
         let _registry_guard = self.registry_lock.lock().await;
         let mut reg = self.registry().await?;
-        if reg.services.contains_key(name) {
+        if reg.services.contains_key(hostname) {
             return Err(coded(
                 "service.exists",
-                format!("service {name} already exists"),
+                format!("service with hostname {hostname} already exists"),
             ));
         }
         let image = required_str(&args, "image")?.to_string();
@@ -550,20 +536,12 @@ impl<H: Host + 'static> Daemon<H> {
             ));
         }
         if provisioning.authorized_keys.is_empty() {
-            warn!(service = %name, "creating VM with SSH recovery access explicitly disabled");
+            warn!(hostname = %hostname, id = %id, "creating VM with SSH recovery access explicitly disabled");
         } else {
             // The escape hatch only describes a genuinely keyless service.
             provisioning.allow_no_ssh = false;
         }
-        let hostname_arg = optional_str(&args, "hostname").map(str::to_string);
-        // Resolve the hostname: an explicit --hostname wins, then a hostname set
-        // inside the provision block, then the service name.
-        let hostname = hostname_arg
-            .clone()
-            .filter(|h| !h.is_empty())
-            .or_else(|| Some(provisioning.hostname.clone()).filter(|h| !h.is_empty()))
-            .unwrap_or_else(|| name.to_string());
-        provisioning.hostname = hostname;
+        provisioning.hostname = hostname.to_string();
         // Build (and validate) the plan before any disk work so bad provision
         // args fail with no side effects.
         let plan = ProvisionPlan::from_provision(&provisioning)
@@ -583,15 +561,16 @@ impl<H: Host + 'static> Daemon<H> {
         }
 
         let (vsock_cid, mac, static_ip) =
-            reg.allocate(name, self.cfg.dhcp_static_start, self.cfg.dhcp_static_count);
+            reg.allocate(&id, self.cfg.dhcp_static_start, self.cfg.dhcp_static_count);
         // Every per-VM boot disk is a standalone qcow2 (no backing chain, which
         // CHV rejects, and qcow2 avoids the raw write-path failures CHV hits on
         // some host filesystems such as ZFS). Images are provisioned on a raw
         // scratch and converted to qcow2; see
         // Host::build_vm_disk.
-        let disk_filename = format!("{name}.qcow2");
+        let disk_filename = format!("{id}.qcow2");
         let svc = Service {
-            name: name.to_string(),
+            id: id.clone(),
+            hostname: hostname.to_string(),
             enabled: false,
             image: image.clone(),
             cpu,
@@ -607,7 +586,7 @@ impl<H: Host + 'static> Daemon<H> {
             restart: RestartPolicy::default(),
         };
         let disk_path = self.cfg.disks_dir.join(&disk_filename);
-        let scratch = self.cfg.disk_path_ext(name, "raw");
+        let scratch = self.cfg.disk_path_ext(&id, "raw");
         if let Err(err) = self
             .host
             .build_vm_disk(&image_path, &disk_path, &scratch, disk_gib, &plan)
@@ -615,7 +594,7 @@ impl<H: Host + 'static> Daemon<H> {
         {
             let _ = remove_path_file(scratch).await;
             let _ = remove_path_file(disk_path).await;
-            reg.free(name);
+            reg.free(&id);
             return Err(err);
         }
         if let Err(err) = Registry::write_allocations(&self.cfg, &reg.allocations).await {
@@ -624,7 +603,7 @@ impl<H: Host + 'static> Daemon<H> {
         }
         if let Err(err) = Registry::write_service(&self.cfg, &svc).await {
             let _ = remove_path_file(disk_path).await;
-            reg.free(name);
+            reg.free(&id);
             let _ = Registry::write_allocations(&self.cfg, &reg.allocations).await;
             return Err(err);
         }
@@ -632,84 +611,198 @@ impl<H: Host + 'static> Daemon<H> {
         // should undo a created service: reconcile re-writes missing drop-ins and
         // re-applies the table on the next daemon start (self-healing), so these
         // warn-and-continue.
-        reg.services.insert(name.to_string(), svc.clone());
+        reg.services.insert(hostname.to_string(), svc.clone());
         if let Some(ip) = &static_ip {
-            if let Err(err) = self.write_dnsmasq_dropin(name, &svc.mac, ip).await {
-                warn!(service = %name, error = %err, "failed to write dnsmasq drop-in; reconcile will retry");
+            if let Err(err) = self.write_dnsmasq_dropin(&id, hostname, &svc.mac, ip).await {
+                warn!(hostname = %hostname, id = %id, error = %err, "failed to write dnsmasq drop-in; reconcile will retry");
             }
         }
         self.rewrite_nat(&reg).await;
         Ok(json!({ "created": service_summary(&svc, false, static_ip) }))
     }
 
-    async fn start(&self, name: &str) -> Result<Value> {
-        let _guard = self.service_guard(name).await;
-        self.start_unlocked(name).await
+    async fn rename(&self, args: Map<String, Value>) -> Result<Value> {
+        let new_hostname = required_str(&args, "hostname")?;
+        validate_hostname(new_hostname)?;
+        let id = match optional_str(&args, "id") {
+            Some(id) => id.to_string(),
+            None => self.service_id(required_str(&args, "name")?).await?,
+        };
+        let _service_guard = self.service_guard(&id).await;
+        let _registry_guard = self.registry_lock.lock().await;
+        let mut reg = self.registry().await?;
+        let mut svc = reg.get_by_id(&id)?.clone();
+        let old_hostname = svc.hostname.clone();
+        if old_hostname == new_hostname {
+            return Ok(json!({
+                "id": id,
+                "old_hostname": old_hostname,
+                "hostname": new_hostname,
+                "guest_hostname_updated": Value::Null,
+            }));
+        }
+        if reg.services.contains_key(new_hostname) {
+            return Err(coded(
+                "service.exists",
+                format!("service with hostname {new_hostname} already exists"),
+            ));
+        }
+        svc.hostname = new_hostname.to_string();
+        svc.provision.hostname = new_hostname.to_string();
+        Registry::write_service(&self.cfg, &svc).await?;
+        reg.services.remove(&old_hostname);
+        reg.services.insert(new_hostname.to_string(), svc.clone());
+        if let Some(ip) = reg.allocations.ips.get(&id) {
+            if let Err(err) = self
+                .write_dnsmasq_dropin(&id, new_hostname, &svc.mac, ip)
+                .await
+            {
+                warn!(hostname = %new_hostname, id = %id, error = %err, "failed to update DNS after rename");
+            }
+        }
+        self.rewrite_nat(&reg).await;
+        drop(_registry_guard);
+
+        let guest_hostname_updated = if self.is_running(&id).await {
+            match self.set_guest_hostname(&id, new_hostname).await {
+                Ok(()) => Value::Bool(true),
+                Err(err) => {
+                    warn!(hostname = %new_hostname, id = %id, error = %err, "host rename committed but guest hostname update failed");
+                    Value::Bool(false)
+                }
+            }
+        } else {
+            Value::Null
+        };
+        Ok(json!({
+            "id": id,
+            "old_hostname": old_hostname,
+            "hostname": new_hostname,
+            "guest_hostname_updated": guest_hostname_updated,
+        }))
     }
 
-    async fn start_unlocked(&self, name: &str) -> Result<Value> {
+    async fn set_guest_hostname(&self, id: &str, hostname: &str) -> Result<()> {
+        let mut stream = UnixStream::connect(self.cfg.vm_vsock_socket(id).as_str())
+            .await
+            .context("connect guest vsock for hostname update")?;
+        hybrid::connect_handshake(&mut stream, PORT_GUESTD)
+            .await
+            .context("connect guestd hostname channel")?;
+        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        stream
+            .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
+            .await?;
+        read_success_response(&mut stream, "guestd hello").await?;
+        let mut args = Map::new();
+        args.insert("hostname".to_string(), json!(hostname));
+        let req = AgentRequest::new(generate_id(), AgentVerb::SetHostname, args);
+        stream
+            .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
+            .await?;
+        read_success_response(&mut stream, "set guest hostname")
+            .await
+            .map(|_| ())
+    }
+
+    async fn probe_guestd_version(&self, id: &str) -> Result<String> {
+        let mut stream = UnixStream::connect(self.cfg.vm_vsock_socket(id).as_str())
+            .await
+            .context("connect guest vsock for version probe")?;
+        hybrid::connect_handshake(&mut stream, PORT_GUESTD)
+            .await
+            .context("connect guestd version channel")?;
+        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        stream
+            .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
+            .await?;
+        read_success_response(&mut stream, "guestd hello").await?;
+        let req = AgentRequest::new(generate_id(), AgentVerb::Version, Map::new());
+        stream
+            .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
+            .await?;
+        read_success_response(&mut stream, "guestd version")
+            .await?
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|version| !version.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("guestd version response omitted version"))
+    }
+
+    async fn start(&self, hostname: &str) -> Result<Value> {
+        let id = self.service_id(hostname).await?;
+        let _guard = self.service_guard(&id).await;
+        self.start_unlocked(hostname).await
+    }
+
+    async fn start_unlocked(&self, hostname: &str) -> Result<Value> {
         let mut reg = self.registry().await?;
-        let mut svc = reg.get(name)?.clone();
+        let mut svc = reg.get(hostname)?.clone();
         if svc.provision.ssh_access_state() != "configured" {
             warn!(
-                service = %name,
+                hostname = %hostname,
+                id = %svc.id,
                 ssh_access = svc.provision.ssh_access_state(),
                 "starting VM without confirmed SSH recovery access"
             );
         }
-        if !self.is_running(name).await {
+        if !self.is_running(&svc.id).await {
             let image_metadata = image::load(&self.cfg, &svc.image).await?;
             validate_boot_prerequisites(&self.cfg, &image_metadata).await?;
             // A fresh boot invalidates any previous guestd report; `wait` must
             // block on this boot's report, not the last one's.
-            self.guests.forget(name);
+            self.guests.forget(&svc.id);
             self.host
                 .systemd_run_vm(&self.cfg, &svc, &image_metadata)
                 .await?;
             self.host
-                .wait_for_vm_socket(&self.cfg.vm_socket(name), Duration::from_secs(20))
+                .wait_for_vm_socket(&self.cfg.vm_socket(&svc.id), Duration::from_secs(20))
                 .await?;
         }
-        self.ensure_guest_channels(name).await?;
+        self.ensure_guest_channels(&svc.id).await?;
         svc.enabled = true;
         Registry::write_service(&self.cfg, &svc).await?;
-        reg.services.insert(name.to_string(), svc);
+        reg.services.insert(hostname.to_string(), svc);
         // Re-apply the NAT table: the VM may have just picked up a lease, and its
         // publishes must be routed now that it is running.
         self.rewrite_nat(&reg).await;
-        self.status(name).await
+        self.status(hostname).await
     }
 
-    async fn stop(&self, name: &str) -> Result<Value> {
-        let _guard = self.service_guard(name).await;
-        self.stop_unlocked(name).await
+    async fn stop(&self, hostname: &str) -> Result<Value> {
+        let id = self.service_id(hostname).await?;
+        let _guard = self.service_guard(&id).await;
+        self.stop_unlocked(hostname).await
     }
 
-    async fn stop_unlocked(&self, name: &str) -> Result<Value> {
+    async fn stop_unlocked(&self, hostname: &str) -> Result<Value> {
         let reg = self.registry().await?;
-        let mut svc = reg.get(name)?.clone();
-        if self.is_running(name).await {
-            let socket = self.cfg.vm_socket(name);
-            let unit = unit_name(name);
+        let mut svc = reg.get(hostname)?.clone();
+        if self.is_running(&svc.id).await {
+            let socket = self.cfg.vm_socket(&svc.id);
+            let unit = unit_name(&svc.id);
             let graceful_timeout = Duration::from_secs(30);
             let started = Instant::now();
-            info!(service = %name, "sending vm.shutdown (ACPI)");
+            info!(hostname = %hostname, id = %svc.id, "sending vm.shutdown (ACPI)");
             if let Err(err) = self
                 .host
                 .chv_put(&socket, "/api/v1/vm.shutdown", json!({}))
                 .await
             {
-                warn!(service = %name, error = %err, "vm.shutdown request failed; waiting for unit to exit anyway");
+                warn!(hostname = %hostname, id = %svc.id, error = %err, "vm.shutdown request failed; waiting for unit to exit anyway");
             }
             if wait_for_inactive(self.host.as_ref(), &unit, graceful_timeout).await? {
                 info!(
-                    service = %name,
+                    hostname = %hostname,
+                    id = %svc.id,
                     duration_ms = started.elapsed().as_millis() as u64,
                     "vm stopped gracefully"
                 );
             } else {
                 warn!(
-                    service = %name,
+                    hostname = %hostname,
+                    id = %svc.id,
                     waited_ms = started.elapsed().as_millis() as u64,
                     timeout_s = graceful_timeout.as_secs(),
                     "graceful shutdown timed out; escalating to vm.power-off"
@@ -719,98 +812,100 @@ impl<H: Host + 'static> Daemon<H> {
                     .chv_put(&socket, "/api/v1/vm.power-off", json!({}))
                     .await
                 {
-                    warn!(service = %name, error = %err, "vm.power-off request failed");
+                    warn!(hostname = %hostname, id = %svc.id, error = %err, "vm.power-off request failed");
                 }
                 if let Err(err) = self.host.systemctl(&["stop", &unit]).await {
-                    warn!(service = %name, error = %err, "systemctl stop failed");
+                    warn!(hostname = %hostname, id = %svc.id, error = %err, "systemctl stop failed");
                 }
             }
         }
         svc.enabled = false;
         Registry::write_service(&self.cfg, &svc).await?;
-        self.drop_guest_channels(name).await;
-        self.guests.forget(name);
+        self.drop_guest_channels(&svc.id).await;
+        self.guests.forget(&svc.id);
         self.rewrite_nat(&reg).await;
-        Ok(json!({ "name": name, "running": false, "enabled": false }))
+        Ok(json!({ "id": svc.id, "hostname": hostname, "running": false, "enabled": false }))
     }
 
-    async fn reboot(&self, name: &str) -> Result<Value> {
-        let _guard = self.service_guard(name).await;
+    async fn reboot(&self, hostname: &str) -> Result<Value> {
         let reg = self.registry().await?;
-        reg.get(name)?;
+        let svc = reg.get(hostname)?;
+        let _guard = self.service_guard(&svc.id).await;
         self.host
-            .chv_put(&self.cfg.vm_socket(name), "/api/v1/vm.reboot", json!({}))
+            .chv_put(&self.cfg.vm_socket(&svc.id), "/api/v1/vm.reboot", json!({}))
             .await?;
-        self.status(name).await
+        self.status(hostname).await
     }
 
-    async fn destroy(&self, name: &str) -> Result<Value> {
-        self.registry().await?.get(name)?;
-        let _service_guard = self.service_guard(name).await;
-        self.stop_unlocked(name).await?;
+    async fn destroy(&self, hostname: &str) -> Result<Value> {
+        let id = self.service_id(hostname).await?;
+        let _service_guard = self.service_guard(&id).await;
+        self.stop_unlocked(hostname).await?;
         let _registry_guard = self.registry_lock.lock().await;
         let mut reg = self.registry().await?;
+        let svc = reg.get(hostname)?.clone();
         // Remove the qcow2 boot disk and any interrupted provisioning scratch.
-        remove_path_file(self.cfg.disk_path_ext(name, "raw")).await?;
-        remove_path_file(self.cfg.disk_path_ext(name, "qcow2")).await?;
-        remove_path_file(self.cfg.console_path(name)).await?;
-        remove_path_dir(self.cfg.snapshots_dir.join(name)).await?;
-        self.host.delete_tap(&host::tap_name(name)).await?;
-        Registry::remove_service(&self.cfg, name).await?;
-        reg.free(name);
-        reg.services.remove(name);
+        remove_path_file(self.cfg.disk_path_ext(&id, "raw")).await?;
+        remove_path_file(self.cfg.disk_path(&svc)).await?;
+        remove_path_file(self.cfg.console_path(&id)).await?;
+        remove_path_dir(self.cfg.snapshots_dir.join(&id)).await?;
+        self.host.delete_tap(&host::tap_name(&id)).await?;
+        Registry::remove_service(&self.cfg, &id).await?;
+        reg.free(&id);
+        reg.services.remove(hostname);
         Registry::write_allocations(&self.cfg, &reg.allocations).await?;
         // Drop the static-lease drop-in and re-apply the NAT table without this
         // service's rules.
-        if let Err(err) = self.remove_dnsmasq_dropin(name).await {
-            warn!(service = %name, error = %err, "failed to remove dnsmasq drop-in");
+        if let Err(err) = self.remove_dnsmasq_dropin(&id).await {
+            warn!(hostname = %hostname, id = %id, error = %err, "failed to remove dnsmasq drop-in");
         }
         self.rewrite_nat(&reg).await;
-        Ok(json!({ "destroyed": name }))
+        Ok(json!({ "destroyed": hostname, "id": id }))
     }
 
     async fn snapshot(&self, args: Map<String, Value>) -> Result<Value> {
-        let name = required_str(&args, "name")?;
-        let _guard = self.service_guard(name).await;
-        self.registry().await?.get(name)?;
+        let hostname = required_str(&args, "name")?;
+        let id = self.service_id(hostname).await?;
+        let _guard = self.service_guard(&id).await;
         let tag = optional_str(&args, "tag")
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| Utc::now().format("%Y%m%d%H%M%S").to_string());
-        let dest = self.cfg.snapshot_dir(name, &tag);
+        let dest = self.cfg.snapshot_dir(&id, &tag);
         fs::create_dir_all(&dest).await?;
         self.host
             .chv_put(
-                &self.cfg.vm_socket(name),
+                &self.cfg.vm_socket(&id),
                 "/api/v1/vm.snapshot",
                 json!({ "destination_url": format!("file://{dest}") }),
             )
             .await?;
-        Ok(json!({ "name": name, "tag": tag, "path": dest }))
+        Ok(json!({ "id": id, "hostname": hostname, "tag": tag, "path": dest }))
     }
 
     async fn restore(&self, args: Map<String, Value>) -> Result<Value> {
-        let name = required_str(&args, "name")?;
-        let _guard = self.service_guard(name).await;
+        let hostname = required_str(&args, "name")?;
+        let id = self.service_id(hostname).await?;
+        let _guard = self.service_guard(&id).await;
         let tag = required_str(&args, "tag")?;
-        let src = self.cfg.snapshot_dir(name, tag);
+        let src = self.cfg.snapshot_dir(&id, tag);
         if !src.exists() {
             return Err(coded(
                 "snapshot.not_found",
                 format!("snapshot not found: {src}"),
             ));
         }
-        let _ = self.stop_unlocked(name).await;
+        let _ = self.stop_unlocked(hostname).await;
         let reg = self.registry().await?;
-        let mut svc = reg.get(name)?.clone();
+        let mut svc = reg.get(hostname)?.clone();
         // The restored guest's next boot report gets `restored: true` in its
         // ack, so guestd rotates task incarnations and outstanding cursors go
         // cleanly stale (§3.4). Marked before the guest can possibly reconnect.
-        self.guests.mark_pending_restore(name);
+        self.guests.mark_pending_restore(&id);
         self.host.systemd_restore_vm(&self.cfg, &svc, &src).await?;
         self.host
-            .wait_for_vm_socket(&self.cfg.vm_socket(name), Duration::from_secs(20))
+            .wait_for_vm_socket(&self.cfg.vm_socket(&id), Duration::from_secs(20))
             .await?;
-        self.ensure_guest_channels(name).await?;
+        self.ensure_guest_channels(&id).await?;
         svc.enabled = true;
         Registry::write_service(&self.cfg, &svc).await?;
         // Re-apply the NAT table (mirror start_unlocked): the resumed guest may
@@ -818,14 +913,15 @@ impl<H: Host + 'static> Daemon<H> {
         // so its publishes' DNAT rules must point at the current address.
         let reg = self.registry().await?;
         self.rewrite_nat(&reg).await;
-        Ok(json!({ "name": name, "tag": tag, "restored": true }))
+        Ok(json!({ "id": id, "hostname": hostname, "tag": tag, "restored": true }))
     }
 
     async fn resize(&self, args: Map<String, Value>) -> Result<Value> {
-        let name = required_str(&args, "name")?;
-        let _guard = self.service_guard(name).await;
+        let hostname = required_str(&args, "name")?;
+        let id = self.service_id(hostname).await?;
+        let _guard = self.service_guard(&id).await;
         let mut reg = self.registry().await?;
-        let mut svc = reg.get(name)?.clone();
+        let mut svc = reg.get(hostname)?.clone();
         if let Some(cpu) = optional_u64(&args, "cpu") {
             svc.cpu = cpu as u32;
         }
@@ -839,31 +935,31 @@ impl<H: Host + 'static> Daemon<H> {
             "desired_ram".to_string(),
             json!(svc.memory_mib * 1024 * 1024),
         );
-        if self.is_running(name).await {
+        if self.is_running(&id).await {
             self.host
                 .chv_put(
-                    &self.cfg.vm_socket(name),
+                    &self.cfg.vm_socket(&id),
                     "/api/v1/vm.resize",
                     Value::Object(body),
                 )
                 .await?;
         }
         Registry::write_service(&self.cfg, &svc).await?;
-        reg.services.insert(name.to_string(), svc);
-        self.status(name).await
+        reg.services.insert(hostname.to_string(), svc);
+        self.status(hostname).await
     }
 
     async fn logs(&self, args: Map<String, Value>) -> Result<Dispatch> {
-        let name = required_str(&args, "name")?;
+        let hostname = required_str(&args, "name")?;
         let reg = self.registry().await?;
-        reg.get(name)?;
+        let svc = reg.get(hostname)?;
         let follow = optional_bool(&args, "follow").unwrap_or(false);
         if follow {
             return Ok(Dispatch::FollowLog {
-                path: self.cfg.console_path(name),
+                path: self.cfg.console_path(&svc.id),
             });
         }
-        let text = read_optional_string(self.cfg.console_path(name)).await?;
+        let text = read_optional_string(self.cfg.console_path(&svc.id)).await?;
         let lines: Vec<Value> = text.lines().map(|line| json!({ "line": line })).collect();
         Ok(Dispatch::BufferedStream(lines))
     }
@@ -962,7 +1058,7 @@ impl<H: Host + 'static> Daemon<H> {
         {
             return Err(coded(
                 "image.in_use",
-                format!("image {name} is still used by service {}", svc.name),
+                format!("image {name} is still used by service {}", svc.hostname),
             ));
         }
         let path = self.cfg.image_path(name);
@@ -998,7 +1094,8 @@ impl<H: Host + 'static> Daemon<H> {
     /// listening on the guest port keeps running uninterrupted.
     async fn add_publish(&self, args: Map<String, Value>) -> Result<Value> {
         let service = required_str(&args, "name")?;
-        let _guard = self.service_guard(service).await;
+        let id = self.service_id(service).await?;
+        let _guard = self.service_guard(&id).await;
         let mut publish: crate::registry::Publish = serde_json::from_value(
             args.get("publish")
                 .cloned()
@@ -1043,7 +1140,7 @@ impl<H: Host + 'static> Daemon<H> {
                         "host port {}/{} is already published by {} ({})",
                         publish.host_port,
                         publish.protocol,
-                        other.name,
+                        other.hostname,
                         clash.effective_name()
                     ),
                 ));
@@ -1061,7 +1158,8 @@ impl<H: Host + 'static> Daemon<H> {
     async fn remove_publish(&self, args: Map<String, Value>) -> Result<Value> {
         let service = required_str(&args, "name")?;
         let publish_name = required_str(&args, "publish_name")?;
-        let _guard = self.service_guard(service).await;
+        let id = self.service_id(service).await?;
+        let _guard = self.service_guard(&id).await;
         let mut reg = self.registry().await?;
         let mut svc = reg.get(service)?.clone();
         let before = svc.publish.len();
@@ -1097,7 +1195,7 @@ impl<H: Host + 'static> Daemon<H> {
                 ),
             ));
         }
-        if !self.is_running(name).await {
+        if !self.is_running(&svc.id).await {
             return Err(coded(
                 "wait.not_running",
                 format!("service {name} is not running"),
@@ -1106,10 +1204,11 @@ impl<H: Host + 'static> Daemon<H> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let mut changes = self.guests.subscribe();
         loop {
-            if let Some(guest) = self.guests.get(name) {
+            if let Some(guest) = self.guests.get(&svc.id) {
                 if guest.report.ready {
                     return Ok(json!({
-                        "name": name,
+                        "id": svc.id,
+                        "hostname": name,
                         "ready": true,
                         "guestd": guest.summary(),
                     }));
@@ -1141,10 +1240,11 @@ impl<H: Host + 'static> Daemon<H> {
         let reg = self.registry().await?;
         let mut endpoints = Vec::new();
         for svc in reg.services.values().filter(|svc| svc.agent) {
-            let running = self.is_running(&svc.name).await;
-            let guest = self.guests.get(&svc.name);
+            let running = self.is_running(&svc.id).await;
+            let guest = self.guests.get(&svc.id);
             endpoints.push(json!({
-                "name": svc.name,
+                "id": svc.id,
+                "hostname": svc.hostname,
                 "running": running,
                 "is_agent_in_charge": svc.is_agent_in_charge,
                 "guestd": guest.map(|g| g.summary()),
@@ -1153,11 +1253,11 @@ impl<H: Host + 'static> Daemon<H> {
         Ok(json!({ "agents": endpoints }))
     }
 
-    /// Broker verb (§6): bind `<vm>.sock_<port>` and pass the listening fd to
+    /// Broker verb (§6): bind `<id>.sock_<port>` and pass the listening fd to
     /// the caller. Only agent-plane ports may be brokered, and only for
     /// agent-enabled services; the vsock directory itself stays root-owned.
     async fn guest_listener(&self, args: Map<String, Value>) -> Result<Dispatch> {
-        let name = required_str(&args, "name")?;
+        let id = required_str(&args, "id")?;
         let port = optional_u64(&args, "port").unwrap_or(PORT_AGENT as u64) as u32;
         if port != PORT_AGENT {
             return Err(coded(
@@ -1166,14 +1266,14 @@ impl<H: Host + 'static> Daemon<H> {
             ));
         }
         let reg = self.registry().await?;
-        let svc = reg.get(name)?;
+        let svc = reg.get_by_id(id)?;
         if !svc.agent {
             return Err(coded(
                 "agent.not_enabled",
-                format!("service {name} is not agent-enabled"),
+                format!("service {} is not agent-enabled", svc.hostname),
             ));
         }
-        let path = self.cfg.vm_vsock_port_socket(name, port);
+        let path = self.cfg.vm_vsock_port_socket(id, port);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -1185,37 +1285,37 @@ impl<H: Host + 'static> Daemon<H> {
         let listener = std::os::unix::net::UnixListener::bind(path.as_str())
             .with_context(|| format!("bind brokered listener {path}"))?;
         Ok(Dispatch::PassFd {
-            result: json!({ "name": name, "port": port }),
+            result: json!({ "id": id, "hostname": svc.hostname, "port": port }),
             fd: OwnedFd::from(listener),
         })
     }
 
-    /// Broker verb (§6): connect to `<vm>.sock` (the CHV hybrid vsock socket)
+    /// Broker verb (§6): connect to `<id>.sock` (the CHV hybrid vsock socket)
     /// and pass the connected fd; the caller performs the in-band
     /// `CONNECT <port>` handshake itself.
     async fn guest_connect(&self, args: Map<String, Value>) -> Result<Dispatch> {
-        let name = required_str(&args, "name")?;
+        let id = required_str(&args, "id")?;
         let reg = self.registry().await?;
-        let svc = reg.get(name)?;
+        let svc = reg.get_by_id(id)?;
         if !svc.agent {
             return Err(coded(
                 "agent.not_enabled",
-                format!("service {name} is not agent-enabled"),
+                format!("service {} is not agent-enabled", svc.hostname),
             ));
         }
-        if !self.is_running(name).await {
+        if !self.is_running(id).await {
             return Err(coded(
                 "service.not_running",
-                format!("service {name} is not running"),
+                format!("service {} is not running", svc.hostname),
             ));
         }
-        let path = self.cfg.vm_vsock_socket(name);
+        let path = self.cfg.vm_vsock_socket(id);
         let stream = UnixStream::connect(path.as_str())
             .await
             .with_context(|| format!("connect guest vsock socket {path}"))?;
         let stream = stream.into_std().context("detach guest vsock stream")?;
         Ok(Dispatch::PassFd {
-            result: json!({ "name": name }),
+            result: json!({ "id": id, "hostname": svc.hostname }),
             fd: OwnedFd::from(stream),
         })
     }
@@ -1262,8 +1362,8 @@ impl<H: Host + 'static> Daemon<H> {
         Ok(json!({ "checks": checks }))
     }
 
-    async fn is_running(&self, name: &str) -> bool {
-        let unit = unit_name(name);
+    async fn is_running(&self, id: &str) -> bool {
+        let unit = unit_name(id);
         self.host
             .systemctl(&["is-active", &unit])
             .await
@@ -1289,31 +1389,38 @@ impl<H: Host + 'static> Daemon<H> {
     /// Write the dnsmasq static-lease drop-in for a service and SIGHUP dnsmasq.
     /// If the drop-in dir is absent (dev host without a managed dnsmasq), warn
     /// and skip — the VM still works with dynamic DHCP.
-    async fn write_dnsmasq_dropin(&self, name: &str, mac: &str, ip: &str) -> Result<()> {
+    async fn write_dnsmasq_dropin(
+        &self,
+        id: &str,
+        hostname: &str,
+        mac: &str,
+        ip: &str,
+    ) -> Result<()> {
         let dir = &self.cfg.dnsmasq_dropin_dir;
         if !dir.exists() {
             warn!(
-                service = %name,
+                hostname = %hostname,
+                id = %id,
                 dir = %dir,
                 "dnsmasq drop-in dir absent; skipping static lease (dynamic DHCP still works)"
             );
             return Ok(());
         }
-        let path = dir.join(format!("{name}.conf"));
-        fs::write(&path, net::dhcp_host_line(mac, ip))
+        let path = dir.join(format!("{id}.conf"));
+        fs::write(&path, net::dhcp_host_line(mac, ip, hostname))
             .await
             .with_context(|| format!("write dnsmasq drop-in {path}"))?;
-        self.reload_dnsmasq(name).await;
+        self.reload_dnsmasq(hostname).await;
         Ok(())
     }
 
     /// Remove a service's dnsmasq drop-in and SIGHUP dnsmasq if one existed.
-    async fn remove_dnsmasq_dropin(&self, name: &str) -> Result<()> {
-        let path = self.cfg.dnsmasq_dropin_dir.join(format!("{name}.conf"));
+    async fn remove_dnsmasq_dropin(&self, id: &str) -> Result<()> {
+        let path = self.cfg.dnsmasq_dropin_dir.join(format!("{id}.conf"));
         let existed = path.exists();
         remove_path_file(path).await?;
         if existed {
-            self.reload_dnsmasq(name).await;
+            self.reload_dnsmasq(id).await;
         }
         Ok(())
     }
@@ -1415,7 +1522,8 @@ async fn read_success_response<R: tokio::io::AsyncRead + Unpin>(
 
 fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Value {
     json!({
-        "name": svc.name,
+        "id": svc.id,
+        "hostname": svc.hostname,
         "enabled": svc.enabled,
         "running": running,
         "image": svc.image,
@@ -1710,7 +1818,7 @@ async fn read_kernel_contract(kernel: &Utf8PathBuf) -> Result<u32> {
 async fn boot_config_state<H: Host>(cfg: &Config, host: &H, svc: &Service) -> Option<&'static str> {
     let image = image::load(cfg, &svc.image).await.ok()?;
     let expected = cloud_hypervisor_argv(cfg, svc, &image);
-    let unit = unit_name(&svc.name);
+    let unit = unit_name(&svc.id);
     let execstart = host
         .systemctl(&["show", "-p", "ExecStart", "--value", &unit])
         .await
@@ -1739,7 +1847,7 @@ fn resolved_address(
     svc: &Service,
 ) -> Option<(String, &'static str)> {
     let lease_ip = net::lease_for_mac(leases, &svc.mac).map(|l| l.ip.as_str());
-    let static_ip = reg.allocations.ips.get(&svc.name).map(|s| s.as_str());
+    let static_ip = reg.allocations.ips.get(&svc.id).map(|s| s.as_str());
     net::resolve_address(lease_ip, static_ip).map(|(ip, source)| (ip.to_string(), source))
 }
 
@@ -1752,7 +1860,7 @@ async fn apply_nat<H: Host>(cfg: &Config, host: &H, reg: &Registry) {
         .services
         .values()
         .map(|svc| PublishTarget {
-            service: svc.name.clone(),
+            service: svc.hostname.clone(),
             address: resolved_address(reg, &leases, svc).map(|(ip, _)| ip),
             publishes: svc.publish.clone(),
         })
@@ -1779,18 +1887,18 @@ async fn rewrite_missing_dropins<H: Host>(cfg: &Config, host: &H, reg: &Registry
     }
     let mut wrote_any = false;
     for svc in reg.services.values() {
-        let Some(ip) = reg.allocations.ips.get(&svc.name) else {
+        let Some(ip) = reg.allocations.ips.get(&svc.id) else {
             continue;
         };
-        let path = dir.join(format!("{}.conf", svc.name));
+        let path = dir.join(format!("{}.conf", svc.id));
         if path.exists() {
             continue;
         }
-        warn!(service = %svc.name, "re-writing missing dnsmasq drop-in");
-        match fs::write(&path, net::dhcp_host_line(&svc.mac, ip)).await {
+        warn!(hostname = %svc.hostname, id = %svc.id, "re-writing missing dnsmasq drop-in");
+        match fs::write(&path, net::dhcp_host_line(&svc.mac, ip, &svc.hostname)).await {
             Ok(()) => wrote_any = true,
             Err(err) => {
-                warn!(service = %svc.name, error = %err, "failed to re-write dnsmasq drop-in")
+                warn!(hostname = %svc.hostname, id = %svc.id, error = %err, "failed to re-write dnsmasq drop-in")
             }
         }
     }
@@ -1815,14 +1923,14 @@ async fn start_enabled_service<H: Host>(cfg: &Config, host: &H, svc: &Service) -
 pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
     let reg = Registry::load(cfg).await?;
     for svc in reg.services.values().filter(|svc| svc.enabled) {
-        let unit = unit_name(&svc.name);
+        let unit = unit_name(&svc.id);
         let running = host
             .systemctl(&["is-active", &unit])
             .await
             .map(|s| s.trim() == "active")
             .unwrap_or(false);
         if !running {
-            warn!(service = %svc.name, "enabled service is not active; starting");
+            warn!(hostname = %svc.hostname, id = %svc.id, "enabled service is not active; starting");
             // Warn-and-continue like the nft/dnsmasq self-heal below. If image
             // load, boot-prerequisite validation, or the VM launch fails (e.g.
             // a guest kernel wiped or bumped out of contract after a reboot),
@@ -1831,7 +1939,8 @@ pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
             // skip the networking self-heal for every other service.
             if let Err(err) = start_enabled_service(cfg, host, svc).await {
                 warn!(
-                    service = %svc.name,
+                    hostname = %svc.hostname,
+                    id = %svc.id,
                     error = %err,
                     "failed to start enabled service during reconcile; leaving it down for operator action"
                 );
@@ -1841,7 +1950,8 @@ pub async fn reconcile<H: Host>(cfg: &Config, host: &H) -> Result<()> {
             // would launch now (older daemon, changed kernel/cmdline). Surface
             // it instead of silently adopting; restart stays the operator's call.
             warn!(
-                service = %svc.name,
+                hostname = %svc.hostname,
+                id = %svc.id,
                 "adopting running unit booted with a stale boot config; restart to apply current flags"
             );
         }
@@ -1911,7 +2021,8 @@ mod tests {
             "/var/lib/hearth/initramfs.cpio.gz",
         ]);
         let svc = Service {
-            name: "dev".into(),
+            id: "vm-00000000000000000000000000000001".into(),
+            hostname: "dev".into(),
             enabled: false,
             image: "exeuntu".into(),
             cpu: 4,
@@ -1950,7 +2061,8 @@ mod tests {
     fn cloud_hypervisor_restore_argv_uses_restore_flag() {
         let cfg = Config::parse_from(["hearthd"]);
         let svc = Service {
-            name: "mail".into(),
+            id: "vm-00000000000000000000000000000002".into(),
+            hostname: "mail".into(),
             enabled: false,
             image: "debian".into(),
             cpu: 2,
@@ -1968,9 +2080,12 @@ mod tests {
         let argv =
             cloud_hypervisor_restore_argv(&cfg, &svc, &Utf8PathBuf::from("/snap/mail/before"))
                 .join(" ");
-        assert!(argv.contains("--api-socket /run/hearth/vms/mail.sock"));
+        assert!(
+            argv.contains("--api-socket /run/hearth/vms/vm-00000000000000000000000000000002.sock")
+        );
         assert!(argv.contains("--restore source_url=file:///snap/mail/before,resume=true"));
-        assert!(argv.contains("--serial file=/var/log/hearth/mail.console"));
+        assert!(argv
+            .contains("--serial file=/var/log/hearth/vm-00000000000000000000000000000002.console"));
     }
 
     #[tokio::test]
@@ -1980,25 +2095,8 @@ mod tests {
         let services = root.join("services");
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::write(
-            services.join("mail.toml"),
-            r#"
-name = "mail"
-enabled = true
-image = "base"
-cpu = 2
-memory_mib = 2048
-disk_gib = 20
-vsock_cid = 100
-mac = "52:54:00:12:34:56"
-
-[provision]
-hostname = "mail"
-
-[restart]
-policy = "on-failure"
-max_retries = 5
-backoff_sec = 10
-"#,
+            services.join(format!("{}.toml", test_id("mail"))),
+            service_toml("mail", true, 100, "52:54:00:12:34:56"),
         )
         .await
         .unwrap();
@@ -2022,7 +2120,7 @@ backoff_sec = 10
         let services = root.join("services");
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::write(
-            services.join("mail.toml"),
+            services.join(format!("{}.toml", test_id("mail"))),
             service_toml("mail", false, 100, "52:54:00:00:00:01"),
         )
         .await
@@ -2050,14 +2148,17 @@ backoff_sec = 10
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
         tokio::fs::write(
-            services.join("mail.toml"),
+            services.join(format!("{}.toml", test_id("mail"))),
             service_toml("mail", false, 100, "52:54:00:00:00:01"),
         )
         .await
         .unwrap();
-        tokio::fs::write(log_dir.join("mail.console"), "first\nsecond\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            log_dir.join(format!("{}.console", test_id("mail"))),
+            "first\nsecond\n",
+        )
+        .await
+        .unwrap();
         let cfg = Config::parse_from([
             "hearthd",
             "--services-dir",
@@ -2099,8 +2200,11 @@ backoff_sec = 10
 
         assert!(responses[0].ok);
         let calls = state.lock().unwrap().calls.clone();
-        assert!(calls.contains(&"systemctl is-active hearth-vm-mail.service".to_string()));
-        assert!(calls.contains(&"systemd-run mail".to_string()));
+        assert!(calls.contains(&format!(
+            "systemctl is-active hearth-vm-{}.service",
+            test_id("mail")
+        )));
+        assert!(calls.contains(&format!("systemd-run {}", test_id("mail"))));
         assert!(calls.iter().any(|call| call.starts_with("wait-socket ")));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(registry.get("mail").unwrap().enabled);
@@ -2179,7 +2283,7 @@ backoff_sec = 10
             "1",
             Verb::Create,
             Map::from_iter([
-                ("name".into(), json!("dev")),
+                ("hostname".into(), json!("dev")),
                 ("image".into(), json!("exeuntu")),
                 ("disk_gib".into(), json!(40)),
             ]),
@@ -2188,22 +2292,25 @@ backoff_sec = 10
         let responses = daemon.handle(req).await;
 
         assert!(responses[0].ok);
+        let registry = Registry::load(&cfg).await.unwrap();
+        let dev = registry.get("dev").unwrap();
         let calls = state.lock().unwrap().calls.clone();
         // The qcow2 boot disk is built via a provisioned raw scratch.
-        // Provisioning defaults apply (hostname = service name, machine-id reset).
+        // Provisioning defaults apply (hostname = service hostname, machine-id reset).
         assert!(calls.iter().any(|call| {
             call.starts_with("build-vm-disk ")
-                && call.contains("dev.qcow2")
+                && call.contains(&format!("{}.qcow2", dev.id))
                 && call.contains("scratch=")
-                && call.contains("dev.raw")
+                && call.contains(&format!("{}.raw", dev.id))
                 && call.contains("reset_machine_id=true")
                 && call.contains("hostname=dev")
         }));
-        let registry = Registry::load(&cfg).await.unwrap();
-        let dev = registry.get("dev").unwrap();
         assert_eq!(dev.image, "exeuntu");
         assert_eq!(dev.disk_gib, 40);
-        assert_eq!(dev.disk.as_deref(), Some("dev.qcow2"));
+        assert_eq!(
+            dev.disk.as_deref(),
+            Some(format!("{}.qcow2", dev.id).as_str())
+        );
         assert_eq!(dev.provision.hostname, "dev");
         assert_eq!(dev.provision.ssh_access_state(), "configured");
         assert_eq!(dev.provision.authorized_keys, vec![TEST_AUTHORIZED_KEY]);
@@ -2368,7 +2475,6 @@ backoff_sec = 10
             "1",
             Verb::Create,
             Map::from_iter([
-                ("name".into(), json!("hermes")),
                 ("image".into(), json!("exeuntu")),
                 ("hostname".into(), json!("hermes-a")),
                 (
@@ -2402,7 +2508,7 @@ backoff_sec = 10
 
         // Persisted, and status redacts the literal content.
         let registry = Registry::load(&cfg).await.unwrap();
-        let svc = registry.get("hermes").unwrap();
+        let svc = registry.get("hermes-a").unwrap();
         assert_eq!(svc.provision.hostname, "hermes-a");
         assert!(svc.provision.reset_ssh_hostkeys);
         assert_eq!(svc.provision.files.len(), 1);
@@ -2411,7 +2517,7 @@ backoff_sec = 10
             Some("TOKEN=secret")
         );
         let status = daemon
-            .handle(Request::new("2", Verb::Status, name_args("hermes")))
+            .handle(Request::new("2", Verb::Status, name_args("hermes-a")))
             .await;
         let value = status[0].result.as_ref().unwrap();
         let rendered = value["provision"].to_string();
@@ -2442,21 +2548,81 @@ backoff_sec = 10
         assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
         // The static IP is recorded next to CID/MAC and returned as the address.
         let registry = Registry::load(&cfg).await.unwrap();
-        let ip = registry.allocations.ips.get("web").cloned();
+        let web_id = &registry.get("web").unwrap().id;
+        let ip = registry.allocations.ips.get(web_id).cloned();
         assert_eq!(ip.as_deref(), Some("10.26.8.16"));
         assert_eq!(
             responses[0].result.as_ref().unwrap()["created"]["address"],
             json!("10.26.8.16")
         );
         // The drop-in file was written and dnsmasq was SIGHUP'd.
-        let dropin = cfg.dnsmasq_dropin_dir.join("web.conf");
+        let dropin = cfg.dnsmasq_dropin_dir.join(format!("{web_id}.conf"));
         let contents = tokio::fs::read_to_string(&dropin).await.unwrap();
-        let mac = registry.allocations.macs.get("web").unwrap();
-        assert_eq!(contents, format!("dhcp-host={mac},10.26.8.16\n"));
+        let mac = registry.allocations.macs.get(web_id).unwrap();
+        assert_eq!(contents, format!("dhcp-host={mac},10.26.8.16,web\n"));
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls.contains(&"reload-dnsmasq".to_string()));
         // The NAT table is (re)applied even with no publishes.
         assert!(calls.contains(&"nft-apply".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rename_changes_hostname_without_changing_machine_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
+            .await
+            .unwrap();
+        write_test_image(&cfg, "base").await;
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let created = daemon
+            .handle(Request::new("1", Verb::Create, create_args("web")))
+            .await;
+        assert!(created[0].ok, "create failed: {:?}", created[0].error);
+        let before = Registry::load(&cfg).await.unwrap();
+        let id = before.get("web").unwrap().id.clone();
+        let cid = before.allocations.vsock_cids.get(&id).copied();
+        let mac = before.allocations.macs.get(&id).cloned();
+        let ip = before.allocations.ips.get(&id).cloned();
+
+        let renamed = daemon
+            .handle(Request::new(
+                "2",
+                Verb::Rename,
+                Map::from_iter([
+                    ("name".to_string(), json!("web")),
+                    ("hostname".to_string(), json!("api")),
+                ]),
+            ))
+            .await;
+        assert!(renamed[0].ok, "rename failed: {:?}", renamed[0].error);
+        assert_eq!(renamed[0].result.as_ref().unwrap()["id"], json!(id));
+        assert_eq!(
+            renamed[0].result.as_ref().unwrap()["guest_hostname_updated"],
+            Value::Null
+        );
+
+        let after = Registry::load(&cfg).await.unwrap();
+        assert!(after.get("web").is_err());
+        let api = after.get("api").unwrap();
+        assert_eq!(api.id, id);
+        assert_eq!(api.provision.hostname, "api");
+        assert_eq!(after.allocations.vsock_cids.get(&id).copied(), cid);
+        assert_eq!(after.allocations.macs.get(&id), mac.as_ref());
+        assert_eq!(after.allocations.ips.get(&id), ip.as_ref());
+        assert!(cfg.services_dir.join(format!("{id}.toml")).exists());
+        assert_eq!(
+            tokio::fs::read_to_string(cfg.dnsmasq_dropin_dir.join(format!("{id}.conf")))
+                .await
+                .unwrap(),
+            format!(
+                "dhcp-host={},{},api\n",
+                mac.as_deref().unwrap(),
+                ip.as_deref().unwrap()
+            )
+        );
     }
 
     #[tokio::test]
@@ -2476,13 +2642,17 @@ backoff_sec = 10
             .await;
 
         assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
-        assert!(!cfg.dnsmasq_dropin_dir.join("web.conf").exists());
+        let registry = Registry::load(&cfg).await.unwrap();
+        let web_id = &registry.get("web").unwrap().id;
+        assert!(!cfg
+            .dnsmasq_dropin_dir
+            .join(format!("{web_id}.conf"))
+            .exists());
         let calls = state.lock().unwrap().calls.clone();
         // No drop-in written -> no dnsmasq reload, but the IP is still reserved.
         assert!(!calls.contains(&"reload-dnsmasq".to_string()));
-        let registry = Registry::load(&cfg).await.unwrap();
         assert_eq!(
-            registry.allocations.ips.get("web").map(String::as_str),
+            registry.allocations.ips.get(web_id).map(String::as_str),
             Some("10.26.8.16")
         );
     }
@@ -2500,7 +2670,7 @@ backoff_sec = 10
             "1",
             Verb::Create,
             Map::from_iter([
-                ("name".into(), json!("web")),
+                ("hostname".into(), json!("web")),
                 ("image".into(), json!("base")),
                 (
                     "publish".into(),
@@ -2682,7 +2852,7 @@ backoff_sec = 10
                 "1",
                 Verb::Create,
                 Map::from_iter([
-                    ("name".into(), json!("web")),
+                    ("hostname".into(), json!("web")),
                     ("image".into(), json!("base")),
                     (
                         "publish".into(),
@@ -2726,7 +2896,7 @@ backoff_sec = 10
             "1",
             Verb::Create,
             Map::from_iter([
-                ("name".into(), json!("web")),
+                ("hostname".into(), json!("web")),
                 ("image".into(), json!("base")),
                 (
                     "publish".into(),
@@ -2746,7 +2916,7 @@ backoff_sec = 10
             .any(|call| call.starts_with("qemu-img create ")));
         assert!(!calls.contains(&"nft-apply".to_string()));
         let registry = Registry::load(&cfg).await.unwrap();
-        assert!(!registry.allocations.ips.contains_key("web"));
+        assert!(registry.allocations.ips.is_empty());
     }
 
     #[tokio::test]
@@ -2760,10 +2930,9 @@ backoff_sec = 10
         Registry::write_allocations(
             &cfg,
             &Allocations {
-                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
-                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
-                    .collect(),
-                ips: std::iter::once(("mail".to_string(), "10.26.8.16".to_string())).collect(),
+                vsock_cids: std::iter::once((test_id("mail"), 100)).collect(),
+                macs: std::iter::once((test_id("mail"), "52:54:00:00:00:01".to_string())).collect(),
+                ips: std::iter::once((test_id("mail"), "10.26.8.16".to_string())).collect(),
             },
         )
         .await
@@ -2798,7 +2967,7 @@ backoff_sec = 10
         write_service(&root, "mail", false).await;
         let daemon = Daemon::new(test_config(&root), FakeHost::default());
         daemon.guests.update_report(
-            "mail",
+            &test_id("mail"),
             Some(&hearth_agent_proto::Hello::new("guestd", "0.1.0+3af0907")),
             hearth_agent_proto::BootReport {
                 ready: true,
@@ -2817,7 +2986,8 @@ backoff_sec = 10
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
-        let socket = cfg.vm_vsock_socket("mail");
+        let id = "vm-00000000000000000000000000000001";
+        let socket = cfg.vm_vsock_socket(id);
         tokio::fs::create_dir_all(socket.parent().unwrap())
             .await
             .unwrap();
@@ -2868,7 +3038,7 @@ backoff_sec = 10
         let daemon = Daemon::new(cfg, FakeHost::default());
 
         assert_eq!(
-            daemon.probe_guestd_version("mail").await.unwrap(),
+            daemon.probe_guestd_version(id).await.unwrap(),
             "0.1.0+3af0907"
         );
         server.await.unwrap();
@@ -2900,16 +3070,19 @@ backoff_sec = 10
         tokio::fs::create_dir_all(&cfg.dnsmasq_dropin_dir)
             .await
             .unwrap();
-        tokio::fs::write(cfg.dnsmasq_dropin_dir.join("mail.conf"), "dhcp-host=x\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            cfg.dnsmasq_dropin_dir
+                .join(format!("{}.conf", test_id("mail"))),
+            "dhcp-host=x\n",
+        )
+        .await
+        .unwrap();
         Registry::write_allocations(
             &cfg,
             &Allocations {
-                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
-                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
-                    .collect(),
-                ips: std::iter::once(("mail".to_string(), "10.26.8.16".to_string())).collect(),
+                vsock_cids: std::iter::once((test_id("mail"), 100)).collect(),
+                macs: std::iter::once((test_id("mail"), "52:54:00:00:00:01".to_string())).collect(),
+                ips: std::iter::once((test_id("mail"), "10.26.8.16".to_string())).collect(),
             },
         )
         .await
@@ -2923,9 +3096,12 @@ backoff_sec = 10
             .await;
 
         assert!(responses[0].ok);
-        assert!(!cfg.dnsmasq_dropin_dir.join("mail.conf").exists());
+        assert!(!cfg
+            .dnsmasq_dropin_dir
+            .join(format!("{}.conf", test_id("mail")))
+            .exists());
         let registry = Registry::load(&cfg).await.unwrap();
-        assert!(!registry.allocations.ips.contains_key("mail"));
+        assert!(!registry.allocations.ips.contains_key(&test_id("mail")));
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls.contains(&"reload-dnsmasq".to_string()));
         assert!(calls.contains(&"nft-apply".to_string()));
@@ -2977,10 +3153,9 @@ backoff_sec = 10
         Registry::write_allocations(
             &cfg,
             &Allocations {
-                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
-                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
-                    .collect(),
-                ips: std::iter::once(("mail".to_string(), "10.26.8.16".to_string())).collect(),
+                vsock_cids: std::iter::once((test_id("mail"), 100)).collect(),
+                macs: std::iter::once((test_id("mail"), "52:54:00:00:00:01".to_string())).collect(),
+                ips: std::iter::once((test_id("mail"), "10.26.8.16".to_string())).collect(),
             },
         )
         .await
@@ -2990,10 +3165,12 @@ backoff_sec = 10
 
         reconcile(&cfg, &host).await.unwrap();
 
-        let dropin = cfg.dnsmasq_dropin_dir.join("mail.conf");
+        let dropin = cfg
+            .dnsmasq_dropin_dir
+            .join(format!("{}.conf", test_id("mail")));
         assert_eq!(
             tokio::fs::read_to_string(&dropin).await.unwrap(),
-            "dhcp-host=52:54:00:00:00:01,10.26.8.16\n"
+            "dhcp-host=52:54:00:00:00:01,10.26.8.16,mail\n"
         );
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls.contains(&"reload-dnsmasq".to_string()));
@@ -3052,7 +3229,7 @@ backoff_sec = 10
 
         assert!(responses[0].ok, "start failed: {:?}", responses[0].error);
         let calls = state.lock().unwrap().calls.clone();
-        assert!(calls.contains(&"systemd-run dev".to_string()));
+        assert!(calls.contains(&format!("systemd-run {}", test_id("dev"))));
     }
 
     #[tokio::test]
@@ -3200,21 +3377,21 @@ cwd = "/home/exedev"
         let cfg = test_config(&root);
         tokio::fs::create_dir_all(&cfg.disks_dir).await.unwrap();
         tokio::fs::create_dir_all(&cfg.log_dir).await.unwrap();
-        tokio::fs::create_dir_all(cfg.snapshots_dir.join("mail"))
+        let id = test_id("mail");
+        tokio::fs::create_dir_all(cfg.snapshots_dir.join(&id))
             .await
             .unwrap();
-        tokio::fs::write(cfg.disk_path_ext("mail", "qcow2"), b"disk")
+        tokio::fs::write(cfg.disk_path_ext(&id, "qcow2"), b"disk")
             .await
             .unwrap();
-        tokio::fs::write(cfg.console_path("mail"), b"log")
+        tokio::fs::write(cfg.console_path(&id), b"log")
             .await
             .unwrap();
         Registry::write_allocations(
             &cfg,
             &Allocations {
-                vsock_cids: std::iter::once(("mail".to_string(), 100)).collect(),
-                macs: std::iter::once(("mail".to_string(), "52:54:00:00:00:01".to_string()))
-                    .collect(),
+                vsock_cids: std::iter::once((id.clone(), 100)).collect(),
+                macs: std::iter::once((id.clone(), "52:54:00:00:00:01".to_string())).collect(),
                 ..Allocations::default()
             },
         )
@@ -3232,13 +3409,13 @@ cwd = "/home/exedev"
         assert!(calls
             .iter()
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
-        assert!(!cfg.disk_path_ext("mail", "qcow2").exists());
-        assert!(!cfg.console_path("mail").exists());
-        assert!(!cfg.snapshots_dir.join("mail").exists());
-        assert!(!cfg.services_dir.join("mail.toml").exists());
+        assert!(!cfg.disk_path_ext(&id, "qcow2").exists());
+        assert!(!cfg.console_path(&id).exists());
+        assert!(!cfg.snapshots_dir.join(&id).exists());
+        assert!(!cfg.services_dir.join(format!("{id}.toml")).exists());
         let registry = Registry::load(&cfg).await.unwrap();
-        assert!(!registry.allocations.vsock_cids.contains_key("mail"));
-        assert!(!registry.allocations.macs.contains_key("mail"));
+        assert!(!registry.allocations.vsock_cids.contains_key(&id));
+        assert!(!registry.allocations.macs.contains_key(&id));
     }
 
     #[tokio::test]
@@ -3262,12 +3439,12 @@ cwd = "/home/exedev"
         let responses = daemon.handle(req).await;
 
         assert!(responses[0].ok);
-        assert!(cfg.snapshot_dir("mail", "before").is_dir());
+        assert!(cfg.snapshot_dir(&test_id("mail"), "before").is_dir());
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls.iter().any(|call| {
             call == &format!(
                 "chv-put /api/v1/vm.snapshot {{\"destination_url\":\"file://{}\"}}",
-                cfg.snapshot_dir("mail", "before")
+                cfg.snapshot_dir(&test_id("mail"), "before")
             )
         }));
 
@@ -3291,7 +3468,7 @@ cwd = "/home/exedev"
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         write_service(&root, "mail", false).await;
         let cfg = test_config(&root);
-        tokio::fs::create_dir_all(cfg.snapshot_dir("mail", "before"))
+        tokio::fs::create_dir_all(cfg.snapshot_dir(&test_id("mail"), "before"))
             .await
             .unwrap();
         let host = FakeHost::running();
@@ -3313,14 +3490,12 @@ cwd = "/home/exedev"
         assert!(calls
             .iter()
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
-        assert!(calls.iter().any(|call| call == "systemd-restore mail"));
+        let restore_call = format!("systemd-restore {}", test_id("mail"));
+        assert!(calls.iter().any(|call| call == &restore_call));
         assert!(calls.iter().any(|call| call.starts_with("wait-socket ")));
         // Restore must refresh the NAT table *after* bringing the VM back up, in
         // case the resumed guest took a different lease than it held before.
-        let restore_idx = calls
-            .iter()
-            .position(|call| call == "systemd-restore mail")
-            .unwrap();
+        let restore_idx = calls.iter().position(|call| call == &restore_call).unwrap();
         assert!(
             calls[restore_idx..].iter().any(|call| call == "nft-apply"),
             "restore must re-apply NAT after resuming the VM: {calls:?}"
@@ -3566,9 +3741,11 @@ cwd = "/home/exedev"
     }
 
     fn service_toml(name: &str, enabled: bool, cid: u32, mac: &str) -> String {
+        let id = test_id(name);
         format!(
             r#"
-name = "{name}"
+id = "{id}"
+hostname = "{name}"
 enabled = {enabled}
 image = "base"
 cpu = 2
@@ -3592,7 +3769,7 @@ backoff_sec = 10
         let services = root.join("services");
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::write(
-            services.join(format!("{name}.toml")),
+            services.join(format!("{}.toml", test_id(name))),
             service_toml(name, enabled, 100, "52:54:00:00:00:01"),
         )
         .await
@@ -3607,9 +3784,16 @@ backoff_sec = 10
 
     fn create_args(name: &str) -> Map<String, Value> {
         Map::from_iter([
-            ("name".to_string(), json!(name)),
+            ("hostname".to_string(), json!(name)),
             ("image".to_string(), json!("base")),
         ])
+    }
+
+    fn test_id(name: &str) -> String {
+        let value = name.bytes().fold(0u128, |value, byte| {
+            value.wrapping_mul(257) ^ u128::from(byte)
+        });
+        format!("vm-{value:032x}")
     }
 
     async fn write_test_image(cfg: &Config, name: &str) {
@@ -3659,12 +3843,14 @@ backoff_sec = 10
     /// `start` exercises the guest-kernel validation path.
     async fn write_image_service(root: &Utf8Path, name: &str, enabled: bool, manifest_toml: &str) {
         let services = root.join("services");
+        let id = test_id(name);
         tokio::fs::create_dir_all(&services).await.unwrap();
         tokio::fs::write(
-            services.join(format!("{name}.toml")),
+            services.join(format!("{id}.toml")),
             format!(
                 r#"
-name = "{name}"
+id = "{id}"
+hostname = "{name}"
 enabled = {enabled}
 image = "exeuntu"
 cpu = 2
