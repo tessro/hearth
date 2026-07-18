@@ -645,13 +645,14 @@ fn render_ls(result: Option<&Value>) -> Result<()> {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_header([
-        "NAME", "ENABLED", "RUNNING", "SSH", "IMAGE", "CPU", "MEM", "CID", "ADDRESS",
+        "NAME", "ENABLED", "RUNNING", "GUESTD", "SSH", "IMAGE", "CPU", "MEM", "CID", "ADDRESS",
     ]);
     for svc in services {
         table.add_row([
             cell(svc, "name"),
             cell(svc, "enabled"),
             cell(svc, "running"),
+            guestd_cell(svc),
             cell(svc, "ssh_access"),
             cell(svc, "image"),
             cell(svc, "cpu"),
@@ -790,6 +791,24 @@ fn address_cell(value: &Value) -> String {
     }
 }
 
+fn guestd_cell(value: &Value) -> String {
+    let Some(guestd) = value.get("guestd") else {
+        return "-".to_string();
+    };
+    let Some(version) = guestd
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+    else {
+        return "-".to_string();
+    };
+    if guestd.get("connected").and_then(Value::as_bool) == Some(false) {
+        format!("{version} (offline)")
+    } else {
+        version.to_string()
+    }
+}
+
 fn args<const N: usize>(items: [(&str, Value); N]) -> Map<String, Value> {
     items
         .into_iter()
@@ -822,6 +841,23 @@ mod tests {
     fn pong_falls_back_when_daemon_omits_version_or_pid() {
         assert_eq!(format_pong(Some(&json!({ "pong": true }))), "pong");
         assert_eq!(format_pong(None), "pong");
+    }
+
+    #[test]
+    fn guestd_cell_shows_version_connection_and_absence() {
+        assert_eq!(
+            guestd_cell(&json!({
+                "guestd": {"version": "0.1.0+3af0907", "connected": true}
+            })),
+            "0.1.0+3af0907"
+        );
+        assert_eq!(
+            guestd_cell(&json!({
+                "guestd": {"version": "0.1.0+3af0907", "connected": false}
+            })),
+            "0.1.0+3af0907 (offline)"
+        );
+        assert_eq!(guestd_cell(&json!({})), "-");
     }
 
     #[test]

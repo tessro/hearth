@@ -78,17 +78,29 @@ dev: build
 # commands to run on the target instead. See docs/operations.md.
 DOCDIR ?= $(PREFIX)/share/doc/hearth
 
-# Install just the binaries. Use this on NixOS (and anywhere else that manages
+# Install just the already-built binaries. Build as the invoking user first;
+# privileged install targets must never invoke Cargo and leave root-owned
+# artifacts in target/. Use this on NixOS (and anywhere else that manages
 # systemd units declaratively): $(UNITDIR) is read-only there, so `install`'s
 # unit copy fails, but updating hearthd/hearthctl is all a code deploy needs.
-install-bin: host-bins
+install-bin:
+	@for binary in target/release/hearthd target/release/hearthctl target/release/hearth-agentd; do \
+		test -x "$$binary" || { \
+			echo "error: $$binary is missing; run 'make build' without sudo first" >&2; \
+			exit 1; \
+		}; \
+	done
 	$(INSTALL) -D -m 0755 target/release/hearthd      $(DESTDIR)$(BINDIR)/hearthd
 	$(INSTALL) -D -m 0755 target/release/hearthctl    $(DESTDIR)$(BINDIR)/hearthctl
 	$(INSTALL) -D -m 0755 target/release/hearth-agentd $(DESTDIR)$(BINDIR)/hearth-agentd
 
 # Install the portable guest-only payload outside PATH. hearthctl derives this
 # location from its own PREFIX and uses it as the default `upgrade --from`.
-install-guest-payload: guest-bin
+install-guest-payload:
+	@test -x "$(GUEST_BIN)" || { \
+		echo "error: guest payload is missing; run 'make guest-bin' without sudo first" >&2; \
+		exit 1; \
+	}
 	$(INSTALL) -D -m 0755 "$(GUEST_BIN)" "$(DESTDIR)$(GUESTPAYLOADDIR)/hearth-guestd"
 
 # Install the agent-plane host daemon unit (opt-in — the machine plane runs

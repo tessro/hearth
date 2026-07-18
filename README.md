@@ -30,6 +30,15 @@ This builds host `hearth-agentd`, builds `hearth-guestd` as a static musl
 binary, verifies it has no dynamic interpreter, and stages it at
 `example/vm-base/hearth-guestd`.
 
+Install targets are copy-only. Build as your normal user first, then elevate
+only the filesystem installation step so Cargo never leaves root-owned build
+artifacts:
+
+```sh
+devenv shell -- make build guest-bin
+devenv shell -- sudo make install
+```
+
 ## Web console
 
 ```sh

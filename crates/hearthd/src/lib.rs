@@ -25,7 +25,10 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use chrono::Utc;
-use hearth_agent_proto::{fdpass, read_line_capped, MAX_LINE_BYTES, PORT_AGENT};
+use hearth_agent_proto::{
+    fdpass, hybrid, read_line_capped, AgentRequest, AgentVerb, Hello, MAX_LINE_BYTES, PORT_AGENT,
+    PORT_GUESTD,
+};
 use hearth_proto::{version_result, ImageManifest, Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -331,10 +334,40 @@ impl<H: Host + 'static> Daemon<H> {
         let reg = self.registry().await?;
         let leases = self.load_leases().await;
         let mut services = Vec::new();
+        let mut probes = Vec::new();
         for svc in reg.services.values() {
             let running = self.is_running(&svc.name).await;
             let address = resolved_address(&reg, &leases, svc);
-            services.push(service_summary(svc, running, address.map(|(ip, _)| ip)));
+            let mut summary = service_summary(svc, running, address.map(|(ip, _)| ip));
+            if let Some(guest) = self.guests.get(&svc.name) {
+                summary["guestd"] = guest.summary();
+            } else if running {
+                let daemon = self.clone();
+                let name = svc.name.clone();
+                let index = services.len();
+                probes.push(async move {
+                    let version = match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        daemon.probe_guestd_version(&name),
+                    )
+                    .await
+                    {
+                        Ok(Ok(version)) => Some(version),
+                        Ok(Err(_)) | Err(_) => None,
+                    };
+                    (index, version)
+                });
+            }
+            services.push(summary);
+        }
+        for (index, version) in futures_util::future::join_all(probes).await {
+            if let Some(version) = version {
+                services[index]["guestd"] = json!({
+                    "version": version,
+                    "connected": true,
+                    "source": "probe",
+                });
+            }
         }
         Ok(json!({ "services": services }))
     }
@@ -404,6 +437,31 @@ impl<H: Host + 'static> Daemon<H> {
             }
         }
         Ok(value)
+    }
+
+    async fn probe_guestd_version(&self, name: &str) -> Result<String> {
+        let mut stream = UnixStream::connect(self.cfg.vm_vsock_socket(name).as_str())
+            .await
+            .context("connect guest vsock for version probe")?;
+        hybrid::connect_handshake(&mut stream, PORT_GUESTD)
+            .await
+            .context("connect guestd version channel")?;
+        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        stream
+            .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
+            .await?;
+        read_success_response(&mut stream, "guestd hello").await?;
+        let req = AgentRequest::new("ls-version-probe", AgentVerb::Version, Map::new());
+        stream
+            .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
+            .await?;
+        read_success_response(&mut stream, "guestd version")
+            .await?
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|version| !version.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("guestd version response omitted version"))
     }
 
     async fn create(&self, args: Map<String, Value>) -> Result<Value> {
@@ -1334,6 +1392,25 @@ async fn write_response<W: AsyncWrite + Unpin>(write: &mut W, response: &Respons
         .await?;
     write.write_all(b"\n").await?;
     Ok(())
+}
+
+async fn read_success_response<R: tokio::io::AsyncRead + Unpin>(
+    read: &mut R,
+    context: &str,
+) -> Result<Value> {
+    let line = read_line_capped(read, MAX_LINE_BYTES)
+        .await?
+        .ok_or_else(|| anyhow!("{context}: connection closed"))?;
+    let response: Response = serde_json::from_str(&line)?;
+    if response.ok {
+        Ok(response.result.unwrap_or(Value::Null))
+    } else {
+        let err = response
+            .error
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| "unknown guest error".to_string());
+        bail!("{context}: {err}")
+    }
 }
 
 fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Value {
@@ -2712,6 +2789,89 @@ backoff_sec = 10
             .as_array()
             .unwrap();
         assert_eq!(services[0]["address"], json!("10.26.8.99"));
+    }
+
+    #[tokio::test]
+    async fn ls_includes_reported_guestd_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", false).await;
+        let daemon = Daemon::new(test_config(&root), FakeHost::default());
+        daemon.guests.update_report(
+            "mail",
+            Some(&hearth_agent_proto::Hello::new("guestd", "0.1.0+3af0907")),
+            hearth_agent_proto::BootReport {
+                ready: true,
+                ..Default::default()
+            },
+        );
+
+        let ls = daemon.handle(Request::new("1", Verb::Ls, Map::new())).await;
+        let service = &ls[0].result.as_ref().unwrap()["services"][0];
+        assert_eq!(service["guestd"]["version"], json!("0.1.0+3af0907"));
+        assert_eq!(service["guestd"]["connected"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn probes_guestd_version_over_the_direct_guest_channel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        let socket = cfg.vm_vsock_socket("mail");
+        tokio::fs::create_dir_all(socket.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = UnixListener::bind(socket.as_str()).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                hybrid::accept_handshake(&mut stream).await.unwrap(),
+                PORT_GUESTD
+            );
+            let hello = read_line_capped(&mut stream, MAX_LINE_BYTES)
+                .await
+                .unwrap()
+                .unwrap();
+            let hello: Hello = serde_json::from_str(&hello).unwrap();
+            assert_eq!(hello.component, "agentd");
+            stream
+                .write_all(
+                    (serde_json::to_string(&Response::success(
+                        "hello",
+                        json!({"proto": hearth_agent_proto::AGENT_PROTOCOL_VERSION}),
+                    ))
+                    .unwrap()
+                        + "\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let request = read_line_capped(&mut stream, MAX_LINE_BYTES)
+                .await
+                .unwrap()
+                .unwrap();
+            let request: AgentRequest = serde_json::from_str(&request).unwrap();
+            assert!(matches!(request.verb, AgentVerb::Version));
+            stream
+                .write_all(
+                    (serde_json::to_string(&Response::success(
+                        request.id,
+                        json!({"version": "0.1.0+3af0907"}),
+                    ))
+                    .unwrap()
+                        + "\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let daemon = Daemon::new(cfg, FakeHost::default());
+
+        assert_eq!(
+            daemon.probe_guestd_version("mail").await.unwrap(),
+            "0.1.0+3af0907"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

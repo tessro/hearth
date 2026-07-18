@@ -106,7 +106,9 @@ start with it.
 ## 3. Install
 
 ```sh
-# 1. Build and install the binaries, the systemd unit, and this doc.
+# 1. Build every installable artifact as the logged-in user, then copy them
+#    into system paths as root. Install targets never invoke Cargo.
+make build guest-bin
 sudo make install
 #    -> /usr/local/bin/{hearthd,hearthctl}
 #    -> /usr/local/lib/hearth/guest/hearth-guestd
@@ -136,6 +138,7 @@ hearthctl host check          # paths/commands/modules/keyring, ok=true each
 run the unit from `/run` or your system config:
 
 ```sh
+make build guest-bin
 sudo make install-bin install-guest-payload # -> host binaries + guest updater payload
 sudo cp systemd/hearth.service /run/systemd/system/   # runtime unit (survives until next boot)
 sudo systemctl daemon-reload && sudo systemctl enable --now hearth.service
@@ -143,8 +146,14 @@ sudo systemctl daemon-reload && sudo systemctl enable --now hearth.service
 # with ExecStart = "/usr/local/bin/hearthd" instead of the /run unit.
 ```
 
-A code-only redeploy (e.g. after a daemon fix) is just `sudo make install-bin &&
-sudo systemctl restart hearth` — the unit and paths do not change.
+A code-only redeploy (e.g. after a daemon fix) builds unprivileged, then copies
+and restarts privileged; the unit and paths do not change:
+
+```sh
+make build
+sudo make install-bin
+sudo systemctl restart hearth
+```
 
 `hearthctl host check` reports each directory, command, the guest
 kernel, `/dev/kvm`, the bridge, and the `kvm`/`vhost_vsock` modules. Green there
@@ -201,6 +210,7 @@ error:
   daemon.**
 
 ```sh
+make build guest-bin
 sudo make install
 sudo systemctl restart hearth.service
 hearthctl ping        # confirm the new version answered
