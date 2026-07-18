@@ -20,7 +20,7 @@ mod upgrade;
 mod wait;
 
 #[derive(Debug, Parser)]
-#[command(name = "hearthctl", version, about = "Operate hearthd")]
+#[command(name = "hearthctl", version = hearth_proto::VERSION, about = "Operate hearthd")]
 struct Cli {
     #[arg(
         long,
@@ -749,6 +749,12 @@ fn render_checks(result: Option<&Value>) -> Result<()> {
             .get("error")
             .and_then(Value::as_str)
             .map(str::to_owned)
+            .or_else(|| {
+                check
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
             .or_else(|| check.get("keys").map(|keys| format!("{keys} key(s)")))
             .unwrap_or_default();
         table.add_row([

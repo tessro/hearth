@@ -263,10 +263,10 @@ impl<H: Host + 'static> Daemon<H> {
         match req.verb {
             Verb::Ping => Ok(Dispatch::One(json!({
                 "pong": true,
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": hearth_proto::VERSION,
                 "pid": std::process::id(),
             }))),
-            Verb::Version => Ok(Dispatch::One(version_result(env!("CARGO_PKG_VERSION")))),
+            Verb::Version => Ok(Dispatch::One(version_result(hearth_proto::VERSION))),
             Verb::Ls => self.ls().await.map(Dispatch::One),
             Verb::Status => self
                 .status(required_str(&req.args, "name")?)
@@ -689,7 +689,7 @@ impl<H: Host + 'static> Daemon<H> {
         hybrid::connect_handshake(&mut stream, PORT_GUESTD)
             .await
             .context("connect guestd hostname channel")?;
-        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        let hello = Hello::new("agentd", hearth_proto::VERSION);
         stream
             .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
             .await?;
@@ -712,7 +712,7 @@ impl<H: Host + 'static> Daemon<H> {
         hybrid::connect_handshake(&mut stream, PORT_GUESTD)
             .await
             .context("connect guestd version channel")?;
-        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        let hello = Hello::new("agentd", hearth_proto::VERSION);
         stream
             .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
             .await?;
@@ -1352,7 +1352,7 @@ impl<H: Host + 'static> Daemon<H> {
                 &Utf8PathBuf::from(format!("/sys/class/net/{}", self.cfg.bridge)),
                 true,
             ),
-            check_command("cloud-hypervisor"),
+            check_command_version("cloud-hypervisor").await,
             check_command("qemu-img"),
             check_command("socat"),
             check_command("nft"),
@@ -1673,6 +1673,59 @@ fn check_command(command: &str) -> Value {
     json!({ "name": format!("command:{command}"), "command": command, "ok": ok })
 }
 
+async fn check_command_version(command: &str) -> Value {
+    let path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(command))
+            .find(|candidate| candidate.is_file())
+    });
+    let Some(path) = path else {
+        return json!({
+            "name": format!("command:{command}"),
+            "command": command,
+            "ok": false,
+            "error": "not found in PATH",
+        });
+    };
+    match tokio::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let version = stdout
+                .lines()
+                .chain(stderr.lines())
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("version output was empty")
+                .trim();
+            json!({
+                "name": format!("command:{command}"),
+                "command": command,
+                "path": path,
+                "version": version,
+                "ok": true,
+            })
+        }
+        Ok(output) => json!({
+            "name": format!("command:{command}"),
+            "command": command,
+            "path": path,
+            "ok": false,
+            "error": format!("--version exited with {}", output.status),
+        }),
+        Err(err) => json!({
+            "name": format!("command:{command}"),
+            "command": command,
+            "path": path,
+            "ok": false,
+            "error": err.to_string(),
+        }),
+    }
+}
+
 async fn check_kernel_module(module: &str) -> Result<Value> {
     let modules = read_optional_string(Utf8PathBuf::from("/proc/modules")).await?;
     let ok = modules
@@ -1988,6 +2041,7 @@ pub async fn ensure_dirs(cfg: &Config) -> Result<()> {
         &cfg.images_dir,
         &cfg.disks_dir,
         &cfg.snapshots_dir,
+        &cfg.dnsmasq_dropin_dir,
         &cfg.run_dir,
         &cfg.log_dir,
     ] {

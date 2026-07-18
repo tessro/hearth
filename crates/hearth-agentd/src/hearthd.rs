@@ -145,7 +145,7 @@ impl Hearthd {
         hybrid::connect_handshake(&mut guest, PORT_GUESTD)
             .await
             .context("CONNECT 1027 handshake")?;
-        let hello = Hello::new("agentd", env!("CARGO_PKG_VERSION"));
+        let hello = Hello::new("agentd", hearth_proto::VERSION);
         guest
             .write_all((serde_json::to_string(&hello)? + "\n").as_bytes())
             .await

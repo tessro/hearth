@@ -1,8 +1,8 @@
-PREFIX      ?= /usr/local
+PREFIX      ?= /usr
 BINDIR      ?= $(PREFIX)/bin
 LIBDIR      ?= $(PREFIX)/lib
 GUESTPAYLOADDIR ?= $(LIBDIR)/hearth/guest
-UNITDIR     ?= /etc/systemd/system
+UNITDIR     ?= $(LIBDIR)/systemd/system
 CONFDIR     ?= /etc/hearth
 BRIDGE      ?= hearth0
 
@@ -10,8 +10,16 @@ CARGO       ?= cargo
 INSTALL     ?= install
 
 BUILDAH     ?= buildah
+NFPM        ?= nfpm
 
-.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts check agui-conformance fmt test clippy dev install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
+RELEASE_TARGET ?= x86_64-unknown-linux-musl
+RELEASE_STAGE  ?= target/release-stage
+PORTABLE_STAGE ?= target/portable-stage
+RELEASE_DIST   ?= dist
+PACKAGE_FORMAT ?=
+RELEASE_VERSION := $(shell sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | head -1)
+
+.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts release-bins release-portable-bins release-kernel release-stage release-portable-stage release-archive release-packages release-check check agui-conformance fmt test clippy dev dev-restart dev-restart-agent-plane dev-reset install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
 
 build: host-bins
 
@@ -44,6 +52,72 @@ guest-bin:
 # Packaging/version metadata intentionally lives outside this target for now.
 agent-plane-artifacts: agentd-bin guest-bin
 	@sha256sum target/release/hearth-agentd "$(GUEST_BIN)" "$(STAGED_GUEST_BIN)"
+
+# Native host binaries are for .deb/.rpm and source installs. The guest payload
+# is always musl-static. HEARTH_RELEASE strips the local Git suffix.
+release-bins:
+	HEARTH_RELEASE=1 $(CARGO) build --release --locked \
+		-p hearthd -p hearthctl -p hearth-agentd
+	HEARTH_RELEASE=1 $(CARGO) build --release --locked --target $(RELEASE_TARGET) -p hearth-guestd
+	@if readelf -lW "target/$(RELEASE_TARGET)/release/hearth-guestd" | grep -q ' INTERP '; then \
+		echo "error: hearth-guestd is dynamically linked" >&2; exit 1; \
+	fi
+
+# The portable tarball has static host tools as well as the static guest.
+release-portable-bins:
+	HEARTH_RELEASE=1 $(CARGO) build --release --locked --target $(RELEASE_TARGET) \
+		-p hearthd -p hearthctl -p hearth-agentd -p hearth-guestd
+	@for binary in hearthd hearthctl hearth-agentd hearth-guestd; do \
+		path="target/$(RELEASE_TARGET)/release/$$binary"; \
+		if readelf -lW "$$path" | grep -q ' INTERP '; then \
+			echo "error: $$path is dynamically linked" >&2; exit 1; \
+		fi; \
+	done
+
+release-kernel: target/release-kernel/current/vmlinux
+
+target/release-kernel/current/vmlinux:
+	scripts/build-guest-kernel.sh --install-dir "$(CURDIR)/target/release-kernel"
+
+release-stage: release-bins release-kernel
+	HEARTH_STAGE_DIR="$(CURDIR)/$(RELEASE_STAGE)" \
+		HEARTH_RELEASE_TARGET="$(RELEASE_TARGET)" \
+		HEARTH_STAGE_FLAVOR=native scripts/stage-release.sh
+
+release-portable-stage: release-portable-bins release-kernel
+	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" \
+		HEARTH_RELEASE_TARGET="$(RELEASE_TARGET)" \
+		HEARTH_STAGE_FLAVOR=portable scripts/stage-release.sh
+
+release-archive: release-portable-stage
+	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" \
+		HEARTH_DIST_DIR="$(CURDIR)/$(RELEASE_DIST)" \
+		HEARTH_VERSION="$(RELEASE_VERSION)" scripts/archive-release.sh
+
+release-packages: release-stage
+	@command -v $(NFPM) >/dev/null || { echo "error: nfpm is required" >&2; exit 1; }
+	@if [ "$(PACKAGE_FORMAT)" != deb ] && [ "$(PACKAGE_FORMAT)" != rpm ]; then \
+		echo "error: set PACKAGE_FORMAT=deb or PACKAGE_FORMAT=rpm; CI builds each on its target system" >&2; \
+		exit 2; \
+	fi
+	@mkdir -p "$(RELEASE_DIST)"
+	@if [ "$(PACKAGE_FORMAT)" = deb ]; then \
+		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE="$(CURDIR)/$(RELEASE_STAGE)" \
+		scripts/build-package.sh deb "$(RELEASE_DIST)/hearth_$(RELEASE_VERSION)_amd64.deb"; \
+	else \
+		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE="$(CURDIR)/$(RELEASE_STAGE)" \
+		scripts/build-package.sh rpm "$(RELEASE_DIST)/hearth-$(RELEASE_VERSION)-1.x86_64.rpm"; \
+	fi
+
+release-check: release-stage release-portable-stage
+	HEARTH_STAGE_DIR="$(CURDIR)/$(RELEASE_STAGE)" \
+		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=native scripts/verify-release.sh
+	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" \
+		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=portable scripts/verify-release.sh
+	systemd-analyze verify "$(RELEASE_STAGE)/lib/systemd/system/hearth.service" \
+		"$(RELEASE_STAGE)/lib/systemd/system/hearth-agentd.service"
+	scripts/test-dev-restart.sh
+	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" scripts/test-reproducible-archive.sh
 
 # Build the shared VM base layer as a plain local buildah image. Workload images
 # (example/hermes-vm, example/agent-vm) are `FROM localhost/vm-base`, so build
@@ -84,6 +158,15 @@ clippy:
 dev: build
 	sudo HEARTH_BRIDGE=$(BRIDGE) \
 		./target/release/hearthd
+
+dev-restart:
+	scripts/dev-restart.sh
+
+dev-restart-agent-plane:
+	HEARTH_DEV_AGENT_PLANE=1 scripts/dev-restart.sh
+
+dev-reset:
+	scripts/dev-restart.sh --reset
 
 # Install the release binaries and the systemd unit. `install -D` creates parent
 # dirs. When installing to the live system (no DESTDIR) and systemd is present,
@@ -133,20 +216,30 @@ install-agentd: install-bin
 	@echo "Next: create the hearth-agent user, stage $(CONFDIR)/agent/{http-token,ref-key},"
 	@echo "      then: systemctl enable --now hearth-agentd.service"
 
-install: install-bin install-guest-payload
-	$(INSTALL) -D -m 0644 docs/operations.md $(DESTDIR)$(DOCDIR)/operations.md 2>/dev/null || true
-	@if $(INSTALL) -D -m 0644 systemd/hearth.service $(DESTDIR)$(UNITDIR)/hearth.service 2>/dev/null; then \
-		if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi; \
-		echo "Installed hearthd + hearthctl + guest payload + hearth.service."; \
-		echo "Next: hearthctl host check   then   systemctl enable --now hearth.service"; \
-		echo "Build the guest kernel first if you have not: scripts/build-guest-kernel.sh (see docs/operations.md)."; \
-	else \
-		echo "Installed hearthd + hearthctl to $(BINDIR)."; \
-		echo "NOTE: $(UNITDIR) is not writable (read-only — NixOS?); skipped the systemd unit."; \
-		echo "  Run hearthd from a runtime unit that survives until you manage it declaratively:"; \
-		echo "    sudo cp systemd/hearth.service /run/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart hearth"; \
-		echo "  or point configuration.nix at ExecStart=$(BINDIR)/hearthd. See docs/operations.md."; \
+install:
+	@test -d "$(RELEASE_STAGE)/bin" || { \
+		echo "error: release stage is missing; run 'devenv shell -- make release-stage' first" >&2; \
+		exit 1; \
+	}
+	$(INSTALL) -D -m 0755 $(RELEASE_STAGE)/bin/hearthd $(DESTDIR)$(BINDIR)/hearthd
+	$(INSTALL) -D -m 0755 $(RELEASE_STAGE)/bin/hearthctl $(DESTDIR)$(BINDIR)/hearthctl
+	$(INSTALL) -D -m 0755 $(RELEASE_STAGE)/bin/hearth-agentd $(DESTDIR)$(BINDIR)/hearth-agentd
+	$(INSTALL) -D -m 0755 $(RELEASE_STAGE)/lib/hearth/guest/hearth-guestd $(DESTDIR)$(GUESTPAYLOADDIR)/hearth-guestd
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/hearth/kernel/vmlinux $(DESTDIR)$(LIBDIR)/hearth/kernel/vmlinux
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/hearth/kernel/contract $(DESTDIR)$(LIBDIR)/hearth/kernel/contract
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/systemd/system/hearth.service $(DESTDIR)$(UNITDIR)/hearth.service
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/systemd/system/hearth-agentd.service $(DESTDIR)$(UNITDIR)/hearth-agentd.service
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/sysusers.d/hearth.conf $(DESTDIR)$(LIBDIR)/sysusers.d/hearth.conf
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/tmpfiles.d/hearth.conf $(DESTDIR)$(LIBDIR)/tmpfiles.d/hearth.conf
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/share/doc/hearth/operations.md $(DESTDIR)$(DOCDIR)/operations.md
+	@if [ ! -e "$(DESTDIR)$(CONFDIR)/verb-policy.toml" ]; then \
+		$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/etc/hearth/verb-policy.toml "$(DESTDIR)$(CONFDIR)/verb-policy.toml"; \
 	fi
+	@if [ -z "$(DESTDIR)" ]; then \
+		systemd-sysusers hearth.conf || true; systemd-tmpfiles --create hearth.conf || true; \
+		systemctl daemon-reload || true; \
+	fi
+	@echo "Installed the staged Hearth tree. Units remain disabled."
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/hearthd $(DESTDIR)$(BINDIR)/hearthctl $(DESTDIR)$(BINDIR)/hearth-agentd

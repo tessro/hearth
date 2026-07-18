@@ -18,9 +18,9 @@ HEARTH_SOCKET="${HEARTH_SOCKET:-/run/hearth.sock}"
 
 # Host locations hearthd writes to (must match the daemon's config). Overridable
 # so the tests work against a daemon run with non-default dirs.
-HEARTH_ALLOCATIONS="${HEARTH_ALLOCATIONS:-/etc/hearth/allocations.toml}"
+HEARTH_ALLOCATIONS="${HEARTH_ALLOCATIONS:-/var/lib/hearth/allocations.toml}"
 HEARTH_DISKS_DIR="${HEARTH_DISKS_DIR:-/var/lib/hearth/disks}"
-HEARTH_DNSMASQ_DROPIN_DIR="${HEARTH_DNSMASQ_DROPIN_DIR:-/etc/dnsmasq.d/hearth}"
+HEARTH_DNSMASQ_DROPIN_DIR="${HEARTH_DNSMASQ_DROPIN_DIR:-/var/lib/hearth/dnsmasq.d}"
 
 # --- CLI wrappers -----------------------------------------------------------
 

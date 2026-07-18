@@ -16,19 +16,10 @@
 set -euo pipefail
 
 # --- pinned kernel (bump deliberately, in a commit) -----------------------
-# Latest 6.12.y LTS as of 2026-07. sha256 from
-# https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc
-KERNEL_VERSION="6.12.95"
-KERNEL_SHA256="a9e8c51fcb1e695d1d35dde5886cba579cb6f29c9646c5889f39d63841d4b9f6"
-# Kernel contract number this config satisfies. Images declare the minimum they
-# need via `min_kernel_contract` in <name>.hearth.toml; hearthd refuses to boot
-# an image whose requirement exceeds the installed kernel's contract. Bump this
-# (and add a note in guest/kernel.config) when the config gains a feature an
-# image may require.
-KERNEL_CONTRACT="1"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../guest/kernel-version.env
+source "$REPO_DIR/guest/kernel-version.env"
 
 CONFIG_FRAGMENT="${HEARTH_KERNEL_CONFIG:-$REPO_DIR/guest/kernel.config}"
 CACHE_DIR="${HEARTH_KERNEL_CACHE:-$HOME/.cache/hearth/kernel}"

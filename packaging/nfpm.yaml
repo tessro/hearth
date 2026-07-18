@@ -1,0 +1,57 @@
+name: hearth
+arch: amd64
+platform: linux
+version: @HEARTH_VERSION@
+release: "1"
+section: admin
+priority: optional
+maintainer: Hearth contributors
+description: Single-host Cloud Hypervisor VM manager
+vendor: Hearth
+homepage: https://github.com/tessro/hearth
+license: MIT
+contents:
+  - src: @HEARTH_STAGE@/bin/
+    dst: /usr/bin
+    type: tree
+  - src: @HEARTH_STAGE@/lib/
+    dst: /usr/lib
+    type: tree
+  - src: @HEARTH_STAGE@/share/
+    dst: /usr/share
+    type: tree
+  - src: @HEARTH_STAGE@/etc/hearth/verb-policy.toml
+    dst: /etc/hearth/verb-policy.toml
+    type: config|noreplace
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  postremove: packaging/scripts/postremove.sh
+overrides:
+  deb:
+    depends:
+      - cloud-hypervisor
+      - dnsmasq
+      - iproute2
+      - nftables
+      - qemu-utils
+      - socat
+      - systemd
+      - libgcc-s1
+    recommends:
+      - buildah
+      - e2fsprogs
+      - umoci
+  rpm:
+    depends:
+      - cloud-hypervisor
+      - dnsmasq
+      - iproute
+      - nftables
+      - qemu-img
+      - socat
+      - systemd
+      - libgcc
+    recommends:
+      - buildah
+      - e2fsprogs
+      - umoci

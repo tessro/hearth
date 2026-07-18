@@ -70,9 +70,9 @@ async fn dispatch(agentd: &Arc<Agentd>, req: &AgentRequest) -> Result<Value> {
     let args = &req.args;
     match req.verb {
         AgentVerb::Ping => Ok(json!({ "pong": true, "component": "agentd" })),
-        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(env!(
-            "CARGO_PKG_VERSION"
-        ))),
+        AgentVerb::Version => Ok(hearth_agent_proto::agent_version_result(
+            hearth_proto::VERSION,
+        )),
         AgentVerb::AgentLs => agentd.list_agents().await,
         AgentVerb::TaskStart => {
             // The operator starts a task directly on an agent VM. This is a

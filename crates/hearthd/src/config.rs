@@ -3,19 +3,20 @@ use camino::Utf8PathBuf;
 use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
+#[command(name = "hearthd", version = hearth_proto::VERSION)]
 pub struct Config {
     #[arg(long, env = "HEARTH_SOCKET", default_value = "/run/hearth.sock")]
     pub socket: Utf8PathBuf,
     #[arg(
         long,
         env = "HEARTH_SERVICES_DIR",
-        default_value = "/etc/hearth/services"
+        default_value = "/var/lib/hearth/services"
     )]
     pub services_dir: Utf8PathBuf,
     #[arg(
         long,
         env = "HEARTH_ALLOCATIONS",
-        default_value = "/etc/hearth/allocations.toml"
+        default_value = "/var/lib/hearth/allocations.toml"
     )]
     pub allocations: Utf8PathBuf,
     #[arg(
@@ -74,7 +75,7 @@ pub struct Config {
     #[arg(
         long,
         env = "HEARTH_DNSMASQ_DROPIN_DIR",
-        default_value = "/etc/dnsmasq.d/hearth"
+        default_value = "/var/lib/hearth/dnsmasq.d"
     )]
     pub dnsmasq_dropin_dir: Utf8PathBuf,
     /// First IP of the static-lease slice Hearth assigns from. It MUST sit inside
@@ -155,5 +156,24 @@ impl Config {
     pub fn image_manifest_path(&self, image: &str) -> Utf8PathBuf {
         let base = image.strip_suffix(".qcow2").unwrap_or(image);
         self.images_dir.join(format!("{base}.hearth.toml"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use clap::Parser;
+
+    #[test]
+    fn mutable_defaults_stay_out_of_etc() {
+        let cfg = Config::try_parse_from(["hearthd"]).unwrap();
+        for path in [&cfg.services_dir, &cfg.allocations, &cfg.dnsmasq_dropin_dir] {
+            assert!(
+                !path.starts_with("/etc"),
+                "mutable default moved under /etc: {path}"
+            );
+        }
+        assert!(cfg.authorized_keys_file.starts_with("/etc/hearth"));
+        assert!(cfg.verb_policy.starts_with("/etc/hearth"));
     }
 }

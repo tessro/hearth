@@ -1,0 +1,37 @@
+[Unit]
+Description=Hearth agent-plane host daemon
+Documentation=file:/usr/share/doc/hearth/agent-plane.md
+After=hearth.service network-online.target
+Wants=hearth.service
+
+[Service]
+Type=simple
+User=hearth-agent
+Group=hearth
+Environment=PATH=/usr/bin:/bin
+UMask=0007
+LoadCredential=http-token:/etc/hearth/agent/http-token
+LoadCredential=ref-key:/etc/hearth/agent/ref-key
+ExecStart=/usr/bin/hearth-agentd --token-file %d/http-token --ref-key-file %d/ref-key
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+StateDirectory=hearth-agentd
+StateDirectoryMode=0750
+RuntimeDirectory=hearth-agentd
+RuntimeDirectoryMode=0750
+LogsDirectory=hearth-agentd
+ReadWritePaths=/var/lib/hearth-agentd
+
+[Install]
+WantedBy=multi-user.target

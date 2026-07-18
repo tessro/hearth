@@ -24,8 +24,8 @@ use camino::Utf8PathBuf;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Package version plus the source commit used to build this guest payload.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HEARTH_GIT_SHA"));
+/// The same build version used by every shipped Hearth binary.
+pub const VERSION: &str = hearth_proto::VERSION;
 
 /// Which CLIs to wire, with their binary names. Commands are overridable so
 /// tests point at fakes; absent commands do not register an adapter.

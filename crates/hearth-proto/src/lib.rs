@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fmt;
 
+/// Version shown by every shipped Hearth binary and protocol endpoint.
+pub const VERSION: &str = env!("HEARTH_BUILD_VERSION");
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

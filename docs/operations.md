@@ -1,9 +1,8 @@
 # Hearth Operations
 
-Everything an operator needs to stand up `hearthd` on a single host and keep it
-current. No Nix anywhere: Hearth is a pair of static Rust binaries plus a systemd
-unit, and every host dependency is an ordinary distro package or an upstream
-release binary.
+Everything an operator needs to install `hearthd` on one x86-64 Linux host and
+keep it current. NixOS, Debian-family, Fedora-family, portable tarball, and
+source installs use the same paths and service rules.
 
 ## 1. Host prerequisites
 
@@ -16,7 +15,7 @@ binaries and are called out as such.
 
 | Tool | Provides | apt | dnf |
 | --- | --- | --- | --- |
-| `cloud-hypervisor` | the VMM Hearth launches per VM | upstream release binary¹ | upstream release binary¹ |
+| `cloud-hypervisor` | the VMM Hearth launches per VM | `cloud-hypervisor` | `cloud-hypervisor` |
 | `qemu-img` | per-VM disk create/convert | `qemu-utils` | `qemu-img` |
 | `nft` | the `hearth_nat` publish table | `nftables` | `nftables` |
 | `dnsmasq` | guest DHCP + leases on the bridge | `dnsmasq` | `dnsmasq` |
@@ -24,9 +23,10 @@ binaries and are called out as such.
 | `socat` | agent-in-charge vsock proxy | `socat` | `socat` |
 | KVM | `/dev/kvm`, `kvm` + `vhost_vsock` modules | kernel | kernel |
 
-¹ `cloud-hypervisor` is distributed as a static release binary from
-<https://github.com/cloud-hypervisor/cloud-hypervisor/releases>; drop it in
-`/usr/local/bin`. Some distros also package it.
+If the base distribution does not carry `cloud-hypervisor`, enable the Cloud
+Hypervisor Open Build Service repository for that distribution before installing
+Hearth. Hearth packages depend on the host package and never bundle or download
+the hypervisor.
 
 ### Build-time — `hearthctl image build` needs these
 
@@ -89,9 +89,9 @@ operator provides:
 - **`dnsmasq` serving DHCP on `hearth0`**, writing leases to
   `/var/lib/dnsmasq/dnsmasq.leases` (override `HEARTH_LEASE_FILE`). Its dynamic
   `dhcp-range` MUST NOT overlap Hearth's static slice.
-- **A drop-in dir Hearth can write**, default `/etc/dnsmasq.d/hearth`
+- **A drop-in dir Hearth can write**, default `/var/lib/hearth/dnsmasq.d`
   (override `HEARTH_DNSMASQ_DROPIN_DIR`). Point dnsmasq at it, e.g.
-  `conf-dir=/etc/dnsmasq.d/hearth`. On `create` Hearth writes `<id>.conf`
+  `conf-dir=/var/lib/hearth/dnsmasq.d`. On `create` Hearth writes `<id>.conf`
   with a `dhcp-host=<mac>,<ip>,<hostname>` line and SIGHUPs dnsmasq; `rename`
   updates that DNS label, and `destroy` removes the file. If the dir is absent,
   static leases are skipped with a
@@ -106,54 +106,122 @@ start with it.
 
 ## 3. Install
 
-```sh
-# 1. Build every installable artifact as the logged-in user, then copy them
-#    into system paths as root. Install targets never invoke Cargo.
-make build guest-bin
-sudo make install
-#    -> /usr/local/bin/{hearthd,hearthctl}
-#    -> /usr/local/lib/hearth/guest/hearth-guestd
-#    -> /etc/systemd/system/hearth.service
-#    -> /usr/local/share/doc/hearth/operations.md
+### NixOS
 
-# 2. Install at least one host-wide SSH recovery key.
+Add the flake input and module. Nix builds Hearth and the pinned guest kernel;
+the module installs Cloud Hypervisor and the other runtime tools.
+
+```nix
+{
+  inputs.hearth.url = "github:tessro/hearth";
+  outputs = { nixpkgs, hearth, ... }: {
+    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        hearth.nixosModules.default
+        {
+          services.hearth = {
+            enable = true;
+            authorizedKeys = [ "ssh-ed25519 AAAA... operator" ];
+            operatorUsers = [ "operator" ];
+            networking = {
+              manage = true;
+              uplinkInterface = "enp1s0";
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Set `networking.manage = false` to leave the bridge, dnsmasq, forwarding, and
+NAT unchanged. You can replace `package`, `cloudHypervisorPackage`, and
+`guestKernel` through module options.
+
+For the agent plane, secret options name runtime source paths. Do not use Nix
+path literals, since those copy data to the store:
+
+```nix
+services.hearth.agentPlane = {
+  enable = true;
+  httpTokenFile = "/run/agenix/hearth-http-token";
+  refKeyFile = "/run/agenix/hearth-ref-key";
+};
+```
+
+### Debian and RPM packages
+
+Enable a distribution or Open Build Service repository that provides
+`cloud-hypervisor`, then install the local release file. These commands use the
+OBS repositories tested by CI for Debian 13 and Fedora 42; select the matching
+directory from the [Cloud Hypervisor OBS
+project](https://download.opensuse.org/repositories/home:/cloud-hypervisor/)
+for another supported release.
+
+```sh
+# Debian 13
+curl -fsSL https://download.opensuse.org/repositories/home:/cloud-hypervisor/Debian_13/Release.key \
+  | sudo gpg --dearmor -o /usr/share/keyrings/cloud-hypervisor.gpg
+echo 'deb [signed-by=/usr/share/keyrings/cloud-hypervisor.gpg] https://download.opensuse.org/repositories/home:/cloud-hypervisor/Debian_13/ /' \
+  | sudo tee /etc/apt/sources.list.d/cloud-hypervisor.list
+sudo apt update
+
+# Fedora 42
+sudo curl -fsSL \
+  https://download.opensuse.org/repositories/home:/cloud-hypervisor/Fedora_42/home:cloud-hypervisor.repo \
+  -o /etc/yum.repos.d/cloud-hypervisor.repo
+```
+
+The package manager resolves `qemu-img`, nftables, dnsmasq, iproute, socat,
+systemd, and the host C library. Units stay disabled after install.
+
+```sh
+sudo apt install ./hearth_0.1.0_amd64.deb
+# or
+sudo dnf install ./hearth-0.1.0-1.x86_64.rpm
+
+sudo install -m 0644 ~/.ssh/id_ed25519.pub /etc/hearth/authorized_keys
+sudo systemctl enable --now hearth.service
+hearthctl ping
+hearthctl host check
+```
+
+The package keeps `/etc/hearth/verb-policy.toml` as admin-owned config. It does
+not create keys or tokens and does not change the uplink, firewall, bridge, or
+dnsmasq setup.
+
+### Portable tarball
+
+Install the runtime tools in §1, extract the archive under a prefix, and copy or
+adapt its systemd units. All Hearth programs in the tarball are musl-static.
+
+```sh
+tar -xzf hearth-0.1.0-x86_64-linux.tar.gz
+sudo cp -a hearth-0.1.0/{bin,lib,share} /usr/local/
+sudo cp hearth-0.1.0/etc/hearth/verb-policy.toml /etc/hearth/
+```
+
+The included units use `/usr` paths. If you keep the files under `/usr/local`,
+change only `ExecStart` and `PATH` in local unit drop-ins. The tarball does not
+include Cloud Hypervisor, host network setup, secrets, authorized keys, state,
+images, or VM disks.
+
+### Source install
+
+Source builds need Rust 1.94.1, a musl linker for `hearth-guestd`, the kernel
+build tools in §1, `readelf`, and the runtime tools. The default install prefix
+is `/usr` and uses the staged native layout:
+
+```sh
+devenv shell -- make release-stage
+sudo make install
 sudo install -d -m 0755 /etc/hearth
 sudo install -m 0644 ~/.ssh/id_ed25519.pub /etc/hearth/authorized_keys
-
-# 3. Build the dedicated guest kernel (vanilla kernel.org, no Nix). Installs
-#    /var/lib/hearth/kernels/<version>/vmlinux and a `current` symlink, which is
-#    the hearthd default. Rerun only to bump the pinned version, never for a host
-#    kernel change.
-sudo scripts/build-guest-kernel.sh
-
-# 4. Start the daemon, then ask it to verify every host prerequisite.
 sudo systemctl enable --now hearth.service
-hearthctl ping                # "pong — hearthd <version> (pid <n>)"
-hearthctl host check          # paths/commands/modules/keyring, ok=true each
-```
-
-### NixOS (or any declaratively-managed systemd)
-
-`/etc/systemd/system` is read-only, so `make install`'s unit copy is skipped
-(it installs the binaries and warns — it does not fail). Deploy the binaries and
-run the unit from `/run` or your system config:
-
-```sh
-make build guest-bin
-sudo make install-bin install-guest-payload # -> host binaries + guest updater payload
-sudo cp systemd/hearth.service /run/systemd/system/   # runtime unit (survives until next boot)
-sudo systemctl daemon-reload && sudo systemctl enable --now hearth.service
-# For a persistent setup, add a systemd.services.hearth block to configuration.nix
-# with ExecStart = "/usr/local/bin/hearthd" instead of the /run unit.
-```
-
-A code-only redeploy (e.g. after a daemon fix) builds unprivileged, then copies
-and restarts privileged; the unit and paths do not change:
-
-```sh
-make build
-sudo make install-bin
-sudo systemctl restart hearth
+hearthctl ping
+hearthctl host check
 ```
 
 ### Optional agent-plane host service
@@ -163,83 +231,24 @@ credential store and uses `/run/hearth-agentd/agent.sock` for `hearthctl agent`
 commands. Install it only on hosts that need the agent plane:
 
 ```sh
-# Build first as your normal user.
-make build
-
-# One-time host setup. The hearth group already owns /run/hearth.sock on a
-# normal Hearth install; add operator accounts to it as needed.
-sudo groupadd --system hearth 2>/dev/null || true
-sudo useradd --system --gid hearth --home-dir /var/lib/hearth-agentd \
-  --shell /usr/sbin/nologin hearth-agent
 sudo install -d -m 0700 /etc/hearth/agent
 sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/hearth/agent/http-token'
 sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/hearth/agent/ref-key'
-
-# This installs the unit and creates /etc/hearth/verb-policy.toml only when no
-# policy exists. If you have a custom policy, merge the hearth-agent entry from
-# systemd/hearth-agentd-verb-policy.toml yourself.
-sudo make install-agentd
 sudo systemctl restart hearth.service # reload the verb policy
 sudo systemctl enable --now hearth-agentd.service
 hearthctl agent ls
 ```
+
+Packages, source installs, and the NixOS module create the `hearth` group and
+`hearth-agent` user and install both units. They do not create these two secret
+files or enable agentd. If you have a custom policy, merge the `hearth-agent`
+rule from the installed default before restarting hearthd.
 
 The unit uses `Group=hearth` so operators in that group can open the agent
 socket. The explicit `hearth-agent` user rule in the verb policy takes priority
 over the broad operator-group rule and denies machine life-cycle verbs such as
 `create`, `start`, and `destroy`.
 
-On NixOS, declare the same user, policy, credentials, and unit. Keep the secret
-files out of the Nix store; the example assumes another secret manager creates
-the two `/etc/hearth/agent/*` source files:
-
-```nix
-users.groups.hearth = {};
-users.users.hearth-agent = {
-  isSystemUser = true;
-  group = "hearth";
-  home = "/var/lib/hearth-agentd";
-};
-
-environment.etc."hearth/verb-policy.toml".source =
-  /path/to/hearth/systemd/hearth-agentd-verb-policy.toml;
-
-systemd.services.hearth-agentd = {
-  description = "Hearth agent-plane host daemon";
-  after = [ "hearth.service" "network-online.target" ];
-  wants = [ "hearth.service" ];
-  wantedBy = [ "multi-user.target" ];
-  serviceConfig = {
-    Type = "simple";
-    User = "hearth-agent";
-    Group = "hearth";
-    UMask = "0007";
-    LoadCredential = [
-      "http-token:/etc/hearth/agent/http-token"
-      "ref-key:/etc/hearth/agent/ref-key"
-    ];
-    ExecStart = "/usr/local/bin/hearth-agentd --token-file %d/http-token --ref-key-file %d/ref-key";
-    Restart = "on-failure";
-    RestartSec = 2;
-    NoNewPrivileges = true;
-    ProtectSystem = "strict";
-    ProtectHome = true;
-    PrivateTmp = true;
-    ProtectKernelTunables = true;
-    ProtectKernelModules = true;
-    ProtectControlGroups = true;
-    RestrictNamespaces = true;
-    RestrictSUIDSGID = true;
-    MemoryDenyWriteExecute = true;
-    LockPersonality = true;
-    StateDirectory = "hearth-agentd";
-    StateDirectoryMode = "0750";
-    RuntimeDirectory = "hearth-agentd";
-    RuntimeDirectoryMode = "0750";
-    ReadWritePaths = [ "/var/lib/hearth-agentd" ];
-  };
-};
-```
 
 `hearthctl host check` reports each directory, command, the guest
 kernel, `/dev/kvm`, the bridge, and the `kvm`/`vhost_vsock` modules. Green there
@@ -250,17 +259,21 @@ hint rather than mid-build.
 
 `make uninstall` removes the binaries, unit, and doc (and daemon-reloads).
 
-## 4. Dev loop — the alternative to the packaged daemon
+## 4. Development restart loop
 
-For development, run the daemon straight out of the build tree instead of the
-installed one. This is **the** supported alternative, not a second deployment:
+Build as the current user, copy the exact build under `/run`, add runtime-only
+unit drop-ins, restart, and ping the new daemon with one command:
 
 ```sh
-make dev
-#   == sudo HEARTH_BRIDGE=hearth0 ./target/release/hearthd
-# or the debug binary directly:
-sudo ./target/debug/hearthd
+make dev-restart
+make dev-restart-agent-plane # also builds guestd and prints an upgrade command
+make dev-reset               # remove only Hearth's runtime files and drop-ins
 ```
+
+The helper restarts agentd only if it was active before the build. A failed
+build changes no unit. A failed restart prints unit status and recent logs.
+It never writes to `/usr`, `/etc`, or `/nix/store`. The agent-plane form never
+changes a running VM without the separate printed `hearthctl upgrade` command.
 
 Run at most one daemon on `/run/hearth.sock` at a time. The failure mode that
 cost real time was a stale `hearth.service` pointing at a deleted
@@ -354,3 +367,26 @@ hearthctl upgrade hermes-a \
 This command updates only VMs that already run and report a guestd. It does not
 install a unit, retrofit guestd-less images, start stopped VMs, or alter image
 manifests.
+
+## 6. Network setup by host type
+
+The NixOS module can own `hearth0`, dnsmasq, forwarding, and NAT. On a
+NetworkManager host, create a persistent bridge connection with the address in
+§2, attach no physical interface to it, run dnsmasq on that bridge, and add a
+masquerade rule for the uplink. On a systemd-networkd host, use a bridge
+`.netdev` and matching `.network` file, then give dnsmasq the same dynamic range
+and `/var/lib/hearth/dnsmasq.d` config dir. In both cases keep the static and
+dynamic ranges separate.
+
+## 7. Releases
+
+Only `vX.Y.Z` tags release, and the tag must equal `[workspace.package].version`.
+Pull requests and tags run the same Rust, Nix, package, install, VM, unit, static
+link, and stable-archive checks. CI builds `.deb` on Debian-family Linux, `.rpm`
+on Fedora-family Linux, the portable tarball with static host tools, and Nix
+packages in Nix.
+
+The release contains the three package files, `SHA256SUMS`, an SPDX JSON SBOM,
+and GitHub build attestations. Verify a file with `sha256sum -c SHA256SUMS` and
+an attestation with `gh attestation verify <file> --repo tessro/hearth`.
+AArch64 is not supported yet.

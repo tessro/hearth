@@ -6,10 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-# Distro-generic PATH. hearthd shells out to cloud-hypervisor, qemu-img, nft,
-# dnsmasq, and systemctl; a release install commonly drops cloud-hypervisor in
-# /usr/bin. The packaged guest kernel is passed explicitly.
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/hearthd --guest-kernel /usr/lib/hearth/kernel/vmlinux
 Restart=on-failure
 RestartSec=2
@@ -17,8 +14,6 @@ RuntimeDirectory=hearth
 RuntimeDirectoryMode=0770
 StateDirectory=hearth
 LogsDirectory=hearth
-# hearthd shuts each VM down with ACPI and waits up to 30s per VM; give the unit
-# room to stop cleanly before systemd escalates.
 TimeoutStopSec=120s
 
 [Install]

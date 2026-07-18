@@ -74,7 +74,7 @@ impl McpServer {
         match method {
             "initialize" => Ok(json!({
                 "protocolVersion": "2025-06-18",
-                "serverInfo": { "name": "hearth-agentd", "version": env!("CARGO_PKG_VERSION") },
+                "serverInfo": { "name": "hearth-agentd", "version": hearth_proto::VERSION },
                 "capabilities": { "tools": {} },
             })),
             "tools/list" => Ok(json!({ "tools": tool_schemas() })),

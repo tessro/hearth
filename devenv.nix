@@ -9,6 +9,8 @@
     jq
     nodejs_24
     pnpm
+    nfpm
+    syft
 
     # mkfs.ext4 for `hearthctl image build` rootfs materialization.
     e2fsprogs

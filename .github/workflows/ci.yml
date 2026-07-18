@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - run: nix profile install nixpkgs#devenv
+      - run: devenv shell -- make check
+
+  nix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - run: nix flake check --print-build-logs
+      - run: nix build .#hearth .#guest-kernel
+
+  portable:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - run: nix profile install nixpkgs#devenv
+      - run: devenv shell -- make release-archive release-check
+      - name: Check extracted tarball
+        run: |
+          archive=$(find dist -name '*.tar.gz' -print -quit)
+          root=$(mktemp -d)
+          tar -C "$root" -xzf "$archive"
+          prefix=$(find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          for binary in \
+            bin/hearthd \
+            bin/hearthctl \
+            bin/hearth-agentd \
+            lib/hearth/guest/hearth-guestd; do
+            test "$(stat -c %a "$prefix/$binary")" = 755
+            "$prefix/$binary" --version | grep " $version\$"
+            if readelf -lW "$prefix/$binary" | grep -q ' INTERP '; then
+              echo "$binary is not static" >&2
+              exit 1
+            fi
+          done
+          test "$(stat -c %a "$prefix/etc/hearth/verb-policy.toml")" = 644
+          test -f "$prefix/lib/hearth/kernel/vmlinux"
+          test "$(cat "$prefix/lib/hearth/kernel/contract")" = 1
+          if find "$prefix" \( -iname '*authorized_key*' -o -iname '*token*' -o -iname '*ref-key*' -o -iname '*.qcow2' \) | grep -q .; then
+            echo 'portable archive contains a key, token, or VM disk' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: portable-release
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  native-packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            image: debian:trixie
+          - format: rpm
+            image: fedora:42
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install Debian build tools
+        if: matrix.format == 'deb'
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl gnupg git build-essential musl-tools binutils file flex bison bc perl xz-utils libelf-dev libssl-dev golang-go systemd
+      - name: Install Fedora build tools
+        if: matrix.format == 'rpm'
+        run: dnf install -y ca-certificates curl git gcc gcc-c++ make musl-gcc binutils file flex bison bc perl xz elfutils-libelf-devel openssl-devel golang systemd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust and nFPM
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.1 --target x86_64-unknown-linux-musl
+          . "$HOME/.cargo/env"
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.4
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build target-libc package
+        run: make release-packages PACKAGE_FORMAT=${{ matrix.format }}
+      - name: Install and inspect package
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${{ matrix.format }}" = deb ]; then
+            curl -fsSL https://download.opensuse.org/repositories/home:/cloud-hypervisor/Debian_13/Release.key \
+              | gpg --dearmor -o /usr/share/keyrings/cloud-hypervisor.gpg
+            echo 'deb [signed-by=/usr/share/keyrings/cloud-hypervisor.gpg] https://download.opensuse.org/repositories/home:/cloud-hypervisor/Debian_13/ /' \
+              > /etc/apt/sources.list.d/cloud-hypervisor.list
+            apt-get update
+            apt-get install -y ./dist/*.deb
+            dpkg-query -W -f='${Depends}\n' hearth | grep cloud-hypervisor
+          else
+            curl -fsSL https://download.opensuse.org/repositories/home:/cloud-hypervisor/Fedora_42/home:cloud-hypervisor.repo \
+              -o /etc/yum.repos.d/cloud-hypervisor.repo
+            dnf install -y ./dist/*.rpm
+            rpm -qR hearth | grep cloud-hypervisor
+          fi
+          getent passwd hearth-agent
+          getent group hearth | grep hearth-agent
+          test "$(stat -c %a /etc/hearth/verb-policy.toml)" = 644
+          test "$(stat -c %U:%G /var/lib/hearth/services)" = root:root
+          test "$(stat -c %a /var/lib/hearth/services)" = 755
+          test "$(stat -c %U:%G /var/lib/hearth-agentd)" = hearth-agent:hearth
+          test "$(stat -c %a /var/lib/hearth-agentd)" = 750
+          test ! -e /etc/hearth/authorized_keys
+          test ! -e /etc/hearth/agent/http-token
+          test ! -e /etc/hearth/agent/ref-key
+          test "$(systemctl is-enabled hearth.service 2>/dev/null || true)" = disabled
+          test "$(systemctl is-enabled hearth-agentd.service 2>/dev/null || true)" = disabled
+          systemd-analyze verify /usr/lib/systemd/system/hearth.service /usr/lib/systemd/system/hearth-agentd.service
+          cloud-hypervisor --version
+          for binary in hearthd hearthctl hearth-agentd; do
+            "$binary" --version | grep " $version\$"
+            readelf -lW "$(command -v "$binary")" | grep -q ' INTERP '
+          done
+          /usr/lib/hearth/guest/hearth-guestd --version | grep " $version\$"
+          if readelf -lW /usr/lib/hearth/guest/hearth-guestd | grep -q ' INTERP '; then
+            echo 'hearth-guestd is not static' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-${{ matrix.format }}-release
+          path: dist/*.*
+          if-no-files-found: error

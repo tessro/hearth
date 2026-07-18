@@ -73,7 +73,7 @@ fn is_unknown_verb_error(code: &str, message: &str) -> bool {
 fn stale_daemon_message(daemon_version: &str, verb: &Verb) -> String {
     format!(
         "daemon {daemon_version} does not support '{verb}'; hearthctl is {} — restart hearthd",
-        env!("CARGO_PKG_VERSION")
+        hearth_proto::VERSION
     )
 }
 
@@ -139,6 +139,6 @@ mod tests {
         let msg = stale_daemon_message("0.1.0", &Verb::ImageImport);
         assert!(msg.contains("daemon 0.1.0 does not support 'image-import'"));
         assert!(msg.contains("restart hearthd"));
-        assert!(msg.contains(env!("CARGO_PKG_VERSION")));
+        assert!(msg.contains(hearth_proto::VERSION));
     }
 }

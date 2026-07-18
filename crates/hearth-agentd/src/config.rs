@@ -9,7 +9,7 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "hearth-agentd",
-    version,
+    version = hearth_proto::VERSION,
     about = "Hearth agent-plane host daemon"
 )]
 pub struct Config {
