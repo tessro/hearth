@@ -19,7 +19,7 @@ RELEASE_DIST   ?= dist
 PACKAGE_FORMAT ?=
 RELEASE_VERSION := $(shell sed -n 's/^version = "\([^\"]*\)"/\1/p' Cargo.toml | head -1)
 
-.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts release-bins release-portable-bins release-kernel release-stage release-portable-stage release-archive release-packages release-check check agui-conformance fmt test clippy dev dev-restart dev-restart-agent-plane dev-reset install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
+.PHONY: build host-bins agentd-bin guest-bin agent-plane-artifacts release-bins release-portable-bins release-kernel release-stage release-portable-stage release-archive release-packages release-native-check release-portable-check release-check check agui-conformance fmt test clippy dev dev-restart dev-restart-agent-plane dev-reset install install-bin install-guest-payload install-agentd uninstall vm-base reload enable start stop restart status logs ping clean
 
 build: host-bins
 
@@ -109,14 +109,18 @@ release-packages: release-stage
 		scripts/build-package.sh rpm "$(RELEASE_DIST)/hearth-$(RELEASE_VERSION)-1.x86_64.rpm"; \
 	fi
 
-release-check: release-stage release-portable-stage
+release-native-check: release-stage
 	HEARTH_STAGE_DIR="$(CURDIR)/$(RELEASE_STAGE)" \
 		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=native scripts/verify-release.sh
+	HEARTH_STAGE_DIR="$(CURDIR)/$(RELEASE_STAGE)" scripts/verify-systemd-units.sh
+
+release-portable-check: release-portable-stage
 	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" \
 		HEARTH_VERSION="$(RELEASE_VERSION)" HEARTH_STAGE_FLAVOR=portable scripts/verify-release.sh
-	HEARTH_STAGE_DIR="$(CURDIR)/$(RELEASE_STAGE)" scripts/verify-systemd-units.sh
 	scripts/test-dev-restart.sh
 	HEARTH_STAGE_DIR="$(CURDIR)/$(PORTABLE_STAGE)" scripts/test-reproducible-archive.sh
+
+release-check: release-native-check release-portable-check
 
 # Build the shared VM base layer as a plain local buildah image. Workload images
 # (example/hermes-vm, example/agent-vm) are `FROM localhost/vm-base`, so build

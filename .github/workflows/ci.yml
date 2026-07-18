@@ -35,6 +35,15 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: scripts/checkout-release-candidate.sh "$RUNNER_TEMP/release-candidate/release-candidate.bundle" "$SOURCE_SHA"
+      - name: Restore Rust build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+          key: rust-check-1.94.1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-check-1.94.1-${{ runner.os }}-
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
       - run: nix profile install nixpkgs#devenv
       - run: devenv shell -- make check
@@ -73,9 +82,23 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: scripts/checkout-release-candidate.sh "$RUNNER_TEMP/release-candidate/release-candidate.bundle" "$SOURCE_SHA"
+      - name: Restore Rust build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/x86_64-unknown-linux-musl/release
+          key: rust-portable-1.94.1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-portable-1.94.1-${{ runner.os }}-
+      - name: Restore guest kernel
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/release-kernel
+          key: guest-kernel-x86_64-${{ hashFiles('guest/kernel-version.env', 'guest/kernel.config', 'scripts/build-guest-kernel.sh') }}
       - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
       - run: nix profile install nixpkgs#devenv
-      - run: devenv shell -- make release-archive release-check
+      - run: devenv shell -- make release-archive release-portable-check
       - name: Check extracted tarball
         run: |
           archive=$(find dist -name '*.tar.gz' -print -quit)
@@ -143,6 +166,21 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: scripts/checkout-release-candidate.sh "$RUNNER_TEMP/release-candidate/release-candidate.bundle" "$SOURCE_SHA"
+      - name: Restore Rust build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release
+            target/x86_64-unknown-linux-musl/release
+          key: rust-package-${{ matrix.format }}-1.94.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-package-${{ matrix.format }}-1.94.1-
+      - name: Restore guest kernel
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/release-kernel
+          key: guest-kernel-x86_64-${{ hashFiles('guest/kernel-version.env', 'guest/kernel.config', 'scripts/build-guest-kernel.sh') }}
       - name: Install pinned Rust and nFPM
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.1 --target x86_64-unknown-linux-musl
@@ -182,7 +220,8 @@ jobs:
           test "$(systemctl is-enabled hearth.service 2>/dev/null || true)" = disabled
           test "$(systemctl is-enabled hearth-agentd.service 2>/dev/null || true)" = disabled
           systemd-analyze verify /usr/lib/systemd/system/hearth.service /usr/lib/systemd/system/hearth-agentd.service
-          cloud-hypervisor --version
+          # Job containers may deny launching a host hypervisor; verify installation only.
+          test -x "$(command -v cloud-hypervisor)"
           for binary in hearthd hearthctl hearth-agentd; do
             "$binary" --version | grep " $version\$"
             readelf -lW "$(command -v "$binary")" | grep -q ' INTERP '
