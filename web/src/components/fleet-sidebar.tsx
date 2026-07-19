@@ -20,7 +20,7 @@ import type { AgentInfo, TaskState, TaskSummary } from "@/lib/hearth-api"
 interface FleetSidebarProps {
   agents: AgentInfo[]
   tasks: TaskSummary[]
-  selectedAgent?: string
+  selectedAgentId?: string
   selectedTaskId?: string
   refreshing: boolean
   onNewTask: (agent: AgentInfo) => void
@@ -54,7 +54,7 @@ const relativeTime = (value: string) => {
 export function FleetSidebar({
   agents,
   tasks,
-  selectedAgent,
+  selectedAgentId,
   selectedTaskId,
   refreshing,
   onNewTask,
@@ -126,18 +126,18 @@ export function FleetSidebar({
                 <button
                   className={cn(
                     "group w-full rounded-xl border px-3 py-2.5 text-left transition-colors",
-                    selectedAgent === agent.name
+                    selectedAgentId === agent.id
                       ? "border-amber-300/20 bg-amber-300/10"
                       : "border-transparent hover:border-neutral-800 hover:bg-neutral-900/80",
                     !available && "opacity-55",
                   )}
                   disabled={!available}
-                  key={agent.name}
+                  key={agent.id}
                   onClick={() => onNewTask(agent)}
                   type="button"
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-medium">{agent.name}</span>
+                    <span className="truncate text-sm font-medium">{agent.hostname}</span>
                     {available ? (
                       <CheckCircle2Icon className="size-3.5 text-emerald-400" />
                     ) : (
@@ -189,7 +189,7 @@ export function FleetSidebar({
                   />
                 </div>
                 <div className="mt-1.5 flex items-center gap-2 pl-3.5 text-[11px] text-neutral-600">
-                  <span className="truncate">{task.agent_vm}</span>
+                  <span className="truncate">{task.agent_hostname}</span>
                   <span>·</span>
                   <span className="shrink-0">{relativeTime(task.updated_at)}</span>
                 </div>

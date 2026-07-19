@@ -173,7 +173,7 @@ export function AgentWorkspace({
   const waitingForAgent =
     busy && lastEntry?.kind === "message" && lastEntry.role === "user"
   const displayName =
-    sessionName ?? task?.session_name ?? task?.text ?? agent?.name ?? "Choose an agent"
+    sessionName ?? task?.session_name ?? task?.text ?? agent?.hostname ?? "Choose an agent"
 
   return (
     <main className="flex min-h-0 min-w-0 flex-col bg-neutral-900 text-neutral-100">
@@ -198,7 +198,7 @@ export function AgentWorkspace({
               {task
                 ? `${task.agent} · ${task.runs.length} ${task.runs.length === 1 ? "run" : "runs"} · ${task.task_id.slice(0, 12)}`
                 : busy && sessionName && agent
-                  ? `${agent.name} · starting session`
+                  ? `${agent.hostname} · starting session`
                 : agent
                   ? `${agent.adapters.join(", ")} · new task`
                   : "Select a ready VM from the fleet"}
@@ -235,7 +235,7 @@ export function AgentWorkspace({
             <ConversationEmptyState
               description={
                 agent
-                  ? `Send a task to ${agent.name}. The run will stream here and remain replayable.`
+                  ? `Send a task to ${agent.hostname}. The run will stream here and remain replayable.`
                   : "Pick a ready agent to start a durable task, or open one from history."
               }
               icon={
@@ -315,7 +315,7 @@ export function AgentWorkspace({
                       : task
                         ? "This task cannot accept another turn"
                         : agent
-                          ? `Give ${agent.name} a task…`
+                          ? `Give ${agent.hostname} a task…`
                           : "Choose an agent to begin"
                 }
               />

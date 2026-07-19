@@ -67,7 +67,7 @@ function App() {
   const [connectionError, setConnectionError] = useState<string>()
   const [agents, setAgents] = useState<AgentInfo[]>([])
   const [tasks, setTasks] = useState<TaskSummary[]>([])
-  const [selectedAgentName, setSelectedAgentName] = useState<string>()
+  const [selectedAgentId, setSelectedAgentId] = useState<string>()
   const [selectedTask, setSelectedTask] = useState<TaskSummary>()
   const [sessionName, setSessionName] = useState<string>()
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
@@ -81,8 +81,8 @@ function App() {
   const liveEventId = useRef(0)
 
   const selectedAgent = useMemo(
-    () => agents.find((agent) => agent.name === selectedAgentName),
-    [agents, selectedAgentName],
+    () => agents.find((agent) => agent.id === selectedAgentId),
+    [agents, selectedAgentId],
   )
   const transcript = useMemo(() => buildTranscript(timeline), [timeline])
   const displayedSessionName = selectedTask
@@ -123,7 +123,7 @@ function App() {
       const firstReady = fleet.agents.find(
         (agent) => agent.running && agent.ready && agent.adapters.length > 0,
       )
-      setSelectedAgentName(firstReady?.name)
+      setSelectedAgentId(firstReady?.id)
     } catch (error) {
       setConnectionError(error instanceof Error ? error.message : "Could not connect to agentd")
     } finally {
@@ -191,7 +191,7 @@ function App() {
   const openTask = (task: TaskSummary) => {
     stopStreams()
     setBusy(false)
-    setSelectedAgentName(task.agent_vm)
+    setSelectedAgentId(task.agent_id)
     setSelectedTask(task)
     setSessionName(task.session_name ?? task.text)
     replayTask(task)
@@ -203,7 +203,7 @@ function App() {
     setStreamError(undefined)
     setSelectedTask(undefined)
     setSessionName(undefined)
-    setSelectedAgentName(agent.name)
+    setSelectedAgentId(agent.id)
     setTimeline([])
     setDraftId((current) => current + 1)
   }
@@ -228,11 +228,11 @@ function App() {
       let returnedTaskRef: string | undefined
       const taskRef = selectedTask?.task_ref
       httpAgent = new HttpAgent({
-        agentId: selectedAgent.name,
+        agentId: selectedAgent.id,
         headers: { Authorization: `Bearer ${settings.token}` },
         initialMessages: [{ id: userId, role: "user", content: text }],
         threadId: selectedTask?.thread_id ?? randomUUID(),
-        url: endpoint(settings, `/v1/agents/${encodeURIComponent(selectedAgent.name)}/agui`),
+        url: endpoint(settings, `/v1/agents/${encodeURIComponent(selectedAgent.hostname)}/agui`),
       })
       activeAgent.current = httpAgent
 
@@ -253,7 +253,8 @@ function App() {
         const status = await getTask(settings, nextRef)
         const hydrated: TaskSummary = {
           ...status,
-          agent_vm: selectedAgent.name,
+          agent_id: selectedAgent.id,
+          agent_hostname: selectedAgent.hostname,
           task_ref: nextRef,
         }
         setSelectedTask(hydrated)
@@ -302,7 +303,7 @@ function App() {
     setTasks([])
     setSelectedTask(undefined)
     setSessionName(undefined)
-    setSelectedAgentName(undefined)
+    setSelectedAgentId(undefined)
     setTimeline([])
   }
 
@@ -336,14 +337,14 @@ function App() {
         onOpenTask={openTask}
         onRefresh={() => void refresh().catch((error: unknown) => setStreamError(error instanceof Error ? error.message : "Refresh failed"))}
         refreshing={refreshing}
-        selectedAgent={selectedAgentName}
+        selectedAgentId={selectedAgentId}
         selectedTaskId={selectedTask?.task_id}
         tasks={tasks}
       />
       <AgentWorkspace
         agent={selectedAgent}
         busy={busy}
-        composerKey={`${selectedTask?.task_id ?? "new"}-${selectedAgentName ?? "none"}-${draftId}`}
+        composerKey={`${selectedTask?.task_id ?? "new"}-${selectedAgentId ?? "none"}-${draftId}`}
         onCancel={() => void handleCancel()}
         onNewTask={() => selectedAgent && newTask(selectedAgent)}
         onQuickResponse={(text) => void submit(text)}

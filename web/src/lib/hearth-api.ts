@@ -7,7 +7,8 @@ export type TaskState =
   | "canceled"
 
 export interface AgentInfo {
-  name: string
+  id: string
+  hostname: string
   running: boolean
   ready: boolean
   is_agent_in_charge: boolean
@@ -27,7 +28,8 @@ export interface TaskSummary {
   task_ref: string
   thread_id: string
   agent: string
-  agent_vm: string
+  agent_id: string
+  agent_hostname: string
   text: string
   session_name?: string
   state: TaskState
