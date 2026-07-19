@@ -58,7 +58,7 @@ install -m 0644 "$repo_dir/packaging/systemd/"*.service "$stage_dir/lib/systemd/
 install -m 0644 "$repo_dir/packaging/sysusers.d/hearth.conf" "$stage_dir/lib/sysusers.d/hearth.conf"
 install -m 0644 "$repo_dir/packaging/tmpfiles.d/hearth.conf" "$stage_dir/lib/tmpfiles.d/hearth.conf"
 install -m 0644 "$repo_dir/systemd/hearth-agentd-verb-policy.toml" "$stage_dir/etc/hearth/verb-policy.toml"
-install -m 0644 "$repo_dir/README.md" "$repo_dir/docs/operations.md" "$repo_dir/docs/agent-plane.md" "$repo_dir/docs/distribution-plan.md" "$stage_dir/share/doc/hearth/"
+install -m 0644 "$repo_dir/README.md" "$repo_dir/docs/operations.md" "$repo_dir/docs/agent-plane.md" "$stage_dir/share/doc/hearth/"
 install -m 0644 "$repo_dir/LICENSE" "$stage_dir/share/licenses/hearth/LICENSE"
 
 find "$stage_dir" -exec touch -h -d "@$epoch" {} +
