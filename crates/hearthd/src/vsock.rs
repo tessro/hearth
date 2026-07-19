@@ -32,7 +32,8 @@ use tracing::{info, warn};
 impl<H: crate::host::Host + 'static> Daemon<H> {
     /// Bind the per-VM hybrid listeners for a (about-to-be-)running service.
     /// Idempotent: listeners persist across guest reconnects and VM restarts;
-    /// they are only torn down by [`Daemon::drop_guest_channels`].
+    /// the machine-owned listeners are torn down by
+    /// [`Daemon::drop_guest_channels`].
     pub(crate) async fn ensure_guest_channels(&self, name: &str) -> Result<()> {
         if self.cfg.disable_vsock {
             return Ok(());
@@ -80,13 +81,12 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
         Ok(())
     }
 
-    /// Tear down a service's hybrid listeners (stop/destroy). Also unlinks the
-    /// agentd-brokered `_1026` socket: it is bound by hearthd on agentd's
-    /// `guest-listener` request and not tracked here, so if it survived a
-    /// destroy a service recreated under the same name — possibly *without*
-    /// `agent = true` — would silently inherit the dead VM's agent-plane
-    /// identity (§8). agentd's stale listener simply stops receiving
-    /// connections once the socket is gone.
+    /// Tear down hearthd's machine-plane listeners on stop/destroy.
+    ///
+    /// The agentd-brokered `_1026` listener must survive a stop/start. Agentd
+    /// owns its open fd and tracks it by stable VM id; unlinking the path here
+    /// leaves agentd accepting on an unreachable inode and makes every MCP
+    /// shim connection reset until agentd restarts.
     pub(crate) async fn drop_guest_channels(&self, name: &str) {
         let mut channels = self.channels.lock().await;
         if let Some(handles) = channels.remove(name) {
@@ -95,9 +95,16 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
             }
         }
         drop(channels);
-        for port in [PORT_VERBS, PORT_REPORT, PORT_AGENT] {
+        for port in [PORT_VERBS, PORT_REPORT] {
             let _ = tokio::fs::remove_file(self.cfg.vm_vsock_port_socket(name, port)).await;
         }
+    }
+
+    /// Remove agentd's brokered listener path when a stable VM id is destroyed.
+    /// A later VM gets a new id, so stop/start must retain this path while
+    /// destroy must not leave it behind.
+    pub(crate) async fn drop_agent_channel(&self, id: &str) {
+        let _ = tokio::fs::remove_file(self.cfg.vm_vsock_port_socket(id, PORT_AGENT)).await;
     }
 
     /// Bind channels for every already-running service (daemon startup).

@@ -14,7 +14,7 @@ use crate::relay;
 use anyhow::{anyhow, Context, Result};
 use hearth_agent_proto::{read_line_capped, AgentVerb, Hello, HelloChannel, MAX_LINE_BYTES};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -42,7 +42,11 @@ impl Listeners {
     pub async fn refresh(self: &Arc<Self>) -> Result<()> {
         let endpoints = self.agentd.hearthd.agent_endpoints().await?;
         let mut active = self.active.lock().await;
-        active.retain(|_, handle| !handle.is_finished());
+        let endpoint_ids = endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.clone())
+            .collect::<HashSet<_>>();
+        retain_known_listeners(&mut active, &endpoint_ids);
         for endpoint in endpoints {
             if !endpoint.running || active.contains_key(&endpoint.id) {
                 continue;
@@ -221,6 +225,19 @@ impl Listeners {
     }
 }
 
+fn retain_known_listeners(
+    active: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    endpoint_ids: &HashSet<String>,
+) {
+    active.retain(|id, handle| {
+        let keep = endpoint_ids.contains(id) && !handle.is_finished();
+        if !keep {
+            handle.abort();
+        }
+        keep
+    });
+}
+
 fn frame_wakeup(
     callee_vm: &str,
     task_id: &str,
@@ -238,4 +255,27 @@ fn frame_wakeup(
          task {task_id} on agent {callee_vm:?} → {state}:\n  {detail}\n\
          Respond with task_respond({task_ref:?}, …) or inspect task_events first."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listener_refresh_drops_destroyed_vm_ids() {
+        let mut active = HashMap::new();
+        active.insert("vm-live".to_string(), tokio::spawn(std::future::pending()));
+        active.insert(
+            "vm-destroyed".to_string(),
+            tokio::spawn(std::future::pending()),
+        );
+
+        retain_known_listeners(&mut active, &HashSet::from(["vm-live".to_string()]));
+
+        assert!(active.contains_key("vm-live"));
+        assert!(!active.contains_key("vm-destroyed"));
+        for handle in active.into_values() {
+            handle.abort();
+        }
+    }
 }

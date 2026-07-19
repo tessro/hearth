@@ -32,6 +32,8 @@ use hearth_agent_proto::{
     fdpass, hybrid, read_line_capped, AgentRequest, AgentVerb, Hello, MAX_LINE_BYTES, PORT_AGENT,
     PORT_GUESTD,
 };
+#[cfg(test)]
+use hearth_agent_proto::{PORT_REPORT, PORT_VERBS};
 use hearth_proto::{version_result, ImageManifest, Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -903,6 +905,7 @@ impl<H: Host + 'static> Daemon<H> {
         remove_path_dir(self.cfg.snapshots_dir.join(&id)).await?;
         self.host.delete_tap(&host::tap_name(&id)).await?;
         Registry::remove_service(&self.cfg, &id).await?;
+        self.drop_agent_channel(&id).await;
         reg.free(&id);
         reg.services.remove(hostname);
         Registry::write_allocations(&self.cfg, &reg.allocations).await?;
@@ -2342,6 +2345,14 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         write_service(&root, "mail", true).await;
         let cfg = test_config(&root);
+        let id = test_id("mail");
+        for port in [PORT_VERBS, PORT_REPORT, PORT_AGENT] {
+            let path = cfg.vm_vsock_port_socket(&id, port);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(path, b"listener").await.unwrap();
+        }
         let host = FakeHost::running();
         let state = host.state.clone();
         let daemon = Daemon::new(cfg.clone(), host);
@@ -2356,6 +2367,12 @@ mod tests {
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(!registry.get("mail").unwrap().enabled);
+        assert!(!cfg.vm_vsock_port_socket(&id, PORT_VERBS).exists());
+        assert!(!cfg.vm_vsock_port_socket(&id, PORT_REPORT).exists());
+        assert!(
+            cfg.vm_vsock_port_socket(&id, PORT_AGENT).exists(),
+            "stop must retain agentd's listener for the next start"
+        );
     }
 
     #[tokio::test]
@@ -3583,6 +3600,11 @@ cwd = "/home/exedev"
         tokio::fs::create_dir_all(&cfg.disks_dir).await.unwrap();
         tokio::fs::create_dir_all(&cfg.log_dir).await.unwrap();
         let id = test_id("mail");
+        let agent_socket = cfg.vm_vsock_port_socket(&id, PORT_AGENT);
+        tokio::fs::create_dir_all(agent_socket.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&agent_socket, b"listener").await.unwrap();
         tokio::fs::create_dir_all(cfg.snapshots_dir.join(&id))
             .await
             .unwrap();
@@ -3618,6 +3640,7 @@ cwd = "/home/exedev"
         assert!(!cfg.console_path(&id).exists());
         assert!(!cfg.snapshots_dir.join(&id).exists());
         assert!(!cfg.services_dir.join(format!("{id}.toml")).exists());
+        assert!(!agent_socket.exists());
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(!registry.allocations.vsock_cids.contains_key(&id));
         assert!(!registry.allocations.macs.contains_key(&id));
