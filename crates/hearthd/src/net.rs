@@ -5,7 +5,7 @@
 //! feeds the results through these functions.
 
 use crate::registry::Publish;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 /// One parsed dnsmasq lease. The lease file has whitespace-separated columns
@@ -40,6 +40,15 @@ pub fn parse_leases(text: &str) -> Vec<Lease> {
 /// service MAC is also lowercase, but match case-insensitively to be safe.
 pub fn lease_for_mac<'a>(leases: &'a [Lease], mac: &str) -> Option<&'a Lease> {
     leases.iter().find(|l| l.mac.eq_ignore_ascii_case(mac))
+}
+
+/// The part of the lease file that affects routing. Expiry and hostname changes
+/// do not require an nftables rewrite; MAC additions, removals, and IP moves do.
+pub fn lease_addresses(leases: &[Lease]) -> BTreeMap<String, String> {
+    leases
+        .iter()
+        .map(|lease| (lease.mac.to_ascii_lowercase(), lease.ip.clone()))
+        .collect()
 }
 
 /// Resolve the address to report/route for a service. An observed lease is
@@ -185,6 +194,16 @@ mod tests {
             Some("10.26.8.23")
         );
         assert!(lease_for_mac(&leases, "52:54:00:00:00:99").is_none());
+    }
+
+    #[test]
+    fn lease_addresses_tracks_only_mac_to_ip_changes() {
+        let first = parse_leases("1 52:54:00:8C:22:12 10.26.8.23 old id\n");
+        let renewed = parse_leases("2 52:54:00:8c:22:12 10.26.8.23 new id\n");
+        let moved = parse_leases("3 52:54:00:8c:22:12 10.26.8.24 new id\n");
+
+        assert_eq!(lease_addresses(&first), lease_addresses(&renewed));
+        assert_ne!(lease_addresses(&first), lease_addresses(&moved));
     }
 
     #[test]

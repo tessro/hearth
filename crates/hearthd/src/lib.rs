@@ -38,17 +38,23 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::mem;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Instant,
+};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{Mutex, OwnedMutexGuard},
     task::JoinHandle,
-    time::Duration,
+    time::{Duration, MissedTickBehavior},
 };
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
+
+const LEASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Daemon<H> {
     cfg: Config,
@@ -104,6 +110,8 @@ impl<H: Host + 'static> Daemon<H> {
         let policy = Arc::new(VerbPolicy::load(&self.cfg.verb_policy).await?);
         info!(socket = %self.cfg.socket, "hearthd ready");
         self.bind_running_guest_channels().await;
+        let lease_watcher = self.clone();
+        tokio::spawn(async move { lease_watcher.watch_lease_changes().await });
         notify::ready()?;
         loop {
             let (stream, _) = listener.accept().await?;
@@ -321,6 +329,50 @@ impl<H: Host + 'static> Daemon<H> {
 
     async fn registry(&self) -> Result<Registry> {
         Registry::load(&self.cfg).await
+    }
+
+    async fn watch_lease_changes(self) {
+        let mut previous = None;
+        let mut last_error = None;
+        let mut interval = tokio::time::interval(LEASE_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match self.refresh_nat_for_lease_change(&mut previous).await {
+                Ok(changed) => {
+                    if last_error.take().is_some() {
+                        info!(lease_file = %self.cfg.lease_file, "lease-file watch recovered");
+                    }
+                    if changed {
+                        info!(lease_file = %self.cfg.lease_file, "lease addresses changed; re-applied nft hearth_nat table");
+                    }
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        warn!(lease_file = %self.cfg.lease_file, error = %message, "lease-file watch failed; will retry");
+                    }
+                    last_error = Some(message);
+                }
+            }
+        }
+    }
+
+    async fn refresh_nat_for_lease_change(
+        &self,
+        previous: &mut Option<BTreeMap<String, String>>,
+    ) -> Result<bool> {
+        let leases = read_leases_checked(&self.cfg).await?;
+        let current = net::lease_addresses(&leases);
+        if previous.as_ref() == Some(&current) {
+            return Ok(false);
+        }
+
+        let _registry_guard = self.registry_lock.lock().await;
+        let reg = self.registry().await?;
+        apply_nat_with_leases(self.host.as_ref(), &reg, &leases).await?;
+        *previous = Some(current);
+        Ok(true)
     }
 
     async fn service_id(&self, hostname: &str) -> Result<String> {
@@ -1892,6 +1944,16 @@ async fn read_leases(cfg: &Config) -> Vec<net::Lease> {
     }
 }
 
+/// Read leases for the change watcher. A missing file is the valid empty state;
+/// other errors retain the last good routing state and are retried.
+async fn read_leases_checked(cfg: &Config) -> Result<Vec<net::Lease>> {
+    match fs::read_to_string(&cfg.lease_file).await {
+        Ok(text) => Ok(net::parse_leases(&text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err).with_context(|| format!("read lease file {}", cfg.lease_file)),
+    }
+}
+
 /// Resolve a service's address: an observed lease wins (ground truth), else the
 /// static reservation (expected address). `(ip, "lease"|"static")` or `None`.
 fn resolved_address(
@@ -1909,12 +1971,22 @@ fn resolved_address(
 /// continues on any failure.
 async fn apply_nat<H: Host>(cfg: &Config, host: &H, reg: &Registry) {
     let leases = read_leases(cfg).await;
+    if let Err(err) = apply_nat_with_leases(host, reg, &leases).await {
+        warn!(error = %err, "failed to apply nft hearth_nat table");
+    }
+}
+
+async fn apply_nat_with_leases<H: Host>(
+    host: &H,
+    reg: &Registry,
+    leases: &[net::Lease],
+) -> Result<()> {
     let targets: Vec<PublishTarget> = reg
         .services
         .values()
         .map(|svc| PublishTarget {
             service: svc.hostname.clone(),
-            address: resolved_address(reg, &leases, svc).map(|(ip, _)| ip),
+            address: resolved_address(reg, leases, svc).map(|(ip, _)| ip),
             publishes: svc.publish.clone(),
         })
         .collect();
@@ -1925,9 +1997,9 @@ async fn apply_nat<H: Host>(cfg: &Config, host: &H, reg: &Registry) {
             "service has publishes but no known address; its DNAT rules are omitted until it gets a lease"
         );
     }
-    if let Err(err) = host.nft_apply(&ruleset.text).await {
-        warn!(error = %err, "failed to apply nft hearth_nat table");
-    }
+    host.nft_apply(&ruleset.text)
+        .await
+        .context("apply nft hearth_nat table")
 }
 
 /// Re-write any static-lease drop-in that is missing from the drop-in dir (e.g.
@@ -2758,6 +2830,85 @@ mod tests {
         assert_eq!(value["static_lease"], json!(true));
         assert_eq!(value["address"], json!("10.26.8.16"));
         assert_eq!(value["address_source"], json!("static"));
+    }
+
+    #[tokio::test]
+    async fn lease_change_retargets_published_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        ensure_dirs(&cfg).await.unwrap();
+        write_test_image(&cfg, "base").await;
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+        let create = daemon
+            .handle(Request::new(
+                "1",
+                Verb::Create,
+                Map::from_iter([
+                    ("hostname".into(), json!("web")),
+                    ("image".into(), json!("base")),
+                    (
+                        "publish".into(),
+                        json!([{ "host_port": 9119, "guest_port": 9119, "protocol": "tcp" }]),
+                    ),
+                ]),
+            ))
+            .await;
+        assert!(create[0].ok, "create failed: {:?}", create[0].error);
+        let registry = Registry::load(&cfg).await.unwrap();
+        let mac = registry.get("web").unwrap().mac.clone();
+        let mut previous = None;
+
+        tokio::fs::write(&cfg.lease_file, format!("1 {mac} 10.26.8.99 web *\n"))
+            .await
+            .unwrap();
+        assert!(daemon
+            .refresh_nat_for_lease_change(&mut previous)
+            .await
+            .unwrap());
+        assert!(state
+            .lock()
+            .unwrap()
+            .last_nft
+            .as_ref()
+            .unwrap()
+            .contains("dnat to 10.26.8.99:9119"));
+
+        tokio::fs::write(&cfg.lease_file, format!("2 {mac} 10.26.8.16 web *\n"))
+            .await
+            .unwrap();
+        assert!(daemon
+            .refresh_nat_for_lease_change(&mut previous)
+            .await
+            .unwrap());
+        let applies = {
+            let locked = state.lock().unwrap();
+            let rules = locked.last_nft.as_ref().unwrap();
+            assert!(rules.contains("dnat to 10.26.8.16:9119"));
+            assert!(!rules.contains("dnat to 10.26.8.99:9119"));
+            locked
+                .calls
+                .iter()
+                .filter(|call| call.as_str() == "nft-apply")
+                .count()
+        };
+
+        assert!(!daemon
+            .refresh_nat_for_lease_change(&mut previous)
+            .await
+            .unwrap());
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|call| call.as_str() == "nft-apply")
+                .count(),
+            applies
+        );
     }
 
     #[tokio::test]

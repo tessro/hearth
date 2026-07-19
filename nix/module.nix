@@ -231,6 +231,7 @@ in
       };
       systemd.network.networks."20-${cfg.networking.bridge}" = {
         matchConfig.Name = cfg.networking.bridge;
+        linkConfig.RequiredForOnline = "routable";
         address = [ cfg.networking.address ];
         networkConfig.ConfigureWithoutCarrier = true;
       };
@@ -238,10 +239,18 @@ in
         enable = true;
         settings = {
           interface = cfg.networking.bridge;
-          bind-interfaces = true;
+          bind-dynamic = true;
           dhcp-range = cfg.networking.dynamicRange;
           conf-dir = "/var/lib/hearth/dnsmasq.d";
         };
+      };
+      systemd.services.dnsmasq = {
+        wants = [ "network-online.target" ];
+        after = [ "network-online.target" ];
+      };
+      systemd.services.hearth = {
+        wants = [ "dnsmasq.service" ];
+        after = [ "dnsmasq.service" ];
       };
       boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
       networking.nftables = {

@@ -77,10 +77,11 @@ distro-generic hints if any are absent:
 
 ## 2. Bridge + dnsmasq expectations
 
-Hearth does **not** create the bridge or run dnsmasq — it assumes the host owns
-that layer (see `ARCHITECTURE.md`). It attaches each VM's tap to the bridge,
-reads the lease file to report addresses, and writes static-lease drop-ins. The
-operator provides:
+`hearthd` does **not** create the bridge or run dnsmasq. With
+`networking.manage = true`, the NixOS module owns that host layer; otherwise the
+operator provides it (see `ARCHITECTURE.md`). Hearth attaches each VM's tap to
+the bridge, reads the lease file to report addresses, and writes static-lease
+drop-ins. The host layer provides:
 
 - **A bridge named `hearth0`** (override with `HEARTH_BRIDGE`) with a gateway
   address, default `10.26.8.1/24`, and outbound NAT/masquerade to the uplink.
@@ -88,7 +89,9 @@ operator provides:
   publish DNAT rules and is rewritten wholesale, never touching yours.
 - **`dnsmasq` serving DHCP on `hearth0`**, writing leases to
   `/var/lib/dnsmasq/dnsmasq.leases` (override `HEARTH_LEASE_FILE`). Its dynamic
-  `dhcp-range` MUST NOT overlap Hearth's static slice.
+  `dhcp-range` MUST NOT overlap Hearth's static slice. Hearth watches the
+  MAC-to-IP entries in this file and re-applies publish DNAT rules when they
+  change.
 - **A drop-in dir Hearth can write**, default `/var/lib/hearth/dnsmasq.d`
   (override `HEARTH_DNSMASQ_DROPIN_DIR`). Point dnsmasq at it, e.g.
   `conf-dir=/var/lib/hearth/dnsmasq.d`. On `create` Hearth writes `<id>.conf`

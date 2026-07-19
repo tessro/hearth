@@ -80,6 +80,9 @@ in
       machine.wait_for_unit("dnsmasq.service")
       machine.succeed("ip address show hearth0 | grep 10.26.8.1/24")
       machine.succeed("grep -R '/var/lib/hearth/dnsmasq.d' /etc/systemd /nix/store/*-dnsmasq.conf 2>/dev/null")
+      machine.succeed("grep -R '^bind-dynamic$' /nix/store/*-dnsmasq.conf")
+      machine.succeed("systemctl show dnsmasq -p After --value | grep network-online.target")
+      machine.succeed("systemctl show hearth -p After --value | grep dnsmasq.service")
       machine.succeed("nft list table ip hearth-host | grep masquerade")
     '';
   };
