@@ -129,6 +129,8 @@ jobs:
           CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           tag="v$RELEASE_VERSION"
           scripts/check-release-tag.sh "$tag"
           remote_main=$(git ls-remote origin refs/heads/main | awk '{print $1}')
