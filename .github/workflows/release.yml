@@ -1,4 +1,5 @@
 name: Release
+run-name: Release ${{ inputs.bump }}${{ inputs.dry_run && ' [dry run]' || '' }}
 
 on:
   workflow_dispatch:
