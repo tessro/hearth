@@ -197,14 +197,14 @@ same cursor/replay path used after completion.
 | hermes (Phase 6) | `hermes acp`: ACP v1 JSON-RPC/stdio; `session/new`/`load`/`prompt`, streamed `session/update`, server-initiated `session/request_permission` | ACP session ↔ `thread_id`, prompt ↔ `run`, message/tool updates → AG-UI events; the per-session ACP MCP server launches the §2.4 shim with Hearth's thread id | permission request → task `awaiting_input`; guestd parks the live ACP process and `task.respond` answers the exact JSON-RPC request |
 
 Codex was implemented first because app-server has generatable schemas. The
-current deployable path is Hermes ACP v1, tested at version `0.18.2` and source
-commit `2ea39dae`; presentation-oriented `hermes chat -q` output is
-deliberately not an adapter contract. Adapters couple to native protocols,
-which drift. Hermes checks the ACP protocol and agent identity, then checks
-message shapes as it uses them. Its release banner is status data, not a gate.
-The image may pin a source revision for repeatable builds. An image registers
-only adapters for CLIs it actually configures; the Hermes image therefore does
-not advertise codex or claude.
+current deployable path is Hermes ACP v1, installed by default at version
+`0.19.0` from source commit `3ef6bbd`; presentation-oriented `hermes chat -q`
+output is deliberately not an adapter contract. Adapters couple to native
+protocols, which drift. Hermes checks the ACP protocol and agent identity, then
+checks message shapes as it uses them. Its release banner is status data, not a
+gate. The image may pin a source revision for repeatable builds. An image
+registers only adapters for CLIs it actually configures; the Hermes image
+therefore does not advertise codex or claude.
 
 ### 2.3 Turn queue and wake-up injection
 

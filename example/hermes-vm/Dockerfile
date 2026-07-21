@@ -4,18 +4,17 @@
 #
 #   buildah bud --network host --layers -t vm-base -f example/vm-base/Dockerfile example/vm-base
 #
-# then build this image with a pinned Hermes commit (see README):
+# then build this image (see README):
 #
 #   hearthctl image build --name hermes-vm --dockerfile example/hermes-vm/Dockerfile \
-#     --context example/hermes-vm --disk 16 --build-arg HERMES_COMMIT=<sha>
+#     --context example/hermes-vm --disk 16
 FROM localhost/vm-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# The Hermes commit to install. §8: no default, so a build is reproducible only
-# with an explicit pin — pass --build-arg HERMES_COMMIT=<sha>. Record the tested
-# sha in the README and bump it deliberately, in a commit.
-ARG HERMES_COMMIT
+# Hermes 0.19.0. Keep the full source pin so the default build is repeatable;
+# pass --build-arg HERMES_COMMIT=<sha> to test another revision.
+ARG HERMES_COMMIT=3ef6bbd201263d354fd83ec55b3c306ded2eb72a
 
 # Workload tooling on top of vm-base's boot essentials (which already ships
 # curl + ca-certificates). ffmpeg/ripgrep are Hermes runtime deps.
@@ -31,8 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Hermes Agent for the agent user, pinned to $HERMES_COMMIT. The
 # interactive setup wizard and the Playwright/Chromium download are skipped;
 # drop --skip-browser and rebuild if you want Hermes browser tools inside the VM.
-RUN test -n "$HERMES_COMMIT" || { echo 'build with --build-arg HERMES_COMMIT=<sha> (see README)'; exit 1; } \
-  && su - agent -c "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup --non-interactive --skip-browser --commit \"$HERMES_COMMIT\""
+RUN su - agent -c "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup --non-interactive --skip-browser --commit \"$HERMES_COMMIT\""
 
 # hermes.env and authorized_keys are NOT baked in anymore. §3/§10 provisions the
 # env through `--provision-file` and SSH through typed

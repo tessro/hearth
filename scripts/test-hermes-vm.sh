@@ -12,8 +12,8 @@ set -euo pipefail
 # example/hermes-vm/hermes.env is NEVER read or touched.
 #
 # Runs as root on a prepared host (KVM, Cloud Hypervisor, a built guest kernel,
-# working hearth0 DHCP/NAT). Building the image needs outbound internet and a
-# pinned Hermes commit; set HERMES_COMMIT=<sha> (skipped if the image exists).
+# working hearth0 DHCP/NAT). Building the image needs outbound internet. Set
+# HERMES_COMMIT=<sha> to override the Dockerfile's Hermes 0.19.0 pin.
 
 HEARTH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib.sh
@@ -43,7 +43,7 @@ Environment:
   NAME_A=${NAME_A}   NAME_B=${NAME_B}
   MEMORY_MIB=${MEMORY_MIB}   CPUS=${CPUS}   SERVICE_DISK_GIB=${SERVICE_DISK_GIB}
   BOOT_BUDGET_S=${BOOT_BUDGET_S}   HERMES_PORT=${HERMES_PORT}
-  HERMES_COMMIT=${HERMES_COMMIT:-<unset>}   (required only if the image must be built)
+  HERMES_COMMIT=${HERMES_COMMIT:-<Dockerfile default>}   (optional source override)
   CLEAN=${CLEAN}   (set CLEAN=1 to destroy existing test VMs first)
 
 Expects a real root hearthd with KVM, Cloud Hypervisor, a built guest kernel,
@@ -99,17 +99,15 @@ ENV_B="${TMPDIR_ENV}/${NAME_B}.env"
 make_env "${ENV_A}" "${NAME_A}" "$(rand_hex)"
 make_env "${ENV_B}" "${NAME_B}" "$(rand_hex)"
 
-# 1. Build vm-base, then the hermes image if missing (needs a pinned commit).
+# 1. Build vm-base, then the Hermes image if missing.
 ensure_vm_base
 if ! image_exists "${IMAGE_NAME}"; then
-  if [ -z "${HERMES_COMMIT:-}" ]; then
-    echo "error: image ${IMAGE_NAME} is not built and HERMES_COMMIT is unset." >&2
-    echo "the Hermes install is pinned by commit (§8). Build it with, e.g.:" >&2
-    echo "  HERMES_COMMIT=<sha> $0" >&2
-    exit 1
+  hermes_build_args=()
+  if [ -n "${HERMES_COMMIT:-}" ]; then
+    hermes_build_args=(--build-arg "HERMES_COMMIT=${HERMES_COMMIT}")
   fi
   ensure_image "${IMAGE_NAME}" "${CONTEXT_DIR}/Dockerfile" "${CONTEXT_DIR}" \
-    "${BUILD_DISK_GIB}" --build-arg "HERMES_COMMIT=${HERMES_COMMIT}"
+    "${BUILD_DISK_GIB}" "${hermes_build_args[@]}"
 fi
 
 # 2. Spawn both VMs from the one image, each with its own secret env file.

@@ -45,20 +45,19 @@ key for every VM unless `--allow-no-ssh` is explicit.
 ## 2. Build the base, then the image
 
 Build `vm-base` once (see `example/vm-base/README.md`), then the Hermes image.
-The Hermes install is pinned by commit; there is no default, so a reproducible
-build needs an explicit `--build-arg HERMES_COMMIT=<sha>`:
+The default build installs Hermes `0.19.0` from its full release commit:
 
 ```sh
 make vm-base
 hearthctl image build --name hermes-vm --dockerfile example/hermes-vm/Dockerfile \
-  --context example/hermes-vm --disk 16 \
-  --build-arg HERMES_COMMIT=2ea39daeb1f675d72e5c21c9400f2d58d7e6d71a
+  --context example/hermes-vm --disk 16
 ```
 
-> **Tested commit.** The Hearth adapter was tested with Hermes `0.18.2` and ACP
-> protocol v1. The image example pins tested source commit `2ea39dae` for a
-> repeatable build, but the run-time probe does not gate on the release or SHA.
-> The build checks both `hermes --version` and `hermes acp --check`,
+> **Default commit.** Hermes `0.19.0` is pinned to
+> `3ef6bbd201263d354fd83ec55b3c306ded2eb72a`. Pass
+> `--build-arg HERMES_COMMIT=<sha>` to test another revision. The run-time probe
+> does not gate on the release or SHA. The build checks both `hermes --version`
+> and `hermes acp --check`,
 > so a moved launcher or missing ACP dependency fails here, not on first boot.
 
 `image build` runs a build-time linter over the unpacked rootfs before it makes
