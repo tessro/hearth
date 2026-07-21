@@ -70,10 +70,6 @@ impl Hearthd {
                         .get("running")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
-                    is_agent_in_charge: entry
-                        .get("is_agent_in_charge")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
                     ready: entry
                         .get("guestd")
                         .and_then(|g| g.get("ready"))
@@ -181,7 +177,6 @@ pub struct AgentEndpoint {
     pub id: String,
     pub hostname: String,
     pub running: bool,
-    pub is_agent_in_charge: bool,
     pub ready: bool,
     pub agents: Vec<AgentDecl>,
 }

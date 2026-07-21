@@ -1,5 +1,5 @@
 //! Phase 4 acceptance (docs/agent-plane.md §11–12, trace (c)/(e)): agent-to-
-//! agent delegation with durable wake-ups. The agent-in-charge delegates, the
+//! agent delegation with durable wake-ups. An allowlisted agent delegates, the
 //! callee hits `awaiting_input` **while agentd is stopped**, agentd restarts,
 //! the initiator is woken **exactly once**, responds, and collects the result —
 //! with a full ledger + audit trail. A non-allowlisted VM's `delegate` is
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 fn opts() -> HarnessOptions {
     HarnessOptions {
-        agents: vec![AgentSpec::boss("boss"), AgentSpec::worker("worker")],
+        agents: vec![AgentSpec::new("boss"), AgentSpec::new("worker")],
         delegators: vec!["boss".to_string()],
         http: None,
         codex_command: Some(env!("CARGO_BIN_EXE_fake_codex").to_string()),

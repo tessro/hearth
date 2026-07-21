@@ -20,20 +20,12 @@ use ulid::Ulid;
 
 pub struct AgentSpec {
     pub name: String,
-    pub is_agent_in_charge: bool,
 }
 
 impl AgentSpec {
-    pub fn worker(name: &str) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            is_agent_in_charge: false,
-        }
-    }
-    pub fn boss(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            is_agent_in_charge: true,
         }
     }
 }
@@ -120,7 +112,7 @@ impl Harness {
         tokio::fs::write(&keys, "ssh-ed25519 AAAATEST harness\n").await?;
 
         for spec in &opts.agents {
-            write_service_toml(&services, &spec.name, true, spec.is_agent_in_charge).await?;
+            write_service_toml(&services, &spec.name, true).await?;
         }
 
         // hearthd.
@@ -312,15 +304,6 @@ impl Harness {
         Ok(stream)
     }
 
-    /// Connect to a guest's machine-plane verb channel (`<vm>.sock_1024`) — the
-    /// agent-in-charge path (Phase 0).
-    pub async fn guest_verb_channel(&self, vm: &str) -> Result<UnixStream> {
-        let path = self.vsock_dir.join(format!("{}.sock_1024", vm_id(vm)));
-        UnixStream::connect(path.as_str())
-            .await
-            .with_context(|| format!("connect {vm} verb channel"))
-    }
-
     /// A machine-plane request to hearthd (as this test's uid).
     pub async fn hearthd(&self, verb: Verb, args: Map<String, Value>) -> Result<Response> {
         let mut stream = UnixStream::connect(self.hearthd_socket.as_str()).await?;
@@ -433,22 +416,6 @@ pub async fn guest_verb(
     }
 }
 
-/// A machine-plane request on a guest's `<vm>.sock_1024` verb channel.
-pub async fn machine_verb(
-    stream: &mut UnixStream,
-    verb: Verb,
-    args: Map<String, Value>,
-) -> Result<Response> {
-    let req = Request::new(Ulid::new().to_string(), verb, args);
-    stream
-        .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
-        .await?;
-    let line = read_line_capped(stream, MAX_LINE_BYTES)
-        .await?
-        .ok_or_else(|| anyhow!("guest verb channel closed"))?;
-    Ok(serde_json::from_str(&line)?)
-}
-
 /// The hello agentd/hearthctl send on the guest verb/mcp channels. Provided so
 /// tests can emulate a shim if needed.
 pub fn hello(component: &str) -> Hello {
@@ -481,12 +448,7 @@ async fn guest_hello(stream: &mut UnixStream, component: &str) -> Result<()> {
     Ok(())
 }
 
-async fn write_service_toml(
-    services: &Utf8PathBuf,
-    name: &str,
-    agent: bool,
-    is_agent_in_charge: bool,
-) -> Result<()> {
+async fn write_service_toml(services: &Utf8PathBuf, name: &str, agent: bool) -> Result<()> {
     let id = vm_id(name);
     let toml = format!(
         r#"id = "{id}"
@@ -498,7 +460,6 @@ memory_mib = 2048
 disk_gib = 20
 vsock_cid = {cid}
 mac = "52:54:00:00:00:{mac:02x}"
-is_agent_in_charge = {is_agent_in_charge}
 agent = {agent}
 "#,
         cid = 100 + (name.len() as u32),

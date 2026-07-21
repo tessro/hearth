@@ -11,7 +11,6 @@ export interface AgentInfo {
   hostname: string
   running: boolean
   ready: boolean
-  is_agent_in_charge: boolean
   adapters: string[]
   task_count: number
 }

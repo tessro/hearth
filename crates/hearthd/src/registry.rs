@@ -23,8 +23,6 @@ pub struct Service {
     pub disk_gib: u64,
     pub vsock_cid: u32,
     pub mac: String,
-    #[serde(default)]
-    pub is_agent_in_charge: bool,
     /// Agent-plane participation (docs/agent-plane.md §2.5): only services
     /// with `agent = true` are visible to `agent-endpoints`/agentd, and
     /// setting it requires a guestd-declaring image at create time.
@@ -381,7 +379,6 @@ impl Registry {
             Err(e) => return Err(e).context("read allocations"),
         };
         validate_allocation_ids(&allocations)?;
-        Self::validate_agent_in_charge(&services)?;
         Ok(Self {
             services,
             allocations,
@@ -475,14 +472,6 @@ impl Registry {
         self.allocations.vsock_cids.remove(id);
         self.allocations.macs.remove(id);
         self.allocations.ips.remove(id);
-    }
-
-    fn validate_agent_in_charge(services: &BTreeMap<String, Service>) -> Result<()> {
-        let count = services.values().filter(|s| s.is_agent_in_charge).count();
-        if count > 1 {
-            bail!("at most one service may set is_agent_in_charge = true");
-        }
-        Ok(())
     }
 }
 

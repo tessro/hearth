@@ -1,12 +1,11 @@
 //! Phase 0 acceptance (docs/agent-plane.md §11): transport and authorization
-//! truth. The agent-in-charge verb channel works over the CHV-hybrid socket; a
-//! restricted-uid client runs exactly the allowlisted verbs and nothing else;
-//! the broker never crosses the guest channel.
+//! truth. A restricted-uid client runs exactly the allowlisted verbs and
+//! nothing else.
 
 use hearth_agent_proto::{
     read_line_capped, AgentRequest, AgentVerb, Hello, AGENT_PROTOCOL_VERSION, MAX_LINE_BYTES,
 };
-use hearth_e2e::{machine_verb, AgentSpec, Harness, HarnessOptions};
+use hearth_e2e::{AgentSpec, Harness, HarnessOptions};
 use hearth_proto::{Response, Verb};
 use serde_json::{json, Map, Value};
 use tokio::io::AsyncWriteExt;
@@ -14,60 +13,13 @@ use ulid::Ulid;
 
 fn opts() -> HarnessOptions {
     HarnessOptions {
-        agents: vec![AgentSpec::boss("boss"), AgentSpec::worker("worker")],
+        agents: vec![AgentSpec::new("boss"), AgentSpec::new("worker")],
         delegators: vec!["boss".to_string()],
         http: None,
         codex_command: Some(env!("CARGO_BIN_EXE_fake_codex").to_string()),
         claude_command: None,
         hermes_command: None,
     }
-}
-
-#[tokio::test]
-async fn agent_in_charge_verb_channel_works_over_hybrid_socket() {
-    let h = Harness::start(opts()).await.unwrap();
-    // The agent-in-charge's `<vm>.sock_1024` accepts a machine-plane `ls`.
-    let mut stream = h.guest_verb_channel("boss").await.unwrap();
-    let resp = machine_verb(&mut stream, Verb::Ls, Map::new())
-        .await
-        .unwrap();
-    assert!(resp.ok, "ls over the guest verb channel should succeed");
-    let services = resp.result.unwrap();
-    let names: Vec<&str> = services["services"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|s| s["hostname"].as_str())
-        .collect();
-    assert!(names.contains(&"boss") && names.contains(&"worker"));
-}
-
-#[tokio::test]
-async fn broker_verbs_are_denied_on_the_guest_channel() {
-    let h = Harness::start(opts()).await.unwrap();
-    // A guest must never obtain fds to other VMs' sockets: the broker verbs are
-    // refused on the guest verb channel even for the agent-in-charge.
-    let mut stream = h.guest_verb_channel("boss").await.unwrap();
-    let mut args = Map::new();
-    args.insert("name".to_string(), Value::String("worker".to_string()));
-    let resp = machine_verb(&mut stream, Verb::GuestConnect, args)
-        .await
-        .unwrap();
-    assert!(!resp.ok);
-    assert_eq!(resp.error.unwrap().code, "verb.denied");
-}
-
-#[tokio::test]
-async fn non_agent_in_charge_verb_channel_is_dropped() {
-    let h = Harness::start(opts()).await.unwrap();
-    // A non-agent-in-charge VM's verb channel accepts the connection but
-    // dispatches nothing — hearthd closes it without a response.
-    let mut stream = h.guest_verb_channel("worker").await.unwrap();
-    let result = machine_verb(&mut stream, Verb::Ls, Map::new()).await;
-    assert!(
-        result.is_err(),
-        "worker is not the agent-in-charge; its verb channel must not dispatch"
-    );
 }
 
 #[tokio::test]

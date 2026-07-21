@@ -20,7 +20,6 @@ binaries and are called out as such.
 | `nft` | the `hearth_nat` publish table | `nftables` | `nftables` |
 | `dnsmasq` | guest DHCP + leases on the bridge | `dnsmasq` | `dnsmasq` |
 | `ip` | tap/bridge wiring | `iproute2` | `iproute` |
-| `socat` | agent-in-charge vsock proxy | `socat` | `socat` |
 | KVM | `/dev/kvm`, `kvm` + `vhost_vsock` modules | kernel | kernel |
 
 If the base distribution does not carry `cloud-hypervisor`, enable the Cloud
@@ -177,7 +176,7 @@ sudo curl -fsSL \
   -o /etc/yum.repos.d/cloud-hypervisor.repo
 ```
 
-The package manager resolves `qemu-img`, nftables, dnsmasq, iproute, socat,
+The package manager resolves `qemu-img`, nftables, dnsmasq, iproute,
 systemd, and the host C library. Units stay disabled after install.
 
 ```sh

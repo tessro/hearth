@@ -70,8 +70,6 @@ enum Command {
         /// Explicitly permit a VM with no managed SSH authorized keys.
         #[arg(long)]
         allow_no_ssh: bool,
-        #[arg(long)]
-        agent_in_charge: bool,
         /// Enrol the VM in the agent plane (requires a guestd-declaring image).
         #[arg(long)]
         agent: bool,
@@ -451,7 +449,6 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
             ssh_key,
             authorized_keys_file,
             allow_no_ssh,
-            agent_in_charge,
             agent,
         } => {
             let mut args = args([("hostname", json!(name)), ("image", json!(image))]);
@@ -468,9 +465,6 @@ fn to_request(command: &Command) -> Result<(Verb, Map<String, Value>)> {
                     provision.insert("allow_no_ssh".into(), json!(true));
                 }
                 args.insert("provision".into(), Value::Object(provision));
-            }
-            if *agent_in_charge {
-                args.insert("is_agent_in_charge".into(), json!(true));
             }
             if *agent {
                 args.insert("agent".into(), json!(true));
@@ -991,7 +985,6 @@ mod tests {
             ssh_key: vec![],
             authorized_keys_file: vec![],
             allow_no_ssh: true,
-            agent_in_charge: true,
             agent: false,
         })
         .unwrap();
@@ -1001,7 +994,6 @@ mod tests {
         assert_eq!(args.get("cpu"), Some(&json!(4)));
         assert_eq!(args.get("memory_mib"), Some(&json!(4096)));
         assert_eq!(args.get("disk_gib"), Some(&json!(30)));
-        assert_eq!(args.get("is_agent_in_charge"), Some(&json!(true)));
         assert_eq!(args["provision"]["allow_no_ssh"], json!(true));
     }
 
@@ -1031,7 +1023,6 @@ mod tests {
             ssh_key: vec![],
             authorized_keys_file: vec![path],
             allow_no_ssh: false,
-            agent_in_charge: false,
             agent: false,
         })
         .unwrap();

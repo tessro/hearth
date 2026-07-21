@@ -87,7 +87,6 @@ impl Agentd {
                 "hostname": endpoint.hostname,
                 "running": endpoint.running,
                 "ready": endpoint.ready,
-                "is_agent_in_charge": endpoint.is_agent_in_charge,
                 "adapters": adapters,
                 "task_count": task_count,
             }));
@@ -305,7 +304,6 @@ mod tests {
             id: "vm-00000000000000000000000000000001".into(),
             hostname: "hermes-vm".into(),
             running: true,
-            is_agent_in_charge: false,
             ready: true,
             agents: vec![
                 AgentDecl {

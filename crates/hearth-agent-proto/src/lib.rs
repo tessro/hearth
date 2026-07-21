@@ -34,7 +34,6 @@ pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Vsock port map (§6). Guest→host ports land on `<vm>.sock_<port>` unix
 /// sockets under the hybrid model; 1027 is an in-guest listener reached via
 /// `CONNECT 1027` on `<vm>.sock`.
-pub const PORT_VERBS: u32 = 1024; // guest→host: hearthd verb channel (agent-in-charge)
 pub const PORT_REPORT: u32 = 1025; // guest→host: boot report / readiness / heartbeat
 pub const PORT_AGENT: u32 = 1026; // guest→host: MCP frames + guestd upcalls (agentd)
 pub const PORT_GUESTD: u32 = 1027; // host→guest: task verbs, attach, inject.turn

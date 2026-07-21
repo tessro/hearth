@@ -85,9 +85,8 @@ COPY init /usr/local/bin/init
 # hearth-guestd: the in-guest agent-plane daemon (docs/agent-plane.md §2). Built
 # by `make guest-bin` and staged into this build context beforehand; every image
 # on the new vm-base carries it, so its manifest declares guestd = true and it
-# can back agent-plane services. It replaces the hearth-proxy socat pair (guestd
-# serves the same agent-in-charge forward itself) and hermes-probe/netdiag (the
-# boot report supersedes them).
+# can back agent-plane services. Its boot report also replaces the old
+# hermes-probe/netdiag readiness checks.
 COPY hearth-guestd /usr/local/bin/hearth-guestd
 COPY hearth-guestd.service /etc/systemd/system/hearth-guestd.service
 

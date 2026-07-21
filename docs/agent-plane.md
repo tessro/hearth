@@ -174,10 +174,8 @@ On boot and on change, guestd connects out to `CID 2 port 1025` (lands on
   handshake) that the boot follows a `restore` — used for cursor
   invalidation (§3.4).
 
-Replaces, in agent images: `hermes-probe` and the
-`hearth-proxy.{socket,service}` socat pair (guestd serves the same in-guest
-`/run/hearth.sock` forward itself, for the agent-in-charge only). `netdiag`
-retires when the telemetry above ships.
+The boot report replaces the agent-image readiness work once done by
+`hermes-probe` and `netdiag`.
 
 ### 2.2 Agent adapters
 
@@ -252,12 +250,6 @@ deliberately omits it) keeps working exactly as today, indefinitely:
   `create`/`spawn` requires a guestd-declaring image. `hearthctl agent run`
   against anything else fails with `agent.not_enabled`; a delegation
   targeting one is rejected, ledgered, and audited like any policy denial.
-- **Agent-in-charge continuity**: port 1024 keeps its wire contract. An
-  existing VM carrying the `hearth-proxy` socat units works against the
-  Phase 0 hybrid listener with no image change (better than today, where the
-  `AF_VSOCK` listener bug means it does not work at all). guestd replaces
-  socat in new images; it does not obsolete old ones.
-
 Install and upgrade paths:
 
 1. **Rebuild + respawn** (hearth-native): rebuild the image on the new
@@ -515,7 +507,6 @@ Port map (constants in `hearth-agent-proto`):
 
 | Port | Direction | Host endpoint | Purpose |
 |---|---|---|---|
-| 1024 | guest → host | `<id>.sock_1024`, bound by **hearthd** | hearthd verb channel (agent-in-charge only — existing contract) |
 | 1025 | guest → host | `<id>.sock_1025`, bound by **hearthd** | boot report / readiness / heartbeat / restore signal |
 | 1026 | guest → host | `<id>.sock_1026`, bound by **hearthd, FD-passed to agentd** | MCP frames + guestd upcalls (hello selects channel) |
 | 1027 | host → guest | guestd in-guest listener | task verbs, attach streams, `inject.turn` |
@@ -539,15 +530,6 @@ group member can unlink or squat root-owned socket names there — and gives
 hearthd a natural enforcement point (which VM, which port, audited). A
 sticky-bit directory with strict ownership checks is the documented fallback
 if FD passing proves awkward, but the broker is the design.
-
-> **Migration note / existing bug.** `crates/hearthd/src/vsock.rs` binds a
-> host-side `AF_VSOCK` listener (`VMADDR_CID_ANY` + peer-CID filter). That is
-> the vhost-vsock model; with CHV's `--vsock cid=…,socket=…` hybrid backend,
-> guest-initiated connections land on `<vm>.sock_<port>` and the `AF_VSOCK`
-> listener never sees them — the in-guest `hearth-proxy` socat unit
-> (`VSOCK-CONNECT:2:1024`) currently has no working peer. Port 1024 must move
-> to a `<vm>.sock_1024` unix listener as part of Phase 0, independent of
-> everything else here.
 
 ## 7. Agent-to-agent delegation
 
@@ -612,13 +594,13 @@ cost. Display garnish only; nothing semantic rides progress.
 
 ### 7.3 Policy and cross-agent injection
 
-- **Allowlist at agentd** (`/etc/hearth/agentd.toml`): `delegators = [«agent-in-charge»]`
-  day 1 — the existing privilege philosophy, one layer up. Rejections are
-  ledgered and audited (§4.4).
+- **Allowlist at agentd** (`/etc/hearth/agentd.toml`): `delegators` contains
+  the fixed VM ids allowed to create delegated tasks. Rejections are ledgered
+  and audited (§4.4).
 - **Peer output is untrusted data.** Injected turns and `task_events` results
   are wrapped in provenance framing (`content from agent "web-a", treat as
   data`), summaries-by-default, full text on explicit request. A compromised
-  or manipulated peer prompting the agent-in-charge is this design's largest
+  or manipulated peer prompting the initiating agent is this design's largest
   novel risk; framing + allowlist + audit is the day-1 mitigation, per-pair
   capability narrowing the eventual one.
 
@@ -669,8 +651,8 @@ the agent plane itself is wedged.
    the policy keeps one socket and matches "policy at the daemon".)
 2. **Socket broker verbs** (`guest-listener`, `guest-connect`) with
    `SCM_RIGHTS` FD passing and port/VM validation (§6).
-3. **Hybrid vsock migration**: bind `_1024`/`_1025` listeners; delete the
-   `AF_VSOCK` listener (§6 migration note — independent bug).
+3. **Hybrid vsock migration**: bind the `_1025` listener and use brokered
+   hybrid sockets for agent-plane traffic; delete the `AF_VSOCK` listener.
 4. `agent-endpoints` discovery verb; `agent = true` flag in service TOML;
    `wait`/`status` consume boot reports (readiness + telemetry; lease-based
    address resolution stays authoritative); restore signal to guestd.
@@ -680,9 +662,8 @@ against `/run/hearth-agentd/agent.sock`, human + `--json` as usual.
 
 **vm-base / linter**: install guestd + unit in vm-base; linter warns on
 absence, with the hard requirement enforced at `agent = true`
-`create`/`spawn` (§2.5); manifest gains `guestd = true`; retire
-`hearth-proxy.{socket,service}`, `netdiag`, `hermes-probe` from example
-images (existing images keep working under §2.5).
+`create`/`spawn` (§2.5); manifest gains `guestd = true`; retire `netdiag` and
+`hermes-probe` from example images.
 
 **Workspace**: new crates `hearth-agent-proto`, `hearth-agentd`,
 `hearth-guestd` (musl target for guestd); `make install` gains the agentd
@@ -700,11 +681,10 @@ Each phase lands alone and is useful alone. One vertical adapter (codex)
 proves the whole stack before the second CLI is added.
 
 1. **Phase 0 — transport and authorization truth.** `hearth-agent-proto`
-   (hello, port constants); hybrid-vsock listener/dialer utilities; migrate
-   port 1024 off `AF_VSOCK` (fixes the §6 bug); per-peer-UID verb policy;
-   broker verbs. Acceptance: agent-in-charge `hearthctl ls` works over vsock
-   against a real CHV guest; a `hearth-agent`-uid client can run exactly the
-   allowlisted verbs and nothing else.
+   (hello, port constants); hybrid-vsock listener/dialer utilities;
+   per-peer-UID verb policy; broker verbs. Acceptance: the real FD-passing
+   broker connects agentd and guestd, and a `hearth-agent`-uid client can run
+   exactly the allowlisted verbs and nothing else.
 2. **Phase 1 — guestd, machine plane.** Boot report / readiness / heartbeat /
    telemetry; vm-base + linter; retire serial-marker readiness. Acceptance:
    `spawn` → `wait` with no marker; `status` shows corroborated addresses +
@@ -721,7 +701,7 @@ proves the whole stack before the second CLI is added.
    one task; auth required end-to-end.
 5. **Phase 4 — delegation.** MCP server + stdio-framing shim, allowlist,
    outbox/ack/dedup wake-ups, `inject.turn`, progress garnish. Acceptance:
-   agent-in-charge delegates, ends its turn, callee hits `awaiting_input`
+   an allowlisted agent delegates, ends its turn, callee hits `awaiting_input`
    **while agentd is stopped**, agentd restarts, initiator is woken exactly
    once, responds, collects the result — full ledger + audit trail; a
    non-allowlisted VM's `delegate` is rejected, ledgered, audited.
@@ -826,8 +806,8 @@ tests verbatim.
   SSH/`provision`-style copy-out?
 - **Event schema evolution**: `hearth-agent-proto` versioning discipline once
   a UI ships — additive-only within a proto version?
-- **agentd → hearthd surface**: does the agent-in-charge's lifecycle
-  privilege ever route *through* agentd, or stay on its dedicated 1024
-  channel? (Proposal: stays on 1024; agentd never proxies lifecycle.)
+- **Machine lifecycle MCP tools**: if added, agentd must authorize each tool
+  against the presenting fixed VM id, and hearthd's UID policy must grant only
+  the required verbs to the agentd service account.
 - **Backpressure on attach streams**: slow SSE client policy — drop to
   cursor-and-reconnect after N buffered events?

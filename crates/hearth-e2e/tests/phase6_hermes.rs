@@ -9,7 +9,7 @@ use ulid::Ulid;
 
 fn opts() -> HarnessOptions {
     HarnessOptions {
-        agents: vec![AgentSpec::worker("worker")],
+        agents: vec![AgentSpec::new("worker")],
         delegators: vec![],
         http: None,
         codex_command: None,

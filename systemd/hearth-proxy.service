@@ -1,7 +1,0 @@
-[Unit]
-Description=Forward local Hearth socket to host hearthd over vsock
-Requires=hearth-proxy.socket
-
-[Service]
-ExecStart=/usr/bin/socat STDIO VSOCK-CONNECT:2:1024
-StandardInput=socket

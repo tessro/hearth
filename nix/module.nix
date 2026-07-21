@@ -127,7 +127,6 @@ in
         pkgs.nftables
         pkgs.dnsmasq
         pkgs.iproute2
-        pkgs.socat
       ];
       environment.etc."hearth/authorized_keys".text =
         lib.concatMapStringsSep "\n" (key: key) cfg.authorizedKeys + "\n";
@@ -156,7 +155,6 @@ in
           pkgs.nftables
           pkgs.dnsmasq
           pkgs.iproute2
-          pkgs.socat
           pkgs.systemd
         ];
         serviceConfig = {

@@ -224,7 +224,7 @@ fn render_agents(value: &Value) -> Result<()> {
         .ok_or_else(|| anyhow!("malformed agent ls response"))?;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(["NAME", "RUNNING", "READY", "IN_CHARGE", "ADAPTERS", "TASKS"]);
+    table.set_header(["NAME", "RUNNING", "READY", "ADAPTERS", "TASKS"]);
     for agent in agents {
         let adapters = agent
             .get("adapters")
@@ -240,7 +240,6 @@ fn render_agents(value: &Value) -> Result<()> {
             cell(agent, "name"),
             cell(agent, "running"),
             cell(agent, "ready"),
-            cell(agent, "is_agent_in_charge"),
             adapters,
             cell(agent, "task_count"),
         ]);

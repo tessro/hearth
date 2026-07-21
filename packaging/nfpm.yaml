@@ -34,7 +34,6 @@ overrides:
       - iproute2
       - nftables
       - qemu-utils
-      - socat
       - systemd
       - libgcc-s1
     recommends:
@@ -48,7 +47,6 @@ overrides:
       - iproute
       - nftables
       - qemu-img
-      - socat
       - systemd
       - libgcc
     recommends:

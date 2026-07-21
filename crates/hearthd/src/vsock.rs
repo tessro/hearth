@@ -3,11 +3,8 @@
 //! CHV's vsock device is the Firecracker-style *hybrid* model: there is no
 //! host-side `AF_VSOCK` at all. A guest connecting to CID 2 port P lands on
 //! whoever listens on the host unix socket `/run/hearth/vsock/<vm>.sock_P`.
-//! hearthd binds two of those per running VM:
-//!
-//! - `_1024` — the machine-plane verb channel (agent-in-charge only, the
-//!   existing contract; identity is the socket path, not a token).
-//! - `_1025` — boot report / readiness / heartbeat / restore signal.
+//! hearthd binds `_1025` for boot reports, readiness, heartbeats, and the
+//! restore signal for each running VM.
 //!
 //! Port 1026 (`_1026`, MCP + upcalls) is bound on demand through the broker
 //! verb `guest-listener` and fd-passed to agentd; it is not served here.
@@ -20,11 +17,7 @@ use crate::Daemon;
 use anyhow::{Context, Result};
 use hearth_agent_proto::{
     read_line_capped, GuestFrame, HostFrame, ReportAck, MAX_LINE_BYTES, PORT_AGENT, PORT_REPORT,
-    PORT_VERBS,
 };
-use hearth_proto::{Request, Response, Verb};
-use serde_json::Value;
-use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
@@ -32,7 +25,7 @@ use tracing::{info, warn};
 impl<H: crate::host::Host + 'static> Daemon<H> {
     /// Bind the per-VM hybrid listeners for a (about-to-be-)running service.
     /// Idempotent: listeners persist across guest reconnects and VM restarts;
-    /// the machine-owned listeners are torn down by
+    /// the machine-owned listener is torn down by
     /// [`Daemon::drop_guest_channels`].
     pub(crate) async fn ensure_guest_channels(&self, name: &str) -> Result<()> {
         if self.cfg.disable_vsock {
@@ -42,46 +35,44 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
         if channels.contains_key(name) {
             return Ok(());
         }
-        let mut handles = Vec::new();
-        for port in [PORT_VERBS, PORT_REPORT] {
-            let path = self.cfg.vm_vsock_port_socket(name, port);
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err).context("remove stale guest listener socket"),
-            }
-            let listener = UnixListener::bind(path.as_str())
-                .with_context(|| format!("bind guest listener {path}"))?;
-            let daemon = self.clone();
-            let service = name.to_string();
-            handles.push(tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            let conn = daemon.guest_conn(port, service.clone(), stream);
-                            tokio::spawn(async move {
-                                if let Err(err) = conn.await {
-                                    warn!(port, error = %err, "guest channel failed");
-                                }
-                            });
-                        }
-                        Err(err) => {
-                            warn!(service = %service, port, error = %err, "guest listener accept failed");
-                            break;
-                        }
+        let path = self.cfg.vm_vsock_port_socket(name, PORT_REPORT);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).context("remove stale guest listener socket"),
+        }
+        let listener = UnixListener::bind(path.as_str())
+            .with_context(|| format!("bind guest listener {path}"))?;
+        let daemon = self.clone();
+        let service = name.to_string();
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let daemon = daemon.clone();
+                        let service = service.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = daemon.handle_guest_reports(&service, stream).await {
+                                warn!(port = PORT_REPORT, error = %err, "guest channel failed");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        warn!(service = %service, port = PORT_REPORT, error = %err, "guest listener accept failed");
+                        break;
                     }
                 }
-            }));
-        }
-        channels.insert(name.to_string(), handles);
+            }
+        });
+        channels.insert(name.to_string(), vec![handle]);
         info!(service = %name, "guest vsock channels bound");
         Ok(())
     }
 
-    /// Tear down hearthd's machine-plane listeners on stop/destroy.
+    /// Tear down hearthd's machine-plane listener on stop/destroy.
     ///
     /// The agentd-brokered `_1026` listener must survive a stop/start. Agentd
     /// owns its open fd and tracks it by stable VM id; unlinking the path here
@@ -95,9 +86,7 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
             }
         }
         drop(channels);
-        for port in [PORT_VERBS, PORT_REPORT] {
-            let _ = tokio::fs::remove_file(self.cfg.vm_vsock_port_socket(name, port)).await;
-        }
+        let _ = tokio::fs::remove_file(self.cfg.vm_vsock_port_socket(name, PORT_REPORT)).await;
     }
 
     /// Remove agentd's brokered listener path when a stable VM id is destroyed.
@@ -118,90 +107,6 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
                     warn!(hostname = %svc.hostname, id = %svc.id, error = %err, "failed to bind guest channels");
                 }
             }
-        }
-    }
-
-    /// One guest connection, type-erased. The verb handler can dispatch
-    /// `start`, which re-enters `ensure_guest_channels`, which spawns this —
-    /// boxing at this boundary breaks the otherwise-infinite future type.
-    fn guest_conn(
-        &self,
-        port: u32,
-        service: String,
-        stream: UnixStream,
-    ) -> futures_util::future::BoxFuture<'static, Result<()>> {
-        let daemon = self.clone();
-        Box::pin(async move {
-            if port == PORT_VERBS {
-                daemon.handle_guest_verbs(&service, stream).await
-            } else {
-                daemon.handle_guest_reports(&service, stream).await
-            }
-        })
-    }
-
-    /// The machine-plane verb channel on `_1024`. The connecting VM *is* the
-    /// socket path; only the agent-in-charge gets dispatch (existing
-    /// contract), and the broker verbs never cross this channel — a guest
-    /// must not be able to obtain fds to other VMs' sockets.
-    async fn handle_guest_verbs(&self, name: &str, mut stream: UnixStream) -> Result<()> {
-        let reg = self.registry().await?;
-        let Ok(svc) = reg.get_by_id(name) else {
-            warn!(service = %name, "vsock verb connection for unknown service; dropping");
-            return Ok(());
-        };
-        if !svc.is_agent_in_charge {
-            warn!(service = %name, "dropping vsock verb connection: not the agent-in-charge");
-            return Ok(());
-        }
-        loop {
-            let Some(line) = read_line_capped(&mut stream, MAX_LINE_BYTES).await? else {
-                return Ok(());
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let started = Instant::now();
-            let req: Request = match serde_json::from_str(&line) {
-                Ok(req) => req,
-                Err(err) => {
-                    write_line(
-                        &mut stream,
-                        &Response::failure("", "protocol.invalid_json", err.to_string()),
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            let id = req.id.clone();
-            let verb = req.verb.clone();
-            let args = Value::Object(req.args.clone());
-            let ok = if guest_verb_allowed(&req.verb) {
-                let (ok, fd) = self.handle_and_write(req, &mut stream).await?;
-                debug_assert!(fd.is_none(), "guest dispatch cannot produce fds");
-                ok
-            } else {
-                write_line(
-                    &mut stream,
-                    &Response::failure(
-                        id.clone(),
-                        "verb.denied",
-                        format!("verb {verb} is not available on the guest channel"),
-                    ),
-                )
-                .await?;
-                false
-            };
-            info!(
-                id = %id,
-                verb = %verb,
-                args = %args,
-                caller_transport = "vsock",
-                caller_service = %name,
-                ok,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "audit"
-            );
         }
     }
 
@@ -257,17 +162,4 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
             }
         }
     }
-}
-
-/// Verbs a guest may issue over `_1024`. Everything in the machine-plane
-/// contract except the socket broker: fds must never flow guestward.
-fn guest_verb_allowed(verb: &Verb) -> bool {
-    !matches!(verb, Verb::GuestListener | Verb::GuestConnect)
-}
-
-async fn write_line(stream: &mut UnixStream, response: &Response) -> Result<()> {
-    stream
-        .write_all((serde_json::to_string(response)? + "\n").as_bytes())
-        .await?;
-    Ok(())
 }

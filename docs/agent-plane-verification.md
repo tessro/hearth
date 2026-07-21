@@ -50,7 +50,7 @@ the VM boot itself and the real CLIs:
 
 | Phase | Test file | What it proves |
 |---|---|---|
-| 0 | `phase0_transport_auth.rs` | Agent-in-charge verb channel over the hybrid `<vm>.sock_1024`; broker verbs refused on the guest channel; per-UID policy allows the allowlist and denies `destroy`; `agent-endpoints` lists only agent VMs; guestd rejects a missing or version-skewed port-1027 hello. **The full broker path (hearthd binds/​connects, `SCM_RIGHTS`-passes the fd, agentd adopts it) is real.** |
+| 0 | `phase0_transport_auth.rs` | Per-UID policy allows the agentd allowlist and denies `destroy`; `agent-endpoints` lists only agent VMs; guestd rejects a missing or version-skewed port-1027 hello. **The full broker path (hearthd binds/​connects, `SCM_RIGHTS`-passes the fd, agentd adopts it) is real.** |
 | 1 | `phase1_readiness.rs` | `wait` resolves on the guestd boot report with no marker; `status` surfaces guestd version, agents, `last_seen`; unknown service errors cleanly instead of hanging. |
 | 2 | `phase2_tasks.rs` | Start → stream (durable user/assistant text and tool-call AG-UI events) → complete; follow-up user turns survive replay; approval **interrupt → new run on the same thread** with both run outcomes recorded; cancel; **cursor staleness by incarnation**. |
 | 3 | `phase3_agui_http.rs` | Real HTTP/SSE: task → interrupt → resume and completed-task follow-up via `forwardedProps.task_ref`; lossless replay to two independent UIs; bearer auth required end-to-end; CORS origin echoed. The opt-in `make agui-conformance` test drives the same endpoint with the pinned, unmodified TypeScript `HttpAgent`. |

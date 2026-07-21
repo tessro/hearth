@@ -28,12 +28,12 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use chrono::Utc;
+#[cfg(test)]
+use hearth_agent_proto::PORT_REPORT;
 use hearth_agent_proto::{
     fdpass, hybrid, read_line_capped, AgentRequest, AgentVerb, Hello, MAX_LINE_BYTES, PORT_AGENT,
     PORT_GUESTD,
 };
-#[cfg(test)]
-use hearth_agent_proto::{PORT_REPORT, PORT_VERBS};
 use hearth_proto::{version_result, ImageManifest, Request, Response, Verb};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -532,13 +532,6 @@ impl<H: Host + 'static> Daemon<H> {
             ));
         }
         let manifest = image::load(&self.cfg, &image).await?;
-        let is_agent_in_charge = optional_bool(&args, "is_agent_in_charge").unwrap_or(false);
-        if is_agent_in_charge && reg.services.values().any(|svc| svc.is_agent_in_charge) {
-            return Err(coded(
-                "service.duplicate_agent_in_charge",
-                "at most one service may set is_agent_in_charge = true",
-            ));
-        }
         // Agent-plane participation is declared, not guessed (§2.5): an
         // `agent = true` service requires an image that carries guestd.
         let agent = optional_bool(&args, "agent").unwrap_or(false);
@@ -628,7 +621,6 @@ impl<H: Host + 'static> Daemon<H> {
             disk_gib,
             vsock_cid,
             mac,
-            is_agent_in_charge,
             agent,
             disk: Some(disk_filename.clone()),
             publish,
@@ -1263,7 +1255,6 @@ impl<H: Host + 'static> Daemon<H> {
                 "id": svc.id,
                 "hostname": svc.hostname,
                 "running": running,
-                "is_agent_in_charge": svc.is_agent_in_charge,
                 "guestd": guest.map(|g| g.summary()),
             }));
         }
@@ -1371,7 +1362,6 @@ impl<H: Host + 'static> Daemon<H> {
             ),
             check_command_version("cloud-hypervisor").await,
             check_command("qemu-img"),
-            check_command("socat"),
             check_command("nft"),
             check_kernel_module("kvm").await?,
             check_kernel_module("vhost_vsock").await?,
@@ -1550,7 +1540,6 @@ fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Val
         "vsock_cid": svc.vsock_cid,
         "mac": svc.mac,
         "address": address,
-        "is_agent_in_charge": svc.is_agent_in_charge,
         "agent": svc.agent,
         "ssh_access": svc.provision.ssh_access_state(),
         "ssh_key_fingerprints": svc.provision.ssh_key_fingerprints(),
@@ -2180,7 +2169,6 @@ mod tests {
             disk_gib: 40,
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
-            is_agent_in_charge: false,
             agent: false,
             disk: Some("dev.qcow2".into()),
             publish: Vec::new(),
@@ -2220,7 +2208,6 @@ mod tests {
             disk_gib: 20,
             vsock_cid: 100,
             mac: "52:54:00:12:34:56".into(),
-            is_agent_in_charge: false,
             agent: false,
             disk: None,
             publish: Vec::new(),
@@ -2367,7 +2354,7 @@ mod tests {
         write_service(&root, "mail", true).await;
         let cfg = test_config(&root);
         let id = test_id("mail");
-        for port in [PORT_VERBS, PORT_REPORT, PORT_AGENT] {
+        for port in [PORT_REPORT, PORT_AGENT] {
             let path = cfg.vm_vsock_port_socket(&id, port);
             tokio::fs::create_dir_all(path.parent().unwrap())
                 .await
@@ -2388,7 +2375,6 @@ mod tests {
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(!registry.get("mail").unwrap().enabled);
-        assert!(!cfg.vm_vsock_port_socket(&id, PORT_VERBS).exists());
         assert!(!cfg.vm_vsock_port_socket(&id, PORT_REPORT).exists());
         assert!(
             cfg.vm_vsock_port_socket(&id, PORT_AGENT).exists(),

@@ -2,16 +2,23 @@
 
 ## Purpose
 
-Hearth manages a small fleet of KVM virtual machines on a single host. Each VM runs an autonomous agent that operates the services inside that VM. One VM — the *agent-in-charge* — is privileged to manage its peers by issuing VM-lifecycle and operational commands back to the host through a constrained channel.
+Hearth manages a small fleet of KVM virtual machines on a single host. Each VM
+may run an autonomous agent that operates services inside that VM. Agents
+coordinate task work through the unprivileged host `hearth-agentd`; they do not
+receive direct access to hearthd's VM lifecycle API.
 
-The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only interface anyone (human or agent) uses to talk to hearthd. Hearth is opinionated about the VM surface — lifecycle, networking, storage, snapshots — and incurious about what those VMs run. How a guest organises its own services (containers, raw processes, an init system) is the guest agent's business.
+The host machine plane runs `hearthd`; operators use `hearthctl` to talk to it.
+The optional agent plane adds `hearth-agentd` for AG-UI and MCP traffic. Hearth
+owns VM lifecycle, networking, storage, and snapshots. Each guest owns its
+containers and processes.
 
 ## Goals
 
-- One process to think about on the host (`hearthd`); one tool to operate it (`hearthctl`).
+- One root machine-plane process (`hearthd`) and one operator tool (`hearthctl`).
 - Bounded, legible surface — future-you with no context should be able to read the configs and understand the system.
 - VM lifecycle entirely owned by hearth: create, destroy, boot, shutdown, reboot, snapshot, restore, resize, image management.
-- A single privileged channel from the agent-in-charge VM to hearthd, structurally identical to the host-side local channel.
+- Agent task and delegation traffic carried by guestd and agentd, separate from
+  the host-only VM lifecycle channel.
 - Verb-level policy (allowlist) and a complete audit log enforced at the daemon, not the transport.
 
 ## Non-goals
@@ -23,7 +30,8 @@ The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only inte
   sanctioned HTTP surface (AG-UI) in a *separate*, unprivileged daemon
   (`hearth-agentd`); hearthd itself stays unix-socket line-JSON only. See the
   agent-plane proposal for that boundary.
-- Per-caller capability models. Day 1 is "the privileged channel can do everything; nobody else has the channel." hearthd now additionally enforces a per-peer-UID verb policy (below) so an unprivileged agent-plane relay can be given exactly the discovery + socket-broker verbs and nothing else.
+- Direct guest access to hearthd's lifecycle verbs. Guest agents use the
+  agent-plane task and delegation APIs instead.
 - General image-building pipelines. Hearth can build a narrow Dockerfile VM
   rootfs format, but arbitrary application Dockerfiles remain a container runtime
   concern.
@@ -31,29 +39,15 @@ The host runs a single daemon, `hearthd`. The CLI, `hearthctl`, is the only inte
 ## Topology
 
 ```
-                                                  Host
-+---------------------------------------------------------------------------------------+
-|                                                                                       |
-|  human         hearthctl ─────unix/JSON──┐                                            |
-|                                          │                                            |
-|                                          ▼                                            |
-|                                       hearthd ──systemd-run──▶ cloud-hypervisor (mail)|
-|                                          │       (transient    cloud-hypervisor (web) |
-|                                          │       units)        cloud-hypervisor (ai)  |
-|                                          │                              │             |
-|                                          │       per-VM API socket      │             |
-|                                          ├──HTTP/unix──▶ /run/hearth/vms/mail.sock    |
-|                                          │                                            |
-|                                          └──vsock listener (CID 2, port N)            |
-|                                                       ▲                               |
-|                                                       │ virtio-vsock                  |
-|  +----------------------+   +----------------------+  │                               |
-|  │ VM: agent-in-charge  │   │ VM: mail (peer)      │  │                               |
-|  │                      │   │                      │  │                               |
-|  │ hearthctl ─unix──▶ guestd ─vsock─────────────────┘                                 |
-|  │ (guest agent)        │   │ (guest agent)        │                                  |
-|  +----------------------+   +----------------------+                                  |
-+---------------------------------------------------------------------------------------+
+Host
+├─ human ── hearthctl ── Unix JSON ──▶ hearthd ── systemd-run ──▶ cloud-hypervisor per VM
+├─ UI / hearthctl agent ── AG-UI ──▶ hearth-agentd
+└─ hearth-agentd ── restricted Unix JSON ──▶ hearthd socket broker
+                                                    │
+                                                    └── brokered hybrid vsock
+                                                          │
+Guest VM                                                  ▼
+└─ agent CLI ◀── ACP / native protocol ──▶ hearth-guestd daemon / MCP shim
 ```
 
 The **agent plane** (`docs/agent-plane.md`) layers on top without changing any
@@ -71,7 +65,8 @@ Long-running Rust daemon. Itself a systemd unit (`hearth.service`). Responsibili
 
 - Owns the service registry (`/etc/hearth/services/*.toml`). Each VM has a fixed,
   generated id for host resources and a mutable hostname for commands and DNS.
-- Listens on `/run/hearth.sock` (host) and on a vsock port (host CID 2, fixed port) for the agent-in-charge.
+- Listens on the host-only `/run/hearth.sock` control socket and on each
+  running VM's boot-report channel.
 - Accepts line-delimited JSON requests; validates against a verb allowlist; dispatches to:
   - `systemd-run` for VM process lifecycle (start/stop the CHV process itself).
   - The per-VM Cloud Hypervisor HTTP API over its unix socket for runtime ops (`vm.boot`, `vm.shutdown`, `vm.reboot`, `vm.info`, `vm.snapshot`, `vm.restore`, `vm.resize`).
@@ -120,17 +115,6 @@ named `hearth-vm-<id>.service`. Each has:
 - Direct-kernel boot with the shared Hearth guest kernel, `root=/dev/vda`, and
   `init=<resolved OCI command>` from the image manifest.
 
-### Agent-in-charge vsock proxy
-
-Inside the agent-in-charge VM, a tiny systemd socket-activated service uses `socat` (or equivalent) to present `/run/hearth.sock` at the same path it would have on the host:
-
-```
-[Socket] /run/hearth.sock     LISTEN
-[Service] socat - UNIX-LISTEN:/run/hearth.sock,fork VSOCK-CONNECT:2:<HEARTH_PORT>
-```
-
-This means hearthctl in the agent-in-charge VM is byte-identical to hearthctl on the host. The transport is invisible to the client.
-
 ## Protocol
 
 Line-delimited JSON over a unix domain socket. One request per line, one response per line, request/response correlation by client-assigned `id`.
@@ -155,7 +139,9 @@ Line-delimited JSON over a unix domain socket. One request per line, one respons
 
 **Streaming responses** (used by `logs --follow`) emit multiple lines tagged with the same `id`, terminated by a `{"id": ..., "ok": true, "stream": "end"}` line.
 
-Why line-JSON not HTTP/gRPC: trivial to debug with `socat - UNIX:/run/hearth.sock`, no schema compiler in the path, no version negotiation, framing is just newlines. CHV's HTTP API is *internal* to hearthd; it is not exposed to clients.
+Why line-JSON not HTTP/gRPC: any Unix-socket client can inspect it, no schema
+compiler sits in the path, no version negotiation is needed, and newlines mark
+frames. CHV's HTTP API is *internal* to hearthd; clients cannot reach it.
 
 ## Service model
 
@@ -285,34 +271,28 @@ CHV's vsock device is the Firecracker-style **hybrid** model: there is no
 host-side `AF_VSOCK`. A guest connecting to CID 2 port *P* lands on whoever
 listens on the host unix socket `/run/hearth/vsock/<vm>.sock_P`; a host→guest
 connection dials `/run/hearth/vsock/<vm>.sock` and sends `CONNECT <port>`.
-hearthd binds a per-VM `<vm>.sock_1024` listener for the machine-plane verb
-channel (readiness/reports ride `_1025`; the agent plane uses `_1026`/`1027`,
-see `docs/agent-plane.md` §6). **Identity is the socket path** — whichever VM's
-socket a connection arrives on *is* the caller, VMM-attested, no tokens between
-host and guest.
-
-The agent-in-charge VM is configured at create time with `is_agent_in_charge =
-true`; hearthd dispatches machine-plane verbs only for connections arriving on
-that VM's `_1024` socket (the socket broker verbs are refused there — a guest
-must never obtain fds to other VMs' sockets). Inside the agent-in-charge VM,
-`hearth-guestd` (or, on pre-guestd images, a socat unit) forwards
-`/run/hearth.sock` to the host over vsock. The result: `hearthctl` in either
-location is identical code, identical config, identical socket path.
+hearthd binds a per-VM `<vm>.sock_1025` listener for readiness reports and
+heartbeats. The agent plane uses guest-to-host port 1026 and host-to-guest port
+1027 through hearthd's FD-passing socket broker (see `docs/agent-plane.md` §6).
+**Identity is the socket path** — whichever VM's socket a connection arrives on
+is the caller, VMM-attested, with no guest token.
 
 > Historical note: an earlier build bound a host-side `AF_VSOCK` listener
 > (`VMADDR_CID_ANY` + peer-CID filter). That is the vhost-vsock model and never
-> saw CHV's hybrid-backend connections; port 1024 moved to a `<vm>.sock_1024`
-> unix listener (`docs/agent-plane.md` §6 migration note).
+> saw CHV's hybrid-backend connections. Hearth now uses per-VM hybrid Unix
+> sockets for all host-side guest channels.
 
 ## Authorization
 
 Day 1 model is intentionally minimal:
 
 - **Host-local socket** (`/run/hearth.sock`): protected by Unix filesystem permissions (`0660`, owned by `root:hearth`). Any human user in the `hearth` group can issue any verb.
-- **Vsock channel**: dispatches machine-plane verbs only for connections on the agent-in-charge VM's `<vm>.sock_1024` socket. That channel can issue any verb in the allowlist, including lifecycle; the socket-broker verbs are refused on it.
 - **Verb allowlist + per-peer-UID policy**: enforced at hearthd. A config-driven map (`/etc/hearth/verb-policy.toml`) grants specific uids/gids a restricted verb set; the built-in default keeps root and the `hearth` group at full access. This is what lets `hearth-agentd` run as an unprivileged `hearth-agent` user with exactly `ping`/`version`/`ls`/`status`/`rename`/`agent-endpoints`/`guest-listener`/`guest-connect` and nothing else — the socket broker (`guest-listener`/`guest-connect`) passes brokered fds via `SCM_RIGHTS` so agentd never opens the root-owned vsock directory itself.
 
-Audit log: every request, including caller identity (uid for unix-socket, CID for vsock), verb, args, result code, and duration, written to journald with structured fields. `journalctl -u hearth.service` is the canonical audit view.
+Audit log: every request includes the Unix peer uid, verb, args, result code,
+and duration in structured journald fields. Guest channel logs identify the
+fixed VM id from the socket path. `journalctl -u hearth.service` is the
+canonical audit view.
 
 ## Supervision model
 
@@ -342,7 +322,7 @@ This is the only systemd config that lives on disk for hearth-related VM managem
 | CHV API socket unresponsive | `vm.shutdown` request times out | hearthd escalates to `systemctl stop hearth-vm-<name>`; on next start, treat as cold boot |
 | hearthd crashes | systemd restarts `hearth.service` | On restart, reconcile: each `enabled = true` service that has no live unit is started; each live unit not in registry is logged but left alone |
 | Host reboot | normal systemd boot sequence | hearthd starts, reconciles, all `enabled = true` VMs come up |
-| Agent-in-charge VM compromised | n/a (treated as trusted) | Out of scope day 1; sketched as a future per-caller capability model |
+| Agent VM compromised | agentd records denied task and MCP calls | Revoke its fixed id from the delegator allowlist; rebuild or restore the VM |
 | Disk corruption | qcow2 read errors surface to guest | Out of scope; restore from snapshot or recreate from base image |
 
 ## Open questions

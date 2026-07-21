@@ -17,7 +17,7 @@ fn free_port() -> u16 {
 
 async fn harness(bind: &str) -> Harness {
     Harness::start(HarnessOptions {
-        agents: vec![AgentSpec::worker("worker")],
+        agents: vec![AgentSpec::new("worker")],
         delegators: vec![],
         http: Some(HttpOptions {
             bind: bind.to_string(),
