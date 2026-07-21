@@ -1,8 +1,8 @@
 //! `hearthctl spawn`: one command from a built template (or straight from a
 //! Dockerfile) to a running, individually-provisioned VM. Pure CLI-side
 //! composition of the existing `image build` → `create` → `start` verbs
-//! (REFACTOR_PROPOSAL.md §10); the daemon contract is unchanged. The provision
-//! and publish arg shapes here mirror exactly what `hearthd` create() parses.
+//! (REFACTOR_PROPOSAL.md §10). The provision and publish arg shapes here mirror
+//! exactly what `hearthd` create() parses.
 
 use crate::{client::hearth_request, image_build, oci::BuildNetwork};
 use anyhow::{anyhow, bail, Context, Result};
@@ -164,8 +164,8 @@ pub fn parse_publish(value: &str) -> Result<PublishSpec> {
         bail!("--publish protocol must be tcp or udp, got {protocol:?}");
     }
     if let Some(bind) = &bind {
-        bind.parse::<std::net::IpAddr>()
-            .map_err(|_| anyhow!("--publish bind must be an IP address, got {bind:?}"))?;
+        bind.parse::<std::net::Ipv4Addr>()
+            .map_err(|_| anyhow!("--publish bind must be an IPv4 address, got {bind:?}"))?;
     }
     Ok(PublishSpec {
         host_port,
@@ -588,6 +588,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("bind"));
+        assert!(parse_publish("80:80@::1")
+            .unwrap_err()
+            .to_string()
+            .contains("IPv4"));
     }
 
     #[test]

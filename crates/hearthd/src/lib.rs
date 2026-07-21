@@ -601,18 +601,14 @@ impl<H: Host + 'static> Daemon<H> {
         let plan = ProvisionPlan::from_provision(&provisioning)
             .map_err(|e| coded("provision.invalid", format!("{e:#}")))?;
 
-        // Managed publishes mirror the [[publish]] TOML shape. Validate every
-        // entry before any disk work so bad ports/protocols fail cleanly.
+        // Managed publishes mirror the [[publish]] TOML shape. Validate the
+        // whole batch against itself and the registry before any disk work.
         let publish = match args.get("publish") {
             Some(value) => serde_json::from_value::<Vec<Publish>>(value.clone())
                 .map_err(|e| coded("publish.invalid", format!("invalid publish args: {e}")))?,
             None => Vec::new(),
         };
-        for entry in &publish {
-            entry
-                .validate()
-                .map_err(|e| coded("publish.invalid", format!("{e:#}")))?;
-        }
+        validate_publish_candidates(&reg, hostname, &publish)?;
 
         let (vsock_cid, mac, static_ip) =
             reg.allocate(&id, self.cfg.dhcp_static_start, self.cfg.dhcp_static_count);
@@ -1151,6 +1147,7 @@ impl<H: Host + 'static> Daemon<H> {
         let service = required_str(&args, "name")?;
         let id = self.service_id(service).await?;
         let _guard = self.service_guard(&id).await;
+        let _registry_guard = self.registry_lock.lock().await;
         let mut publish: crate::registry::Publish = serde_json::from_value(
             args.get("publish")
                 .cloned()
@@ -1163,44 +1160,9 @@ impl<H: Host + 'static> Daemon<H> {
         }
         validate_name(&publish.name)
             .map_err(|e| coded("publish.invalid", format!("publish name {e:#}")))?;
-        publish
-            .validate()
-            .map_err(|e| coded("publish.invalid", format!("{e:#}")))?;
         let mut reg = self.registry().await?;
         let mut svc = reg.get(service)?.clone();
-        if svc
-            .publish
-            .iter()
-            .any(|p| p.effective_name() == publish.name)
-        {
-            return Err(coded(
-                "publish.name_exists",
-                format!(
-                    "service {service} already has a publish named {}",
-                    publish.name
-                ),
-            ));
-        }
-        // A duplicate (bind, protocol, host_port) across any service would
-        // install two conflicting DNAT rules; reject it up front.
-        for other in reg.services.values() {
-            if let Some(clash) = other.publish.iter().find(|p| {
-                p.protocol == publish.protocol
-                    && p.host_port == publish.host_port
-                    && p.bind == publish.bind
-            }) {
-                return Err(coded(
-                    "publish.host_port_in_use",
-                    format!(
-                        "host port {}/{} is already published by {} ({})",
-                        publish.host_port,
-                        publish.protocol,
-                        other.hostname,
-                        clash.effective_name()
-                    ),
-                ));
-            }
-        }
+        validate_publish_candidates(&reg, service, std::slice::from_ref(&publish))?;
         svc.publish.push(publish);
         Registry::write_service(&self.cfg, &svc).await?;
         reg.services.insert(service.to_string(), svc);
@@ -1593,6 +1555,65 @@ fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Val
         "ssh_access": svc.provision.ssh_access_state(),
         "ssh_key_fingerprints": svc.provision.ssh_key_fingerprints(),
     })
+}
+
+/// Validate new forwards as one set before changing a disk or service record.
+/// This covers both `create`/`spawn` batches and live `publish add` calls.
+fn validate_publish_candidates(
+    reg: &Registry,
+    service: &str,
+    candidates: &[Publish],
+) -> Result<()> {
+    let mut names: Vec<String> = reg
+        .services
+        .get(service)
+        .into_iter()
+        .flat_map(|svc| svc.publish.iter().map(Publish::effective_name))
+        .collect();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        candidate
+            .validate()
+            .map_err(|err| coded("publish.invalid", format!("{err:#}")))?;
+        let name = candidate.effective_name();
+        if names.iter().any(|existing| existing == &name) {
+            return Err(coded(
+                "publish.name_exists",
+                format!("service {service} already has a publish named {name}"),
+            ));
+        }
+
+        for other in reg.services.values() {
+            if let Some(clash) = other
+                .publish
+                .iter()
+                .find(|publish| candidate.conflicts_with(publish))
+            {
+                return Err(publish_port_conflict(candidate, &other.hostname, clash));
+            }
+        }
+        if let Some(clash) = candidates[..index]
+            .iter()
+            .find(|publish| candidate.conflicts_with(publish))
+        {
+            return Err(publish_port_conflict(candidate, service, clash));
+        }
+        names.push(name);
+    }
+    Ok(())
+}
+
+fn publish_port_conflict(candidate: &Publish, service: &str, clash: &Publish) -> anyhow::Error {
+    coded(
+        "publish.host_port_in_use",
+        format!(
+            "host port {}/{} overlaps a publish by {} ({})",
+            candidate.host_port,
+            candidate.protocol,
+            service,
+            clash.effective_name()
+        ),
+    )
 }
 
 async fn check_authorized_keys_file(path: &Utf8PathBuf) -> Value {
@@ -2655,10 +2676,7 @@ mod tests {
         assert_eq!(svc.provision.hostname, "hermes-a");
         assert!(svc.provision.reset_ssh_hostkeys);
         assert_eq!(svc.provision.files.len(), 1);
-        assert_eq!(
-            svc.provision.files[0].from_literal.as_deref(),
-            Some("TOKEN=secret")
-        );
+        assert_eq!(svc.provision.files[0].from_literal, "TOKEN=secret");
         let status = daemon
             .handle(Request::new("2", Verb::Status, name_args("hermes-a")))
             .await;
@@ -3003,6 +3021,42 @@ mod tests {
             Some("publish.host_port_in_use")
         );
 
+        // An all-address bind also conflicts with a specific-address bind.
+        let overlap = daemon
+            .handle(Request::new(
+                "4b",
+                Verb::Publish,
+                Map::from_iter([
+                    ("name".into(), json!("web")),
+                    (
+                        "publish".into(),
+                        json!({ "name": "loopback", "host_port": 8080, "guest_port": 82, "protocol": "tcp", "bind": "127.0.0.1" }),
+                    ),
+                ]),
+            ))
+            .await;
+        assert_eq!(
+            overlap[0].error.as_ref().map(|e| e.code.as_str()),
+            Some("publish.host_port_in_use")
+        );
+
+        // Create/spawn uses the same registry-wide conflict check.
+        let mut create = create_args("api");
+        create.insert(
+            "publish".into(),
+            json!([{ "name": "api", "host_port": 8080, "guest_port": 8080, "protocol": "tcp", "bind": "127.0.0.1" }]),
+        );
+        let create_clash = daemon
+            .handle(Request::new("4c", Verb::Create, create))
+            .await;
+        assert_eq!(
+            create_clash[0]
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("publish.host_port_in_use")
+        );
+
         // An invalid (non-kebab) name is rejected before any nft change.
         let bad = daemon
             .handle(Request::new(
@@ -3139,6 +3193,80 @@ mod tests {
         assert!(!calls.contains(&"nft-apply".to_string()));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(registry.allocations.ips.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_conflicting_publish_batch_before_disk_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        write_test_image(&cfg, "base").await;
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+        let mut args = create_args("web");
+        args.insert(
+            "publish".into(),
+            json!([
+                { "name": "public", "host_port": 8080, "guest_port": 80, "protocol": "tcp" },
+                { "name": "loopback", "host_port": 8080, "guest_port": 81, "protocol": "tcp", "bind": "127.0.0.1" }
+            ]),
+        );
+
+        let responses = daemon.handle(Request::new("1", Verb::Create, args)).await;
+
+        assert_eq!(
+            responses[0].error.as_ref().map(|error| error.code.as_str()),
+            Some("publish.host_port_in_use")
+        );
+        assert!(!state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| call.starts_with("build-vm-disk ")));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_daemon_side_provision_source_before_disk_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        write_test_image(&cfg, "base").await;
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+        let mut args = create_args("web");
+        args.insert(
+            "provision".into(),
+            json!({
+                "files": [{
+                    "source": "/etc/shadow",
+                    "dest": "/home/agent/shadow",
+                    "mode": "0600",
+                    "owner": "1000:1000"
+                }]
+            }),
+        );
+
+        let responses = daemon.handle(Request::new("1", Verb::Create, args)).await;
+
+        assert_eq!(
+            responses[0].error.as_ref().map(|error| error.code.as_str()),
+            Some("provision.invalid")
+        );
+        assert!(responses[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("unknown field `source`"));
+        assert!(!state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| call.starts_with("build-vm-disk ")));
     }
 
     #[tokio::test]

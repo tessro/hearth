@@ -62,14 +62,17 @@ pub struct Publish {
     #[serde(default = "default_protocol")]
     pub protocol: String,
     // Optional host address to restrict the forward to; default is all host
-    // addresses. Stored as a string (validated as an IpAddr) so the TOML stays
-    // human-legible and round-trips.
+    // addresses. Stored as a string (validated as IPv4) so the TOML stays easy
+    // to read and round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
 }
 
 impl Publish {
     pub fn validate(&self) -> Result<()> {
+        if !self.name.is_empty() {
+            validate_name(&self.name).with_context(|| format!("publish name {:?}", self.name))?;
+        }
         // u16 already caps at 65535; reject port 0, which is not a real port.
         if self.host_port == 0 || self.guest_port == 0 {
             bail!("publish ports must be in 1-65535");
@@ -81,10 +84,19 @@ impl Publish {
             );
         }
         if let Some(bind) = &self.bind {
-            bind.parse::<std::net::IpAddr>()
-                .map_err(|_| anyhow!("publish bind must be an IP address, got {bind:?}"))?;
+            bind.parse::<std::net::Ipv4Addr>()
+                .map_err(|_| anyhow!("publish bind must be an IPv4 address, got {bind:?}"))?;
         }
         Ok(())
+    }
+
+    /// Whether two forwards compete for the same host socket. An all-address
+    /// bind overlaps every specific address; two specific binds overlap only
+    /// when they are equal.
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.host_port == other.host_port
+            && (self.bind.is_none() || other.bind.is_none() || self.bind == other.bind)
     }
 
     /// The name `publish rm` matches on. Named forwards use their name; unnamed
@@ -153,15 +165,11 @@ impl Provision {
             .files
             .iter()
             .map(|f| {
-                let source = match (&f.source, &f.from_literal) {
-                    (Some(src), _) => json!(src),
-                    _ => json!("<literal>"),
-                };
                 json!({
                     "dest": f.dest,
                     "mode": f.mode,
                     "owner": f.owner,
-                    "source": source,
+                    "source": "<literal>",
                 })
             })
             .collect();
@@ -198,13 +206,11 @@ impl Provision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvisionFile {
-    // Exactly one of `source` (an absolute path read by the daemon at provision
-    // time) or `from_literal` (inline content) must be set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<Utf8PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_literal: Option<String>,
+    // Only literal content may cross the daemon boundary. hearthctl reads a
+    // local `--provision-file source=...` before it sends the create request.
+    pub from_literal: String,
     pub dest: Utf8PathBuf,
     pub mode: String,
     pub owner: String,
@@ -212,17 +218,6 @@ pub struct ProvisionFile {
 
 impl ProvisionFile {
     pub fn validate(&self) -> Result<()> {
-        match (&self.source, &self.from_literal) {
-            (Some(_), Some(_)) => bail!(
-                "provision file {}: set exactly one of `source` or `from_literal`, not both",
-                self.dest
-            ),
-            (None, None) => bail!(
-                "provision file {}: set exactly one of `source` or `from_literal`",
-                self.dest
-            ),
-            _ => {}
-        }
         if !self.dest.is_absolute() {
             bail!(
                 "provision file dest must be an absolute path: {}",
@@ -235,11 +230,6 @@ impl ProvisionFile {
             .any(|c| matches!(c, Utf8Component::ParentDir))
         {
             bail!("provision file dest must not contain `..`: {}", self.dest);
-        }
-        if let Some(src) = &self.source {
-            if !src.is_absolute() {
-                bail!("provision file source must be an absolute path: {src}");
-            }
         }
         parse_mode(&self.mode).with_context(|| format!("provision file {}", self.dest))?;
         parse_owner(&self.owner).with_context(|| format!("provision file {}", self.dest))?;
@@ -384,6 +374,7 @@ impl Registry {
                 bail!("duplicate service hostname in registry");
             }
         }
+        validate_registry_publishes(&services)?;
         let allocations = match fs::read_to_string(&cfg.allocations).await {
             Ok(text) => toml::from_str(&text).context("parse allocations")?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Allocations::default(),
@@ -495,6 +486,40 @@ impl Registry {
     }
 }
 
+fn validate_registry_publishes(services: &BTreeMap<String, Service>) -> Result<()> {
+    let mut seen: Vec<(&str, &Publish)> = Vec::new();
+    for service in services.values() {
+        let mut names = BTreeSet::new();
+        for publish in &service.publish {
+            publish
+                .validate()
+                .with_context(|| format!("service {} publish", service.hostname))?;
+            let name = publish.effective_name();
+            if !names.insert(name.clone()) {
+                bail!(
+                    "service {} has duplicate publish name {name}",
+                    service.hostname
+                );
+            }
+            if let Some((other_service, other)) =
+                seen.iter().find(|(_, other)| publish.conflicts_with(other))
+            {
+                bail!(
+                    "service {} publish {} conflicts with {} ({}) on host port {}/{}",
+                    service.hostname,
+                    name,
+                    other_service,
+                    other.effective_name(),
+                    publish.host_port,
+                    publish.protocol
+                );
+            }
+            seen.push((&service.hostname, publish));
+        }
+    }
+    Ok(())
+}
+
 fn validate_allocation_ids(allocations: &Allocations) -> Result<()> {
     for id in allocations
         .vsock_cids
@@ -552,8 +577,7 @@ mod tests {
 
     fn literal_file(dest: &str, mode: &str, owner: &str) -> ProvisionFile {
         ProvisionFile {
-            source: None,
-            from_literal: Some("secret".to_string()),
+            from_literal: "secret".to_string(),
             dest: Utf8PathBuf::from(dest),
             mode: mode.to_string(),
             owner: owner.to_string(),
@@ -589,34 +613,6 @@ mod tests {
         assert!(literal_file("/home/agent/.env", "0600", "1000:1000")
             .validate()
             .is_ok());
-        let src = ProvisionFile {
-            source: Some(Utf8PathBuf::from("/etc/hearth/secrets/a.env")),
-            from_literal: None,
-            dest: Utf8PathBuf::from("/home/agent/.env"),
-            mode: "0640".to_string(),
-            owner: "1000:1000".to_string(),
-        };
-        assert!(src.validate().is_ok());
-    }
-
-    #[test]
-    fn provision_file_validate_rejects_both_and_neither_source() {
-        let both = ProvisionFile {
-            source: Some(Utf8PathBuf::from("/a")),
-            from_literal: Some("x".to_string()),
-            dest: Utf8PathBuf::from("/dest"),
-            mode: "0600".to_string(),
-            owner: "0:0".to_string(),
-        };
-        assert!(both.validate().is_err());
-        let neither = ProvisionFile {
-            source: None,
-            from_literal: None,
-            dest: Utf8PathBuf::from("/dest"),
-            mode: "0600".to_string(),
-            owner: "0:0".to_string(),
-        };
-        assert!(neither.validate().is_err());
     }
 
     #[test]
@@ -638,15 +634,12 @@ mod tests {
     }
 
     #[test]
-    fn provision_file_validate_rejects_relative_source() {
-        let rel = ProvisionFile {
-            source: Some(Utf8PathBuf::from("relative/a.env")),
-            from_literal: None,
-            dest: Utf8PathBuf::from("/dest"),
-            mode: "0600".to_string(),
-            owner: "0:0".to_string(),
-        };
-        assert!(rel.validate().is_err());
+    fn provision_file_schema_rejects_host_source_field() {
+        let err = toml::from_str::<ProvisionFile>(
+            "source = \"/etc/shadow\"\ndest = \"/dest\"\nmode = \"0600\"\nowner = \"0:0\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `source`"));
     }
 
     #[test]
@@ -722,6 +715,38 @@ mod tests {
         }
         .validate()
         .is_err());
+        assert!(Publish {
+            name: String::new(),
+            host_port: 80,
+            guest_port: 80,
+            protocol: "tcp".to_string(),
+            bind: Some("::1".to_string()),
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn publish_conflicts_treat_all_addresses_as_overlapping_specific_binds() {
+        let all = Publish {
+            name: "all".to_string(),
+            host_port: 8080,
+            guest_port: 80,
+            protocol: "tcp".to_string(),
+            bind: None,
+        };
+        let loopback = Publish {
+            name: "loopback".to_string(),
+            bind: Some("127.0.0.1".to_string()),
+            ..all.clone()
+        };
+        let lan = Publish {
+            name: "lan".to_string(),
+            bind: Some("192.0.2.1".to_string()),
+            ..all.clone()
+        };
+        assert!(all.conflicts_with(&loopback));
+        assert!(!loopback.conflicts_with(&lan));
     }
 
     #[test]
