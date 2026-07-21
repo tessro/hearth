@@ -19,9 +19,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-/// Hermes release and checked-out source revision validated against a real CLI.
-pub const PINNED_CLI_VERSION: &str = "0.18.2";
-pub const PINNED_SOURCE_COMMIT: &str = "2ea39dae";
 const PINNED_ACP_PROTOCOL: u64 = 1;
 
 const LINE_CAP: usize = 4 * 1024 * 1024;
@@ -160,10 +157,7 @@ impl HermesAdapter {
             .get("agentInfo")
             .and_then(|info| info.get("version"))
             .and_then(Value::as_str);
-        if protocol != Some(PINNED_ACP_PROTOCOL)
-            || name != Some("hermes-agent")
-            || version != Some(PINNED_CLI_VERSION)
-        {
+        if protocol != Some(PINNED_ACP_PROTOCOL) || name != Some("hermes-agent") {
             server.shutdown().await;
             bail!(
                 "Hermes ACP mismatch: protocol={protocol:?}, agent={name:?}, version={version:?}"
@@ -356,15 +350,6 @@ impl Adapter for HermesAdapter {
         if !output.success {
             bail!("Hermes --version failed: {}", output.stderr.trim());
         }
-        if !version_is_pinned(&output.stdout) {
-            bail!(
-                "Hermes CLI {:?} is not pinned (version {:?}, source {:?}); rebuild the image \
-                 with the matching commit or extend the adapter",
-                output.stdout.trim(),
-                PINNED_CLI_VERSION,
-                PINNED_SOURCE_COMMIT
-            );
-        }
         let check = self.output(&["acp", "--check"]).await?;
         if !check.success {
             let detail = if check.stderr.trim().is_empty() {
@@ -374,9 +359,16 @@ impl Adapter for HermesAdapter {
             };
             bail!("Hermes ACP dependency check failed: {detail}");
         }
-        Ok(format!(
-            "{PINNED_CLI_VERSION} (source {PINNED_SOURCE_COMMIT}, ACP v{PINNED_ACP_PROTOCOL})"
-        ))
+        let banner = output
+            .stdout
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("unknown version")
+            .chars()
+            .take(256)
+            .collect::<String>();
+        Ok(format!("{banner} (ACP v{PINNED_ACP_PROTOCOL})"))
     }
 
     async fn run(
@@ -825,12 +817,6 @@ fn input_text(input: &Value) -> Result<&str> {
         .ok_or_else(|| anyhow!("Hermes ACP run requires non-empty text input"))
 }
 
-fn version_is_pinned(banner: &str) -> bool {
-    banner.contains(&format!("Hermes Agent v{PINNED_CLI_VERSION}"))
-        && (banner.contains(&format!("upstream {PINNED_SOURCE_COMMIT}"))
-            || banner.contains(&format!("local {PINNED_SOURCE_COMMIT}")))
-}
-
 fn permission_decision(input: &Value, options: &HashSet<String>) -> Result<String> {
     let raw = input_text(input)?.trim().to_ascii_lowercase();
     let normalized = raw.replace([' ', '-'], "_");
@@ -1057,18 +1043,5 @@ mod tests {
     fn validates_only_the_external_acp_session_boundary() {
         assert!(validate_session_id("fe9e3089-ccac-4609-b717-47f82bf41f81").is_ok());
         assert!(validate_session_id("--config=/tmp/other").is_err());
-    }
-
-    #[test]
-    fn accepts_source_pin_in_both_real_version_banner_forms() {
-        assert!(version_is_pinned(
-            "Hermes Agent v0.18.2 (2026.7.7.2) · upstream 2ea39dae"
-        ));
-        assert!(version_is_pinned(
-            "Hermes Agent v0.18.2 (2026.7.7.2) · upstream 4a69a662 · local 2ea39dae (+15667 carried commits)"
-        ));
-        assert!(!version_is_pinned(
-            "Hermes Agent v0.18.2 (2026.7.7.2) · upstream 4a69a662"
-        ));
     }
 }

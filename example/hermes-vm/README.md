@@ -55,9 +55,10 @@ hearthctl image build --name hermes-vm --dockerfile example/hermes-vm/Dockerfile
   --build-arg HERMES_COMMIT=2ea39daeb1f675d72e5c21c9400f2d58d7e6d71a
 ```
 
-> **Tested commit.** The Hearth adapter pins Hermes `0.18.2`, source commit
-> `2ea39dae`, with ACP protocol v1. Bump the image commit and adapter contract
-> together. The build checks both `hermes --version` and `hermes acp --check`,
+> **Tested commit.** The Hearth adapter was tested with Hermes `0.18.2` and ACP
+> protocol v1. The image example pins tested source commit `2ea39dae` for a
+> repeatable build, but the run-time probe does not gate on the release or SHA.
+> The build checks both `hermes --version` and `hermes acp --check`,
 > so a moved launcher or missing ACP dependency fails here, not on first boot.
 
 `image build` runs a build-time linter over the unpacked rootfs before it makes

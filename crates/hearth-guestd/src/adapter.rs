@@ -74,15 +74,15 @@ pub struct RunOutput {
     pub native_thread: Option<String>,
 }
 
-/// One agent CLI. Adapters couple to CLI stream formats, which drift, so the
-/// CLI is pinned by version in the image and the adapter refuses (loudly, at
-/// boot report) a version it does not know (§2.2).
+/// One agent CLI. Adapters couple to CLI stream formats, which drift, so each
+/// adapter checks the parts of its contract that it needs and refuses a bad
+/// match in the boot report (§2.2).
 #[async_trait]
 pub trait Adapter: Send + Sync {
     fn name(&self) -> &str;
 
     /// Probe the CLI and report its version, or an error explaining why this
-    /// adapter refuses to drive it. Surfaces in the boot report (§2.1).
+    /// adapter refuses to drive it. This appears in the boot report (§2.1).
     async fn probe(&self) -> Result<String>;
 
     /// Start a new run. `thread_id` is Hearth's durable thread identity (used

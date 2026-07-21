@@ -1,4 +1,4 @@
-//! Deterministic stand-in for Hermes's pinned ACP JSON-RPC contract.
+//! Deterministic stand-in for Hermes's ACP JSON-RPC contract.
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -10,7 +10,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--version") {
         println!(
-            "Hermes Agent v0.18.2 (fake) · upstream 4a69a662 · local 2ea39dae (+1 carried commit)"
+            "Hermes Agent v99.0.0 (fake) · upstream 4a69a662 · local 2ea39dae (+1 carried commit)"
         );
         return;
     }
@@ -41,7 +41,7 @@ fn main() {
                 id,
                 json!({
                     "protocolVersion": 1,
-                    "agentInfo": { "name": "hermes-agent", "version": "0.18.2" },
+                    "agentInfo": { "name": "hermes-agent", "version": "99.0.0" },
                     "agentCapabilities": {
                         "loadSession": true,
                         "sessionCapabilities": { "resume": {} },

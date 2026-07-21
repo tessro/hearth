@@ -126,8 +126,8 @@ in-process acceptance harness:
   `d5d060ef765f5c8a97dabbb8752ba7ea003d89db8563bafe1663d9d931e3afc4`),
   leaving the long-running VM and original image untouched. That fresh install's
   version banner labels the pinned checkout as `local 2ea39dae` rather than
-  `upstream 2ea39dae`; the adapter now accepts either real banner form while
-  still requiring the exact version and source pin. The imported qcow2 predates
+  `upstream 2ea39dae`; the adapter records this banner but gates on ACP v1 and
+  the Hermes agent identity, not the release or source revision. The imported qcow2 predates
   that final probe compatibility fix and must be rebuilt before it is used as a
   fresh-image acceptance artifact.
 - A rebuilt host agentd and the existing disposable guest completed the

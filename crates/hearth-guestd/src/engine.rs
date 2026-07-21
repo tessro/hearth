@@ -167,8 +167,8 @@ impl Engine {
         names
     }
 
-    /// Probe one adapter for its boot report (§2.1). A refusal (unpinned CLI
-    /// version) surfaces as the adapter's error, loudly, exactly as §2.2 wants.
+    /// Probe one adapter for its boot report (§2.1). A refusal appears as the
+    /// adapter's error, loudly, exactly as §2.2 wants.
     pub async fn probe_agent(&self, name: &str) -> Result<String> {
         let adapter = self
             .adapters

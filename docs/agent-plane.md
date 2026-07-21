@@ -194,17 +194,17 @@ same cursor/replay path used after completion.
 |---|---|---|---|
 | codex (**first**, Phase 2) | `codex app-server`: JSONL/stdio; threads, turns, streamed items, server-initiated approvals; version-matched JSON schemas | thread ↔ `thread_id`, turn ↔ `run`, streamed items → events | server-initiated approval requests → task `awaiting_input` |
 | claude (second, Phase 5) | headless `-p` with `stream-json` in/out, resumable sessions | session ↔ `thread_id`, one `-p` invocation ↔ `run` | permission prompts via its MCP permission-prompt hook → `awaiting_input` |
-| hermes (Phase 6) | pinned `hermes acp`: ACP v1 JSON-RPC/stdio; `session/new`/`load`/`prompt`, streamed `session/update`, server-initiated `session/request_permission` | ACP session ↔ `thread_id`, prompt ↔ `run`, message/tool updates → AG-UI events; the per-session ACP MCP server launches the §2.4 shim with Hearth's thread id | permission request → task `awaiting_input`; guestd parks the live ACP process and `task.respond` answers the exact JSON-RPC request |
+| hermes (Phase 6) | `hermes acp`: ACP v1 JSON-RPC/stdio; `session/new`/`load`/`prompt`, streamed `session/update`, server-initiated `session/request_permission` | ACP session ↔ `thread_id`, prompt ↔ `run`, message/tool updates → AG-UI events; the per-session ACP MCP server launches the §2.4 shim with Hearth's thread id | permission request → task `awaiting_input`; guestd parks the live ACP process and `task.respond` answers the exact JSON-RPC request |
 
 Codex was implemented first because app-server has generatable schemas. The
-current deployable path is Hermes ACP v1 at version `0.18.2`, source commit
-`2ea39dae`; presentation-oriented `hermes chat -q` output is deliberately not
-an adapter contract. Adapters couple to native protocols, which drift. Rule
-(workaround #13's lesson): agent CLIs are **pinned by version, protocol, and
-source revision in the image**, the manifest records adapter compatibility,
-and guestd refuses (loudly, at boot report) to adapt a CLI version it doesn't
-know. An image registers only adapters for CLIs it actually configures; the
-Hermes image therefore does not advertise codex or claude.
+current deployable path is Hermes ACP v1, tested at version `0.18.2` and source
+commit `2ea39dae`; presentation-oriented `hermes chat -q` output is
+deliberately not an adapter contract. Adapters couple to native protocols,
+which drift. Hermes checks the ACP protocol and agent identity, then checks
+message shapes as it uses them. Its release banner is status data, not a gate.
+The image may pin a source revision for repeatable builds. An image registers
+only adapters for CLIs it actually configures; the Hermes image therefore does
+not advertise codex or claude.
 
 ### 2.3 Turn queue and wake-up injection
 
@@ -467,7 +467,7 @@ precedes the run ending `interrupted`), `hearth.session_name` (the agent
 replaced the thread's display name), `hearth.state` (task state transitions),
 `hearth.truncation`.
 
-Representative mapping (adapters own the details; pinned per CLI version):
+Representative mapping (each adapter owns its contract checks):
 
 | CLI stream item | AG-UI |
 |---|---|
@@ -650,7 +650,7 @@ Assume any guest can be adversarial (they run autonomous code executors).
 | UI disconnect mid-run | SSE drop | task unaffected; reattach with cursor, exact replay |
 | initiator VM down at wake-up time | inject.turn fails | outbox entry waits in callee; agentd retries on initiator's next boot report (§7.2) |
 | duplicate wake-up delivery | retry after partial failure | initiator dedup set by `delivery_id`; ack-after-inject ordering (§7.2) |
-| CLI version drift breaks an adapter | guestd refuses at boot report | visible in `hearthctl status`; image rebuild with pinned CLI |
+| CLI protocol drift breaks an adapter | boot probe or run fails its protocol and message-shape checks | visible in `hearthctl status` or the task error; update the image or adapter |
 | Guest floods event log | segment caps | segment rotation + truncation marker (§3.3) |
 
 SSH recovery access (mandatory since e4880b5) remains the rescue path when

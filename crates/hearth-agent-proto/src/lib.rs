@@ -121,7 +121,7 @@ pub struct BootReport {
 }
 
 /// One agent CLI guestd can (or refuses to) adapt. `ok: false` with an error is
-/// the loud boot-report refusal for an unpinned CLI version (§2.2).
+/// the loud boot-report refusal for an incompatible CLI (§2.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDecl {
     pub name: String,
