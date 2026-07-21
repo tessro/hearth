@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hearth agent-VM acceptance test (REFACTOR_PROPOSAL.md §5): build the shared
-# vm-base plus the example/agent-vm image, spawn one VM, and assert the whole
+# Hearth agent-VM acceptance test: build the shared vm-base plus the
+# example/agent-vm image, spawn one VM, and assert the whole
 # contract that this class of bug hid behind — a reported address, real
 # reachability, MAC == allocation, a boot-time budget, stop/start persistence,
 # and a clean destroy.

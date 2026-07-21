@@ -1,5 +1,5 @@
-//! Offline per-VM provisioning (REFACTOR_PROPOSAL.md §3). The daemon mounts a
-//! VM's raw disk once at create time and applies a [`ProvisionPlan`]:
+//! Offline per-VM provisioning. The daemon mounts a VM's raw disk once at
+//! create time and applies a [`ProvisionPlan`]:
 //! write secret/config files, reset machine-id and SSH host keys, set hostname.
 //!
 //! Plan *construction* ([`ProvisionPlan::from_provision`]) is a pure function,

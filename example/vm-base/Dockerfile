@@ -11,7 +11,7 @@
 #
 # Everything here was learned the hard way during the 2026-07 Hermes bring-up:
 # each line prevents a boot failure that cost a full build+boot cycle (~10 min)
-# to diagnose from the serial console. See REFACTOR_PROPOSAL.md §2.
+# to diagnose from the serial console.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

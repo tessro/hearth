@@ -6,7 +6,7 @@
 //! This is the client-side consumer of the daemon's existing `logs --follow`
 //! stream (`Verb::Logs` with `follow = true`). It replaces the three copy-pasted
 //! `wait_for_log()` bash loops in the acceptance scripts with one first-class
-//! readiness signal (REFACTOR_PROPOSAL.md §5). The daemon protocol is unchanged.
+//! readiness signal. The daemon protocol is unchanged.
 
 use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8Path;

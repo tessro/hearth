@@ -82,9 +82,9 @@ pub trait Host: Send + Sync {
     async fn delete_tap(&self, tap: &str) -> Result<()>;
     /// Apply an nftables ruleset via `nft -f -` (stdin). The daemon feeds a full
     /// `add table` + `flush table` + rules transaction, so this is an idempotent
-    /// rewrite of the `hearth_nat` table (REFACTOR_PROPOSAL.md §4.3).
+    /// rewrite of the `hearth_nat` table.
     async fn nft_apply(&self, ruleset: &str) -> Result<()>;
-    /// SIGHUP dnsmasq so it re-reads its drop-in dir (REFACTOR_PROPOSAL.md §4.2).
+    /// SIGHUP dnsmasq so it re-reads its drop-in dir.
     /// Errs if the unit does not exist; callers warn-and-continue.
     async fn reload_dnsmasq(&self) -> Result<()>;
 }

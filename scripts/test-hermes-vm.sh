@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hermes multi-VM acceptance test (REFACTOR_PROPOSAL.md §5 + §10): spawn TWO
-# VMs — hermes-a and hermes-b — from the one hermes-vm image, each provisioned
+# Hermes multi-VM acceptance test: spawn TWO VMs — hermes-a and hermes-b — from
+# the one hermes-vm image, each provisioned
 # with its OWN secret env file, and assert they run simultaneously with distinct
 # addresses, MACs, and hostnames, and that curl reaches each on :9119. This is
-# the story §3/§10 exist for: two services from one immutable image sharing
-# nothing but that image.
+# two services from one immutable image share nothing but that image.
 #
 # The two env files are generated from hermes.env.example (below). The real
 # example/hermes-vm/hermes.env is NEVER read or touched.

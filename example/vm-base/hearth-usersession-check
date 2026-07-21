@@ -1,6 +1,6 @@
 #!/bin/sh
-# hearth-usersession-check — boot-time proof (REFACTOR_PROPOSAL.md §2 voice: every
-# line names the failure it catches) that the `agent` user's systemd *user*
+# hearth-usersession-check — boot-time proof that the `agent` user's systemd
+# *user*
 # session works before any login. A field agent hit a Hearth VM where
 # `systemctl --user`/`loginctl` were dead because logind, the session bus,
 # XDG_RUNTIME_DIR and cgroup delegation were all absent; this turns that silent

@@ -1,8 +1,8 @@
 # Hearth Agent Plane — Design Proposal
 
 Status: **proposed, revised** (2026-07-14). Builds on `ARCHITECTURE.md`
-(machine plane, unchanged) and `REFACTOR_PROPOSAL.md` (cited by workaround
-number). Nothing here ships until Phase 1 of §11 is accepted.
+(machine plane, unchanged). Nothing here ships until Phase 1 of §11 is
+accepted.
 
 ### Revisions (2026-07-14, after external review)
 
@@ -168,8 +168,8 @@ On boot and on change, guestd connects out to `CID 2 port 1025` (lands on
   fallback (`resolved_address`, `crates/hearthd/src/lib.rs`); a divergence
   between lease and report is surfaced in `status` as a warning, and the
   lease always wins.
-- `status` additionally shows guestd/adapter versions (surfaces skew, §6 of
-  `REFACTOR_PROPOSAL.md`) and heartbeat `last_seen`.
+- `status` additionally shows guestd/adapter versions to surface skew and
+  heartbeat `last_seen`.
 - The `restored` flag is set when hearthd told guestd (via this channel's
   handshake) that the boot follows a `restore` — used for cursor
   invalidation (§3.4).

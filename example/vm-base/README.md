@@ -9,8 +9,7 @@ mask, `STOPSIGNAL SIGRTMIN+3`, `openssh-server`, and a one-shot unit that runs
 `ssh-keygen -A` before sshd when host keys are absent.
 
 Every line exists because its absence cost a full build+boot cycle to diagnose
-from the serial console during the 2026-07 Hermes bring-up. See
-`REFACTOR_PROPOSAL.md` §2.
+from the serial console during the 2026-07 Hermes bring-up.
 
 ## Build it
 

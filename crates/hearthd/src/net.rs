@@ -1,5 +1,5 @@
-//! Managed addresses, static leases, and managed publish (REFACTOR_PROPOSAL.md
-//! §4). Everything in this module is a pure function of its inputs so it can be
+//! Managed addresses, static leases, and managed publish. Everything in this
+//! module is a pure function of its inputs so it can be
 //! unit-tested without dnsmasq, nftables, or a booted VM. The daemon in `lib.rs`
 //! does the IO (read the lease file, write drop-ins, shell out to `nft`) and
 //! feeds the results through these functions.

@@ -60,7 +60,7 @@ pub struct Config {
     #[arg(long, env = "HEARTH_BRIDGE", default_value = "hearth0")]
     pub bridge: String,
     /// dnsmasq lease file, joined on the service MAC to report guest addresses
-    /// (REFACTOR_PROPOSAL.md §4.1). A missing/unreadable file is not an error —
+    /// to report guest addresses. A missing or unreadable file is not an error;
     /// the address is simply reported as null.
     #[arg(
         long,
@@ -69,8 +69,8 @@ pub struct Config {
     )]
     pub lease_file: Utf8PathBuf,
     /// dnsmasq drop-in dir where Hearth writes `<id>.conf` static-lease
-    /// reservations (REFACTOR_PROPOSAL.md §4.2). If it is absent (a dev host
-    /// without a Hearth-managed dnsmasq), reservations are skipped-with-warn and
+    /// reservations. If it is absent (a dev host without a Hearth-managed
+    /// dnsmasq), reservations are skipped with a warning and
     /// VMs fall back to dynamic DHCP.
     #[arg(
         long,

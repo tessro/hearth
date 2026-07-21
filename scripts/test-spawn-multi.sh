@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generic multi-VM spawn test (REFACTOR_PROPOSAL.md §5 + §10). Spawns TWO VMs
-# from the one example/agent-vm image and asserts they run simultaneously with
+# Generic multi-VM spawn test. Spawns TWO VMs from the one example/agent-vm
+# image and asserts they run simultaneously with
 # distinct addresses, MACs, and hostnames, and that each is reachable. Unlike
 # test-hermes-vm.sh this needs no secrets and no external supply chain, so it is
 # the fast `hearthctl spawn` smoke for the N-from-one-template contract.

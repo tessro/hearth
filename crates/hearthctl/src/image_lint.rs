@@ -1,4 +1,4 @@
-//! Build-time rootfs linter (REFACTOR_PROPOSAL.md §2.2).
+//! Build-time rootfs linter.
 //!
 //! Three of the 2026-07 bring-up's four boot failures were image-content bugs
 //! that only surfaced at runtime — one boot each (~10 min to build + boot +

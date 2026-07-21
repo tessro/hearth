@@ -1,8 +1,7 @@
 //! `hearthctl spawn`: one command from a built template (or straight from a
 //! Dockerfile) to a running, individually-provisioned VM. Pure CLI-side
-//! composition of the existing `image build` → `create` → `start` verbs
-//! (REFACTOR_PROPOSAL.md §10). The provision and publish arg shapes here mirror
-//! exactly what `hearthd` create() parses.
+//! composition of the existing `image build` → `create` → `start` verbs. The
+//! provision and publish arg shapes here mirror what `hearthd` create() parses.
 
 use crate::{client::hearth_request, image_build, oci::BuildNetwork};
 use anyhow::{anyhow, bail, Context, Result};

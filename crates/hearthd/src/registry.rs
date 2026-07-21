@@ -35,8 +35,8 @@ pub struct Service {
     // (before the tables below) so `toml::to_string_pretty` serializes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<String>,
-    // Managed host->guest port forwards (REFACTOR_PROPOSAL.md §4.3). An array of
-    // tables `[[publish]]`; declared among the other tables (after every scalar)
+    // Managed host->guest port forwards. An array of tables `[[publish]]`;
+    // declared among the other tables (after every scalar)
     // so `toml::to_string_pretty` serializes it. Empty is skipped so a service
     // with no publishes stays scalar-clean.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -47,9 +47,9 @@ pub struct Service {
     pub restart: RestartPolicy,
 }
 
-/// A managed host->guest port forward (REFACTOR_PROPOSAL.md §4.3). This is VM
-/// port-forwarding owned by the registry, not Docker `-p` emulation: hearthd
-/// renders every service's publishes into the `hearth_nat` nftables table.
+/// A managed host->guest port forward. The registry owns this VM forwarding;
+/// hearthd renders every service's publishes into the `hearth_nat` nftables
+/// table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Publish {
     // Management handle so `publish rm` can target one forward by name. Optional
@@ -115,8 +115,8 @@ fn default_protocol() -> String {
     "tcp".to_string()
 }
 
-/// Per-service offline customization applied to a VM's disk at
-/// create time (see REFACTOR_PROPOSAL.md §3). The whole section is optional.
+/// Per-service offline customization applied to a VM's disk at create time.
+/// The whole section is optional.
 /// Scalar fields are declared before `files` so `toml::to_string_pretty` (which
 /// rejects a scalar after an array-of-tables) can serialize it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,8 +299,8 @@ pub struct Allocations {
     pub vsock_cids: BTreeMap<String, u32>,
     #[serde(default)]
     pub macs: BTreeMap<String, String>,
-    // Static-lease IPs (REFACTOR_PROPOSAL.md §4.2), allocated from the config's
-    // static slice, sitting next to CID and MAC where they belong. Absent for a
+    // Static-lease IPs, allocated from the config's static slice and stored next
+    // to CID and MAC. Absent for a
     // service means no static reservation (dynamic DHCP only).
     #[serde(default)]
     pub ips: BTreeMap<String, String>,
