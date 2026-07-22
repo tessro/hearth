@@ -81,6 +81,10 @@ pub trait Host: Send + Sync {
     /// PUT with no request body. CHV's bare action endpoints (`vm.pause`,
     /// `vm.resume`) return HTTP 400 when a body — even `{}` — is present.
     async fn chv_put_empty(&self, socket: &Utf8Path, path: &str) -> Result<Value>;
+    /// Copy a VM disk image byte-for-byte. Prefers a filesystem reflink so the
+    /// paused window stays short on cloning-capable hosts (XFS, btrfs, recent
+    /// ZFS); elsewhere this is a full copy and the VM stays paused for it.
+    async fn copy_disk(&self, src: &Utf8Path, dest: &Utf8Path) -> Result<()>;
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool>;
     async fn delete_tap(&self, tap: &str) -> Result<()>;
     /// Apply an nftables ruleset via `nft -f -` (stdin). The daemon feeds a full
@@ -217,6 +221,17 @@ impl Host for RealHost {
 
     async fn chv_put_empty(&self, socket: &Utf8Path, path: &str) -> Result<Value> {
         chv_request(socket, "PUT", path, None).await
+    }
+
+    async fn copy_disk(&self, src: &Utf8Path, dest: &Utf8Path) -> Result<()> {
+        let mut cmd = Command::new("cp");
+        cmd.args([
+            "--reflink=auto",
+            "--sparse=always",
+            src.as_str(),
+            dest.as_str(),
+        ]);
+        run_status(cmd, "cp disk image").await
     }
 
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {

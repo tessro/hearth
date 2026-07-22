@@ -400,10 +400,16 @@ access would let a future session prove it.
    *Remaining (new, narrower):* CHV's `vm.snapshot` captures memory/device
    state only, so resuming it against a rootfs that advanced after the
    snapshot wedged the guest (dead net/vsock; rotation completed on the
-   recovery boot, which still carried the pending-restore mark). A
-   production-grade restore must capture a disk-consistent image while the VM
-   is paused (e.g., a qcow2 snapshot alongside the CHV state) and restore
-   both; until then restore is only sound when the disk has not diverged.
+   recovery boot, which still carried the pending-restore mark).
+   *Implemented 2026-07-22:* `snapshot` now copies the boot disk into the
+   snapshot directory (`disk.qcow2`, `cp --reflink=auto` so cloning-capable
+   filesystems pay nothing) inside the same paused window as the memory dump,
+   and `restore` copies it back over the live disk before relaunching CHV —
+   refusing disk-less snapshots with `snapshot.no_disk` *before* stopping the
+   running VM. Unit-tested (pause < dump < disk < resume ordering, resume on
+   either failure, early refusal). *Still to verify live:* one
+   snapshot → mutate → restore cycle proving the restored guest comes back
+   healthy and the mutation is genuinely rewound.
 
 6. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only

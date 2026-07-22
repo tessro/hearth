@@ -31,6 +31,8 @@ pub struct FakeState {
     /// call), so error-path ordering like resume-after-failed-snapshot is
     /// testable.
     pub chv_fail: Option<String>,
+    /// When true, `copy_disk` fails after recording the call.
+    pub copy_fail: bool,
 }
 
 impl FakeHost {
@@ -165,6 +167,15 @@ impl Host for FakeHost {
             return Err(anyhow::anyhow!("injected chv failure for {path}"));
         }
         Ok(json!({}))
+    }
+
+    async fn copy_disk(&self, src: &Utf8Path, dest: &Utf8Path) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.calls.push(format!("copy-disk {src} -> {dest}"));
+        if state.copy_fail {
+            return Err(anyhow::anyhow!("injected disk copy failure"));
+        }
+        Ok(())
     }
 
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {
