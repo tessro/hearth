@@ -1,7 +1,8 @@
 # Agent Plane — Verification Report
 
 Status: **implemented and self-verified, including a live KVM guest**
-(2026-07-18). Companion to
+(2026-07-18; gaps 2 and 4 closed live on the NixOS-module install 2026-07-21).
+Companion to
 `docs/agent-plane.md`. Records what the acceptance tests actually exercise, and
 — honestly — what they cannot, plus how a future session could close each gap.
 
@@ -182,6 +183,81 @@ in-process acceptance harness:
 13. Live host instructions explicitly build runnable release binaries; release
     tests alone can leave a stale top-level daemon executable on disk.
 
+## Verified live on the NixOS module (2026-07-21)
+
+The host now runs Hearth from the flake's NixOS module (`services.hearth` +
+`services.hearth.agentPlane`), with `hearth.service` and `hearth-agentd.service`
+as nix-store units. This pass closed remaining gaps 2 and 4 and found one new
+production bug.
+
+Gap 2 — fresh-image rebuild, authentication, and follow-up (**closed**):
+
+- The rebuilt image `hermes-agent-plane-v2` bakes Hermes **0.19.0** (banner
+  `Hermes Agent v0.19.0 (2026.7.20) · upstream 693d3909 (ACP v1)`) and the tip
+  guestd (`0.0.1+5fadb94`). The `demo` VM boots it directly; provider
+  configuration arrives declaratively as a provisioned
+  `/home/agent/.hermes/.env` (`--provision-file`), superseding the interactive
+  setup the earlier pass deferred. No credential was read or copied.
+- After a clean boot (fresh boot report, `boot_config: current`,
+  `static_lease: true`), task `01KY41MWA04S9DS848A837NJA9` ran through the
+  production path — hearthd FD broker, in-band `CONNECT 1027`, protocol-v1
+  hello, real ACP session — and completed with summary `HEARTH_V2_OK`,
+  `stopReason: end_turn`, and the full durable AG-UI sequence.
+- A same-thread `followup` on the completed task started run
+  `01KY41NGSH5F17NHERA1079B2X`, which answered `FOLLOWUP:HEARTH_V2_OK`;
+  Hermes's `cachedReadTokens: 15040` shows the prior conversation was actually
+  reloaded, not restarted. The image is self-contained.
+
+Gap 4 — live systemd hardening + `LoadCredential` (**closed**, one proof
+delegated):
+
+- The module declares the `hearth-agent` user (uid 992, group `hearth`) and the
+  hardened unit: `User=hearth-agent`, `Group=hearth`,
+  `LoadCredential=` for `http-token` and `ref-key` from root-only `0400` files
+  under `/run/secrets`, `RuntimeDirectory=hearth-agentd` `0750`,
+  `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, and the
+  rest of the checked-in hardening block.
+- `LoadCredential` startup is proven by the running daemon itself: it serves
+  the AG-UI endpoint and mints signed task refs, both of which require the two
+  credentials, and has run for days across restarts.
+- `systemd-analyze security hearth-agentd` scores **6.7 MEDIUM**; the flagged
+  `UMask=` is the deliberate `0007` that makes the control socket
+  group-usable. (`hearth.service` scores 9.6 as expected for a root VM
+  manager; hardening it is out of scope here.)
+- `/run/hearth-agentd/agent.sock` is `0660 hearth-agent:hearth`, and a
+  `hearth`-group operator (uid 1000) drove the entire `hearthctl agent`
+  surface over it. The AG-UI HTTP endpoint returns 401 without or with a wrong
+  bearer token.
+- hearthd's audit log shows uid 992 exercising exactly the allowlisted
+  broker/discovery verbs (`agent-endpoints`, `guest-connect`), and
+  `/etc/hearth/verb-policy.toml` carries the explicit `hearth-agent` rule that
+  omits every machine life-cycle verb. The denial itself is proven live too:
+  `sudo -u hearth-agent hearthctl destroy no-such-vm` returned
+  `verb.denied: peer is not authorized for verb destroy`, and hearthd's audit
+  log recorded `caller_uid=992 verb=destroy allowed=false` — rejected at the
+  policy gate before any target lookup.
+
+New production bug found (fixed in-tree, deploy pending):
+
+- **`RuntimeDirectory=hearth` wiped CHV's bound vsock sockets on every daemon
+  restart.** systemd removes the runtime directory when the unit stops
+  (`RuntimeDirectoryPreserve` defaults to `no`), but the Cloud Hypervisor
+  processes outlive the daemon and cannot re-bind
+  `/run/hearth/vsock/<id>.sock`. After a hearthd restart, guest→host channels
+  (boot report, heartbeat, upcalls) recover — hearthd re-binds those listeners
+  — while every **host→guest** `guest-connect` fails with `ENOENT` until the
+  VM itself restarts. So `status` looked healthy while `agent ls` showed no
+  adapters and every task start would have failed: exactly the half-broken
+  state the earlier restart test (pre-module, no `RuntimeDirectory`) could not
+  see. Fixed with `RuntimeDirectoryPreserve=yes` in both the packaged unit and
+  the NixOS module; restarting the `demo` VM confirmed the diagnosis
+  end-to-end. Three smaller fixes fell out of the same investigation:
+  `hearthctl agent ls` rendered the NAME column from a nonexistent `name`
+  field (agentd sends `hostname`); agentd's `list_agents` swallowed relay
+  errors silently (now logged at WARN); and hearthd's wire errors dropped the
+  underlying cause (`err.to_string()` → `{err:#}`), which had reduced the
+  `guest-connect` failure to a context line with no errno.
+
 ## Remaining gaps — and how to close each
 
 These are genuine gaps, not hand-waves. Each says what is unproven and what
@@ -195,18 +271,13 @@ access would let a future session prove it.
    Authentication must then be provisioned for those CLIs. None of this blocks
    the Hermes-only vertical.
 
-2. **Fresh-image rebuild, authentication, and follow-up.** The ACP Dockerfile
-   build, direct ACP prompt, production broker/hello path, and authenticated
-   full task now pass. Rebuild the imported image once more with the final
-   source-pin banner compatibility fix; do not treat the recorded qcow2 hash as
-   the final artifact.
-   The authenticated task used the existing disposable VM with the new static
-   guestd installed in place so user-owned provider setup remained untouched.
-   Boot `hermes-agent-plane-acp`, perform setup interactively in that fresh VM,
-   then repeat the task and a same-session wake-up/follow-up before calling the
-   image fully self-contained. The existing `hermes-a` predates agent-plane
-   vm-base and remains running and unmodified; do not extract or silently copy
-   its credentials.
+2. **Fresh-image rebuild, authentication, and follow-up.** **Closed
+   2026-07-21** — see "Verified live on the NixOS module": the rebuilt
+   `hermes-agent-plane-v2` (Hermes 0.19.0 ACP) booted self-contained with a
+   provisioned `~/.hermes/.env`, completed a real task and a same-thread
+   follow-up through the production broker path. The older
+   `hermes-agent-plane`/`-acp` images are superseded. `hermes-a` remains
+   running and unmodified.
 
 3. **Hermes ACP approval expiry/restart.** The adapter preserves the exact ACP
    process and request across `awaiting_input`, and the fake-protocol E2E proves
@@ -225,11 +296,12 @@ access would let a future session prove it.
    user-matched verb policy, which takes priority over the broad `hearth` group
    rule and limits agentd to broker/discovery verbs. Portable and NixOS setup
    examples are in `docs/operations.md`.
-   *Still to verify live:* declare the `hearth-agent` user and credentials on
-   NixOS, launch the unit, prove `LoadCredential` startup and broker access,
-   inspect `systemd-analyze security hearth-agentd`, and confirm the agentd uid
-   is denied machine-plane life-cycle verbs while a `hearth` operator can open
-   `/run/hearth-agentd/agent.sock`.
+   **Closed 2026-07-21** — see "Verified live on the NixOS module": the module
+   declares the user and credentials, `LoadCredential` startup and broker
+   access are proven on the running daemon, `systemd-analyze security` scores
+   6.7 MEDIUM, a `hearth` operator drove the agent socket, and a live
+   `destroy` attempt as the `hearth-agent` uid was denied at the policy gate
+   (`verb.denied`, audited `allowed=false`). Nothing remains open here.
 
 5. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
    rotation is unit-tested (`store.rs`) and the restore→`ReportAck{restored:
@@ -264,7 +336,9 @@ access would let a future session prove it.
   its requested static lease drop-in and the live agent VM uses dnsmasq's
   dynamic lease instead. Connectivity works, but the declarative NixOS network
   integration should create/wire the drop-in before static addressing can be
-  claimed.
+  claimed. *Resolved by the NixOS module (2026-07-21): the module wires
+  `HEARTH_DNSMASQ_DROPIN_DIR`, and the rebooted `demo` VM reports
+  `static_lease: true`.*
 - A legacy image at `/var/lib/hearth/images/debian-13-generic-amd64` has no
   `.hearth.toml`. It blocked the installed daemon's entire `image ls` and the
   old composite `spawn` preflight. Source now skips invalid entries with a
