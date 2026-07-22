@@ -164,6 +164,11 @@ in
           RestartSec = 2;
           RuntimeDirectory = "hearth";
           RuntimeDirectoryMode = "0770";
+          # Cloud Hypervisor binds each VM's hybrid-vsock socket under
+          # /run/hearth and outlives daemon restarts; without preserve, a
+          # restart deletes those bound sockets and every host->guest
+          # agent-plane connect fails until the VM reboots.
+          RuntimeDirectoryPreserve = "yes";
           StateDirectory = "hearth";
           LogsDirectory = "hearth";
           TimeoutStopSec = 120;
