@@ -158,6 +158,15 @@ impl Host for FakeHost {
         Ok(json!({}))
     }
 
+    async fn chv_put_empty(&self, _socket: &Utf8Path, path: &str) -> Result<Value> {
+        let mut state = self.state.lock().unwrap();
+        state.calls.push(format!("chv-put {path} (empty)"));
+        if state.chv_fail.as_deref() == Some(path) {
+            return Err(anyhow::anyhow!("injected chv failure for {path}"));
+        }
+        Ok(json!({}))
+    }
+
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {
         self.state
             .lock()

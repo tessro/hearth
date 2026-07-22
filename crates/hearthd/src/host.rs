@@ -78,6 +78,9 @@ pub trait Host: Send + Sync {
     ) -> Result<()>;
     async fn chv_get(&self, socket: &Utf8Path, path: &str) -> Result<Value>;
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value>;
+    /// PUT with no request body. CHV's bare action endpoints (`vm.pause`,
+    /// `vm.resume`) return HTTP 400 when a body — even `{}` — is present.
+    async fn chv_put_empty(&self, socket: &Utf8Path, path: &str) -> Result<Value>;
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool>;
     async fn delete_tap(&self, tap: &str) -> Result<()>;
     /// Apply an nftables ruleset via `nft -f -` (stdin). The daemon feeds a full
@@ -210,6 +213,10 @@ impl Host for RealHost {
 
     async fn chv_put(&self, socket: &Utf8Path, path: &str, body: Value) -> Result<Value> {
         chv_request(socket, "PUT", path, Some(body)).await
+    }
+
+    async fn chv_put_empty(&self, socket: &Utf8Path, path: &str) -> Result<Value> {
+        chv_request(socket, "PUT", path, None).await
     }
 
     async fn setup_tap(&self, bridge: &str, tap: &str) -> Result<bool> {
@@ -387,6 +394,10 @@ pub fn cloud_hypervisor_restore_argv(
         "cloud-hypervisor".to_string(),
         "--api-socket".to_string(),
         cfg.vm_socket(&service.id).to_string(),
+        // CHV requires a boot payload argument even under --restore (the
+        // restored state supplies the actual memory/device contents).
+        "--kernel".to_string(),
+        cfg.guest_kernel.to_string(),
         "--restore".to_string(),
         format!("source_url=file://{snapshot_dir},resume=true"),
         "--serial".to_string(),

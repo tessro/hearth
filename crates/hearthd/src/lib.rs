@@ -920,7 +920,7 @@ impl<H: Host + 'static> Daemon<H> {
         // resume is attempted even when the snapshot fails — a paused guest
         // must never be the residue of a failed snapshot.
         self.host
-            .chv_put(&socket, "/api/v1/vm.pause", json!({}))
+            .chv_put_empty(&socket, "/api/v1/vm.pause")
             .await
             .context("pause VM for snapshot")?;
         let snapshot = self
@@ -931,10 +931,7 @@ impl<H: Host + 'static> Daemon<H> {
                 json!({ "destination_url": format!("file://{dest}") }),
             )
             .await;
-        let resume = self
-            .host
-            .chv_put(&socket, "/api/v1/vm.resume", json!({}))
-            .await;
+        let resume = self.host.chv_put_empty(&socket, "/api/v1/vm.resume").await;
         snapshot.context("snapshot paused VM")?;
         resume.context("resume VM after snapshot")?;
         Ok(json!({ "id": id, "hostname": hostname, "tag": tag, "path": dest }))
@@ -3801,7 +3798,7 @@ cwd = "/home/exedev"
         // CHV refuses a running-VM snapshot: pause, dump, resume, in order.
         let pause = calls
             .iter()
-            .position(|c| c == "chv-put /api/v1/vm.pause {}")
+            .position(|c| c == "chv-put /api/v1/vm.pause (empty)")
             .expect("vm.pause called");
         let snapshot = calls
             .iter()
@@ -3814,7 +3811,7 @@ cwd = "/home/exedev"
             .expect("vm.snapshot called");
         let resume = calls
             .iter()
-            .position(|c| c == "chv-put /api/v1/vm.resume {}")
+            .position(|c| c == "chv-put /api/v1/vm.resume (empty)")
             .expect("vm.resume called");
         assert!(pause < snapshot && snapshot < resume);
 
@@ -3859,7 +3856,7 @@ cwd = "/home/exedev"
             .expect("vm.snapshot attempted");
         let resume = calls
             .iter()
-            .position(|c| c == "chv-put /api/v1/vm.resume {}")
+            .position(|c| c == "chv-put /api/v1/vm.resume (empty)")
             .expect("vm.resume still called");
         assert!(snapshot < resume);
     }
