@@ -915,13 +915,28 @@ impl<H: Host + 'static> Daemon<H> {
             .unwrap_or_else(|| Utc::now().format("%Y%m%d%H%M%S").to_string());
         let dest = self.cfg.snapshot_dir(&id, &tag);
         fs::create_dir_all(&dest).await?;
+        let socket = self.cfg.vm_socket(&id);
+        // CHV refuses to snapshot a running VM, so pause around the dump. The
+        // resume is attempted even when the snapshot fails — a paused guest
+        // must never be the residue of a failed snapshot.
         self.host
+            .chv_put(&socket, "/api/v1/vm.pause", json!({}))
+            .await
+            .context("pause VM for snapshot")?;
+        let snapshot = self
+            .host
             .chv_put(
-                &self.cfg.vm_socket(&id),
+                &socket,
                 "/api/v1/vm.snapshot",
                 json!({ "destination_url": format!("file://{dest}") }),
             )
-            .await?;
+            .await;
+        let resume = self
+            .host
+            .chv_put(&socket, "/api/v1/vm.resume", json!({}))
+            .await;
+        snapshot.context("snapshot paused VM")?;
+        resume.context("resume VM after snapshot")?;
         Ok(json!({ "id": id, "hostname": hostname, "tag": tag, "path": dest }))
     }
 
@@ -3783,12 +3798,25 @@ cwd = "/home/exedev"
         assert!(responses[0].ok);
         assert!(cfg.snapshot_dir(&test_id("mail"), "before").is_dir());
         let calls = state.lock().unwrap().calls.clone();
-        assert!(calls.iter().any(|call| {
-            call == &format!(
-                "chv-put /api/v1/vm.snapshot {{\"destination_url\":\"file://{}\"}}",
-                cfg.snapshot_dir(&test_id("mail"), "before")
-            )
-        }));
+        // CHV refuses a running-VM snapshot: pause, dump, resume, in order.
+        let pause = calls
+            .iter()
+            .position(|c| c == "chv-put /api/v1/vm.pause {}")
+            .expect("vm.pause called");
+        let snapshot = calls
+            .iter()
+            .position(|call| {
+                call == &format!(
+                    "chv-put /api/v1/vm.snapshot {{\"destination_url\":\"file://{}\"}}",
+                    cfg.snapshot_dir(&test_id("mail"), "before")
+                )
+            })
+            .expect("vm.snapshot called");
+        let resume = calls
+            .iter()
+            .position(|c| c == "chv-put /api/v1/vm.resume {}")
+            .expect("vm.resume called");
+        assert!(pause < snapshot && snapshot < resume);
 
         let missing = daemon
             .handle(Request::new(
@@ -3802,6 +3830,38 @@ cwd = "/home/exedev"
             missing[0].error.as_ref().map(|err| err.code.as_str()),
             Some("service.not_found")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_still_resumes_the_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", true).await;
+        let cfg = test_config(&root);
+        let host = FakeHost::running();
+        host.state.lock().unwrap().chv_fail = Some("/api/v1/vm.snapshot".into());
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new(
+                "1",
+                Verb::Snapshot,
+                Map::from_iter([("name".into(), json!("mail")), ("tag".into(), json!("bad"))]),
+            ))
+            .await;
+
+        assert!(!responses[0].ok);
+        let calls = state.lock().unwrap().calls.clone();
+        let snapshot = calls
+            .iter()
+            .position(|c| c.starts_with("chv-put /api/v1/vm.snapshot"))
+            .expect("vm.snapshot attempted");
+        let resume = calls
+            .iter()
+            .position(|c| c == "chv-put /api/v1/vm.resume {}")
+            .expect("vm.resume still called");
+        assert!(snapshot < resume);
     }
 
     #[tokio::test]

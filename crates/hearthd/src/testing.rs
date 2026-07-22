@@ -27,6 +27,10 @@ pub struct FakeState {
     pub running: bool,
     pub exec_start: Option<String>,
     pub last_nft: Option<String>,
+    /// When set, `chv_put` to exactly this path fails (after recording the
+    /// call), so error-path ordering like resume-after-failed-snapshot is
+    /// testable.
+    pub chv_fail: Option<String>,
 }
 
 impl FakeHost {
@@ -145,6 +149,9 @@ impl Host for FakeHost {
     async fn chv_put(&self, _socket: &Utf8Path, path: &str, body: Value) -> Result<Value> {
         let mut state = self.state.lock().unwrap();
         state.calls.push(format!("chv-put {path} {body}"));
+        if state.chv_fail.as_deref() == Some(path) {
+            return Err(anyhow::anyhow!("injected chv failure for {path}"));
+        }
         if path == "/api/v1/vm.shutdown" || path == "/api/v1/vm.power-off" {
             state.running = false;
         }

@@ -476,31 +476,72 @@ async fn chv_request(
         body_text
     );
     stream.write_all(request.as_bytes()).await?;
-    stream.shutdown().await?;
+    // Keep the write half open. CHV's API server answers keep-alive regardless
+    // of `Connection: close`, and a slow endpoint (vm.snapshot dumps guest
+    // memory) drops the request without replying if it sees client EOF first.
+    // So read exactly one response, sized by Content-Length, then hang up.
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    parse_http_response(&buf)
-}
-
-fn parse_http_response(bytes: &[u8]) -> Result<Value> {
-    let text = String::from_utf8_lossy(bytes);
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("malformed HTTP response from CHV"))?;
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("malformed HTTP status from CHV"))?;
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(end) = header_end(&buf) {
+            break end;
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(anyhow!("oversized HTTP response head from CHV"));
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(anyhow!(
+                "CHV closed the API connection before sending a response"
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let (status, content_length) = parse_http_head(&String::from_utf8_lossy(&buf[..head_end]))?;
+    while buf.len() < head_end + content_length {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(anyhow!("CHV closed the API connection mid-body"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = String::from_utf8_lossy(&buf[head_end..head_end + content_length]);
     if !(200..300).contains(&status) {
         return Err(anyhow!("CHV API returned HTTP {status}: {body}"));
     }
     if body.trim().is_empty() {
         Ok(json!({}))
     } else {
-        serde_json::from_str(body).context("parse CHV JSON response")
+        serde_json::from_str(&body).context("parse CHV JSON response")
     }
+}
+
+/// Byte offset just past the `\r\n\r\n` header terminator, if present.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Parse an HTTP response head into (status, content-length). A missing
+/// Content-Length means an empty body (CHV's 204s carry no body at all).
+fn parse_http_head(head: &str) -> Result<(u16, usize)> {
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("malformed HTTP status from CHV"))?;
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    Ok((status, content_length))
 }
 
 pub fn unit_name(name: &str) -> String {
@@ -661,6 +702,26 @@ async fn delete_tap_device(tap: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_chv_head_with_keep_alive_and_content_length() {
+        // Verbatim shape of CHV 52's error response: keep-alive despite the
+        // client's `Connection: close`, body sized by Content-Length.
+        let head = "HTTP/1.1 500\r\nServer: Cloud Hypervisor API\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: 156\r\n\r\n";
+        assert_eq!(parse_http_head(head).unwrap(), (500, 156));
+    }
+
+    #[test]
+    fn missing_content_length_means_empty_body() {
+        let head = "HTTP/1.1 204\r\nServer: Cloud Hypervisor API\r\nConnection: keep-alive\r\n\r\n";
+        assert_eq!(parse_http_head(head).unwrap(), (204, 0));
+    }
+
+    #[test]
+    fn header_end_requires_the_full_terminator() {
+        assert_eq!(header_end(b"HTTP/1.1 204\r\n\r\nrest"), Some(16));
+        assert!(header_end(b"HTTP/1.1 204\r\n").is_none());
+    }
 
     #[test]
     fn short_tap_names_keep_service_name() {
