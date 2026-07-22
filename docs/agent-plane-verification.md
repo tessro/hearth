@@ -258,6 +258,56 @@ New production bug found (fixed in-tree, deploy pending):
   underlying cause (`err.to_string()` → `{err:#}`), which had reduced the
   `guest-connect` failure to a context line with no errno.
 
+### Gap 3 closed: live approvals from the web console (2026-07-21)
+
+The `web/` operator console (official AG-UI `HttpAgent` over agentd's HTTP
+leg, reverse-proxied with a bearer token) drove every approval scenario
+against real Hermes 0.19.0 in `demo`:
+
+- **Hermes decides most commands itself by default.** Its shipped default is
+  `approvals.mode: smart`: a dangerous-pattern match goes to an auxiliary LLM
+  ("Smart approval"), and the ACP client only sees a permission request on a
+  smart DENY override. Live, `sudo touch /etc/...` and even `rm -rf` of a
+  scratch directory were auto-approved (the latter after the auxiliary
+  provider timed out twice and fell back). For deterministic owner prompts the
+  `demo` VM's `~/.hermes/config.yaml` now sets `approvals.mode: manual` —
+  worth considering as the baked default for agent-plane images, since the
+  whole point of the Hearth approval loop is a human answering.
+- **Found and fixed: the permission interrupt violated AG-UI event ordering**
+  (high). Real Hermes raises `session/request_permission` while the gated
+  tool call is still open. The adapter closed open message/reasoning streams
+  before parking, but not open tool calls, so the run ended with an active
+  `TOOL_CALL_START` and the official `HttpAgent` hard-errored
+  (`Cannot send 'RUN_FINISHED' while tool calls are still active`) — the UI
+  never even rendered the Allow/Deny controls. The in-process E2E missed it
+  because fake_hermes completed its tool call before asking. Fixed
+  (`Translation::close_tool_calls` on both the park and turn-end paths);
+  fake_hermes now opens a tool call across the permission request and phase 6
+  asserts no run end leaves a tool call open. Validated live: post-fix
+  interrupts stream cleanly and the console renders and answers them.
+  A pre-fix task's durable log still replays the invalid sequence; replay
+  through the events API is unaffected — only live strict-client runs were.
+- **Approve** — Allow in the console answered the parked ACP request on the
+  still-live process; the command executed and the task completed with the
+  report (task `01KY44N93DMQ`, 3 runs).
+- **Deny** — Deny produced a blocked tool result (exit −1), Hermes explained
+  the refusal without retrying, and the task completed (`01KY45678JDZ`).
+- **Expiry (60s)** — Hermes's `approvals.timeout` self-denies the callback
+  after 60 seconds (`Permission request timed out`) and continues its turn,
+  while the parked adapter keeps the Hearth task in `awaiting_input`
+  indefinitely — no run is lost or failed. The defined transition for a late
+  answer: it cannot resolve the dead request, so it becomes an ordinary
+  consent turn on the reloaded session, and Hermes re-raises a **fresh**
+  permission request instead of executing on stale authority. Offline
+  approvals therefore remain answerable forever at the Hearth layer; only the
+  in-guest execution window is 60 seconds per ask.
+- **guestd restart** — with an outstanding permission, restarting
+  `hearth-guestd` (twice, including a binary upgrade via `hearthctl upgrade`)
+  preserved `awaiting_input` durably. The parked ACP process is necessarily
+  lost; a subsequent answer follows the same late-answer path above
+  (`session/load`, consent turn, fresh permission request) and the task
+  completed normally after a second Allow.
+
 ## Remaining gaps — and how to close each
 
 These are genuine gaps, not hand-waves. Each says what is unproven and what
@@ -279,15 +329,15 @@ access would let a future session prove it.
    `hermes-agent-plane`/`-acp` images are superseded. `hermes-a` remains
    running and unmodified.
 
-3. **Hermes ACP approval expiry/restart.** The adapter preserves the exact ACP
-   process and request across `awaiting_input`, and the fake-protocol E2E proves
-   a second Hearth run answers it. Pinned Hermes currently times out permission
-   callbacks after 60 seconds, and a guestd process restart necessarily loses
-   an outstanding stdio request. Live approval was intentionally deferred until
-   the GUI is available to render and answer the interrupt; the harmless live
-   terminal probe did not ask. Exercise approve/deny, timeout, and guestd
-   restart from that GUI, then define the task transition (expiry/failure versus
-   a future persistent Runs API) before promising indefinite offline approvals.
+3. **Hermes ACP approval expiry/restart.** **Closed 2026-07-21** — all four
+   scenarios (approve, deny, 60-second expiry, guestd restart) were exercised
+   live from the web console against the real Hermes 0.19.0 in the `demo` VM;
+   see "Verified live on the NixOS module" for the full findings, including
+   the AG-UI open-tool-call protocol bug this surfaced (fixed) and the defined
+   expiry semantics: the Hearth task waits in `awaiting_input` indefinitely, a
+   late answer becomes a consent turn on the reloaded session, and Hermes
+   re-raises a fresh permission request rather than executing on stale
+   authority.
 
 4. **Live systemd hardening + `LoadCredential`.** The checked-in unit no longer
    shares hearthd's runtime directory: it owns `/run/hearth-agentd`, runs with
