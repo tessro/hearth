@@ -80,17 +80,27 @@ done
 hearth_dropin="$(mktemp)"
 agent_dropin="$(mktemp)"
 trap 'rm -f "$hearth_dropin" "$agent_dropin"' EXIT
+# Setting Environment=PATH here REPLACES the base unit's PATH, and hearthd
+# shells out to ip/nft/systemctl/cloud-hypervisor at runtime. Include the
+# NixOS system profile alongside the FHS locations so the dev daemon finds
+# host tools on either layout (on nix-store units the base PATH points at
+# individual store paths this override would otherwise discard).
+host_path=/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 cat > "$hearth_dropin" <<EOF
 [Service]
 ExecStart=
 ExecStart=$deploy_dir/hearthd
-Environment=PATH=$deploy_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$deploy_dir:$host_path
+# Cloud Hypervisor keeps sockets bound under /run/hearth across daemon
+# restarts; without preserve, every dev restart severs host->guest channels
+# for all running VMs (see systemd/hearth.service).
+RuntimeDirectoryPreserve=yes
 EOF
 cat > "$agent_dropin" <<EOF
 [Service]
 ExecStart=
 ExecStart=$deploy_dir/hearth-agentd --token-file %d/http-token --ref-key-file %d/ref-key
-Environment=PATH=$deploy_dir:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$deploy_dir:$host_path
 EOF
 as_root install -m 0644 "$hearth_dropin" "$unit_dir/hearth.service.d/90-hearth-dev.conf"
 as_root install -m 0644 "$agent_dropin" "$unit_dir/hearth-agentd.service.d/90-hearth-dev.conf"
