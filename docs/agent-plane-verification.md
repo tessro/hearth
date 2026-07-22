@@ -308,6 +308,44 @@ against real Hermes 0.19.0 in `demo`:
   (`session/load`, consent turn, fresh permission request) and the task
   completed normally after a second Allow.
 
+### Gap 5: live snapshot/restore incarnation rotation (2026-07-21)
+
+Exercised on the live host against `demo`, after a baseline task
+(`GAP5_BASELINE`, cursor at `<incarnation>.15`) and a deliberate
+post-snapshot mutation (`GAP5_MUTATED`, seq 44):
+
+- `hearthctl snapshot demo` completes in ~1.2s live: the daemon now pauses,
+  snapshots, and resumes, with the resume guaranteed even when the snapshot
+  fails. Getting there surfaced three real CHV 52 API contract bugs, each
+  invisible until a live call: `vm.snapshot` refuses a running VM (hearthd
+  never paused); CHV's bare action endpoints return HTTP 400 when the request
+  carries any body — even `{}` — so `vm.pause`/`vm.resume` are now body-less
+  PUTs (`vm.shutdown` tolerates a body; nothing else changed); and hearthd's
+  HTTP client half-closed before reading, which CHV punishes on slow endpoints
+  by dropping the response entirely (`Connection: close` is ignored) — the
+  client now reads one Content-Length-framed response instead.
+- `hearthctl restore demo` required `--kernel` in the relaunch argv (CHV
+  demands a boot payload argument even under `--restore`) and then resumed
+  the snapshot with running vCPUs.
+- **The rotation contract holds end to end**: the pre-restore cursor is
+  rejected with `cursor.stale: cursor predates a snapshot restore; re-sync
+  via task.status`; `task.status` re-syncs (state, runs, and events intact)
+  under a freshly rotated incarnation; and a cursor-less replay returns the
+  full log under the new incarnation.
+- **Honest limitation**: the resumed memory image met a rootfs that had
+  advanced past the snapshot and wedged (CHV `Running`, guest dead on
+  net/vsock). The pending-restore mark survived, so the rotation fired on the
+  clean recovery boot — proving the wiring, not the resume. Disk-consistent
+  capture is item 5 in the remaining gaps.
+- Found alongside: `scripts/dev-restart.sh` wrote a drop-in whose
+  `Environment=PATH` replaced the unit's PATH with FHS-only locations, which
+  on NixOS left the dev daemon unable to spawn `ip`/`nft`/`systemctl` — it
+  then judged every running VM inactive and tried to boot duplicates. The
+  drop-in now appends `/run/current-system/sw/bin` and sets
+  `RuntimeDirectoryPreserve=yes`, and a subsequent dev restart was observed
+  leaving both running VMs' agent channels intact — the preserve fix
+  validated live.
+
 ## Remaining gaps — and how to close each
 
 These are genuine gaps, not hand-waves. Each says what is unproven and what
@@ -353,15 +391,19 @@ access would let a future session prove it.
    `destroy` attempt as the `hearth-agent` uid was denied at the policy gate
    (`verb.denied`, audited `allowed=false`). Nothing remains open here.
 
-5. **VM snapshot/restore incarnation rotation, end to end.** Incarnation
-   rotation is unit-tested (`store.rs`) and the restore→`ReportAck{restored:
-   true}`→`rotate_incarnation` wiring is in place (`hearthd` marks pending
-   restore; guestd rotates on the ack), but the *machine-plane* `restore` path
-   that triggers it needs a real CHV snapshot.
-   *To verify:* on the CHV host from (1), `snapshot` a running agent VM, mutate
-   a task, `restore`, and assert outstanding cursors return `cursor.stale` and a
-   fresh `task.status` re-syncs. The guest-side half is already proven by
-   `phase2_tasks.rs::stale_cursor_is_rejected_by_incarnation`.
+5. **VM snapshot/restore incarnation rotation, end to end.** **Closed
+   2026-07-21** for the rotation contract — see "Gap 5: live snapshot/restore"
+   below: a real CHV snapshot of a running agent VM, a post-snapshot task
+   mutation, and the machine-plane `restore` produced `cursor.stale` on the
+   pre-restore cursor and a clean `task.status` re-sync under a rotated
+   incarnation. Three CHV API contract bugs were fixed to get there.
+   *Remaining (new, narrower):* CHV's `vm.snapshot` captures memory/device
+   state only, so resuming it against a rootfs that advanced after the
+   snapshot wedged the guest (dead net/vsock; rotation completed on the
+   recovery boot, which still carried the pending-restore mark). A
+   production-grade restore must capture a disk-consistent image while the VM
+   is paused (e.g., a qcow2 snapshot alongside the CHV state) and restore
+   both; until then restore is only sound when the disk has not diverged.
 
 6. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only
