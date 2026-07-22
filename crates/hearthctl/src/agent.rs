@@ -237,7 +237,7 @@ fn render_agents(value: &Value) -> Result<()> {
             })
             .unwrap_or_default();
         table.add_row([
-            cell(agent, "name"),
+            cell(agent, "hostname"),
             cell(agent, "running"),
             cell(agent, "ready"),
             adapters,

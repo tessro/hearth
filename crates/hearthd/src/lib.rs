@@ -225,7 +225,7 @@ impl<H: Host + 'static> Daemon<H> {
                 "stream.requires_socket",
                 "fd passing requires a live unix socket",
             )],
-            Err(err) => vec![Response::failure(id, error_code(&err), err.to_string())],
+            Err(err) => vec![Response::failure(id, error_code(&err), format!("{err:#}"))],
         }
     }
 
@@ -261,7 +261,7 @@ impl<H: Host + 'static> Daemon<H> {
             Err(err) => {
                 write_response(
                     write,
-                    &Response::failure(id, error_code(&err), err.to_string()),
+                    &Response::failure(id, error_code(&err), format!("{err:#}")),
                 )
                 .await?;
                 Ok((false, None))

@@ -13,7 +13,7 @@ use hearth_agent_proto::taskref::TaskRefClaims;
 use hearth_agent_proto::AgentVerb;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct Agentd {
     pub cfg: Config,
@@ -66,18 +66,32 @@ impl Agentd {
         let mut agents = Vec::new();
         for endpoint in endpoints {
             let (adapters, task_count) = if endpoint.running && endpoint.ready {
-                let adapters =
-                    relay::call(&self.hearthd, &endpoint.id, AgentVerb::AgentLs, Map::new())
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("agents").cloned())
-                        .unwrap_or(json!([]));
-                let count =
-                    relay::call(&self.hearthd, &endpoint.id, AgentVerb::TaskList, Map::new())
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("tasks").and_then(Value::as_array).map(|t| t.len()))
-                        .unwrap_or(0);
+                let adapters = relay::call(
+                    &self.hearthd,
+                    &endpoint.id,
+                    AgentVerb::AgentLs,
+                    Map::new(),
+                )
+                .await
+                .map_err(|err| {
+                    warn!(vm = %endpoint.id, error = %format!("{err:#}"), "agent-ls relay failed");
+                })
+                .ok()
+                .and_then(|v| v.get("agents").cloned())
+                .unwrap_or(json!([]));
+                let count = relay::call(
+                    &self.hearthd,
+                    &endpoint.id,
+                    AgentVerb::TaskList,
+                    Map::new(),
+                )
+                .await
+                .map_err(|err| {
+                    warn!(vm = %endpoint.id, error = %format!("{err:#}"), "task-list relay failed");
+                })
+                .ok()
+                .and_then(|v| v.get("tasks").and_then(Value::as_array).map(|t| t.len()))
+                .unwrap_or(0);
                 (adapters, count)
             } else {
                 (json!([]), 0)
