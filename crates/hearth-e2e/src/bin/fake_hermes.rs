@@ -70,6 +70,19 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(500));
                     message_chunk(&mut output, SESSION_ID, "finished thinking");
                 } else if text.contains("approval") {
+                    // Real Hermes raises the permission request while the
+                    // gated tool call is still open (status pending) — the
+                    // adapter must close it before the run can legally end.
+                    update(
+                        &mut output,
+                        SESSION_ID,
+                        json!({
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "tc-perm",
+                            "title": "terminal: rm -rf /tmp/example",
+                            "rawInput": { "command": "rm -rf /tmp/example" },
+                        }),
+                    );
                     permission(&mut output, SESSION_ID);
                     let response: Value =
                         serde_json::from_str(&input.next().unwrap().unwrap()).unwrap();
@@ -77,6 +90,19 @@ fn main() {
                     let choice = response["result"]["outcome"]["optionId"]
                         .as_str()
                         .unwrap_or("deny");
+                    update(
+                        &mut output,
+                        SESSION_ID,
+                        json!({
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": "tc-perm",
+                            "status": "completed",
+                            "content": [{
+                                "type": "content",
+                                "content": { "type": "text", "text": "removed" },
+                            }],
+                        }),
+                    );
                     message_chunk(
                         &mut output,
                         SESSION_ID,

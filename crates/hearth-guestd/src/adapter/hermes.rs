@@ -473,6 +473,7 @@ impl AcpServer {
             if message.get("id") == Some(prompt_id) && message.get("method").is_none() {
                 translated.close_reasoning();
                 translated.close_message();
+                translated.close_tool_calls();
                 flush_events(&mut translated.events, events)?;
                 if let Some(error) = message.get("error") {
                     translated.events.push(AdapterEvent::Failed {
@@ -518,6 +519,13 @@ impl AcpServer {
                 "session/request_permission" if message.get("id").is_some() => {
                     translated.close_reasoning();
                     translated.close_message();
+                    // A permission request usually arrives while its tool call
+                    // is still open. The run is about to end (interrupted), and
+                    // AG-UI forbids RUN_FINISHED with an active tool call, so
+                    // close any open calls now; the eventual tool result after
+                    // resume surfaces as RAW in the next run, whose stream the
+                    // original tool_call_id may not legally appear in.
+                    translated.close_tool_calls();
                     flush_events(&mut translated.events, events)?;
                     let params = message.get("params").cloned().unwrap_or(Value::Null);
                     let options: HashSet<String> = params
@@ -752,6 +760,20 @@ impl Translation {
             // AG-UI reasoning events cover thought chunks. Preserve other ACP
             // plan/usage/session-info updates losslessly as RAW.
             _ => self.raw(update.clone()),
+        }
+    }
+
+    /// End every still-open tool call. AG-UI rejects a run end while a tool
+    /// call is active, and a permission interrupt (or a hard prompt error)
+    /// legitimately arrives mid-call.
+    fn close_tool_calls(&mut self) {
+        let mut ids: Vec<String> = self.tool_ids.drain().map(|(_, id)| id).collect();
+        ids.sort();
+        for tool_call_id in ids {
+            self.events
+                .push(AdapterEvent::Event(AgentEvent::ToolCallEnd {
+                    tool_call_id,
+                }));
         }
     }
 

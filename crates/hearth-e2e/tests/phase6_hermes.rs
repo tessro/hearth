@@ -119,6 +119,29 @@ async fn hermes_acp_permission_interrupts_and_responds_on_the_live_prompt() {
     assert_eq!(status["pending_input"]["protocol"], json!("acp"));
     assert_eq!(status["pending_input"]["kind"], json!("permission"));
 
+    // The gated tool call was still open when the permission interrupt ended
+    // run 1. AG-UI forbids RUN_FINISHED while a tool call is active, so every
+    // TOOL_CALL_START must have a TOOL_CALL_END before the run end (the
+    // official HttpAgent hard-errors otherwise).
+    let mut guest = h.guest_connect("worker").await.unwrap();
+    let mut args = Map::new();
+    args.insert("task_id".to_string(), json!(task_id));
+    args.insert("max".to_string(), json!(100));
+    let events = guest_verb(&mut guest, AgentVerb::TaskEvents, args)
+        .await
+        .unwrap();
+    let mut open_tool_calls = 0i64;
+    for record in events["events"].as_array().unwrap() {
+        match record["event"]["type"].as_str().unwrap_or_default() {
+            "TOOL_CALL_START" => open_tool_calls += 1,
+            "TOOL_CALL_END" => open_tool_calls -= 1,
+            "RUN_FINISHED" => {
+                assert_eq!(open_tool_calls, 0, "run ended with an open AG-UI tool call")
+            }
+            _ => {}
+        }
+    }
+
     let mut args = Map::new();
     args.insert("task_ref".to_string(), json!(task_ref));
     args.insert("response".to_string(), json!({ "text": "allow once" }));
