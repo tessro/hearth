@@ -46,6 +46,10 @@ pub trait Host: Send + Sync {
         service: &Service,
         image: &ImageManifest,
     ) -> Result<()>;
+    /// Launch a bare API-only VMM for `service` (no boot payload): `restore`
+    /// drives it via `vm.restore` afterwards. Prepares the same host-side
+    /// resources as a boot — runtime dirs, stale sockets cleared, tap present.
+    async fn systemd_run_vmm(&self, cfg: &Config, service: &Service) -> Result<()>;
     async fn wait_for_vm_socket(&self, path: &Utf8Path, dur: Duration) -> Result<()>;
     async fn systemctl(&self, args: &[&str]) -> Result<String>;
     async fn qemu_img_create(
@@ -108,6 +112,24 @@ impl Host for RealHost {
         unlink_stale(&cfg.vm_vsock_socket(&service.id)).await?;
         let _ = ensure_tap(&cfg.bridge, &tap_name(&service.id)).await?;
         systemd_run_chv(service, cloud_hypervisor_argv(cfg, service, image)).await
+    }
+
+    async fn systemd_run_vmm(&self, cfg: &Config, service: &Service) -> Result<()> {
+        fs::create_dir_all(cfg.run_dir.join("vms")).await?;
+        fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
+        fs::create_dir_all(&cfg.log_dir).await?;
+        unlink_stale(&cfg.vm_socket(&service.id)).await?;
+        unlink_stale(&cfg.vm_vsock_socket(&service.id)).await?;
+        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.id)).await?;
+        systemd_run_chv(
+            service,
+            vec![
+                "cloud-hypervisor".to_string(),
+                "--api-socket".to_string(),
+                cfg.vm_socket(&service.id).to_string(),
+            ],
+        )
+        .await
     }
 
     async fn wait_for_vm_socket(&self, path: &Utf8Path, dur: Duration) -> Result<()> {

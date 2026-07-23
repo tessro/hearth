@@ -73,6 +73,13 @@ impl Host for FakeHost {
         Ok(())
     }
 
+    async fn systemd_run_vmm(&self, _cfg: &Config, service: &Service) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.calls.push(format!("systemd-run-vmm {}", service.id));
+        state.running = true;
+        Ok(())
+    }
+
     async fn wait_for_vm_socket(&self, path: &Utf8Path, _dur: Duration) -> Result<()> {
         self.state
             .lock()

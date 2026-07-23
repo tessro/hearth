@@ -401,26 +401,34 @@ access would let a future session prove it.
    state only, so resuming it against a rootfs that advanced after the
    snapshot wedged the guest (dead net/vsock; rotation completed on the
    recovery boot, which still carried the pending-restore mark).
-   *Implemented 2026-07-22:* snapshots are disk captures, restores are cold
-   boots. A first cut kept CHV's memory dump and restored it alongside the
-   captured disk, and the live host disproved it: even with a byte-identical
-   disk, the resumed image came back with a `NO-CARRIER` tap — fd-backed
-   devices (tap, vsock) cannot be revived from on-disk state; CHV expects the
-   restorer to pass fresh fds over the API (`net_fds` + `SCM_RIGHTS`).
-   Rather than plumb fds through `systemd-run`, `snapshot` now pauses the
-   vCPUs, captures the boot disk (`disk.qcow2`, `cp --reflink=auto`, ~1.3s
-   observed live), and resumes — no memory dump — and `restore` copies the
-   disk back and boots it through the ordinary start path, with
-   `mark_pending_restore` driving the incarnation rotation exactly as the
-   live pass proved. Disk-less snapshots are refused with `snapshot.no_disk`
-   *before* the running VM is touched. Guest memory state is deliberately not
-   restored: the agent plane is built for cold boots (durable task logs,
-   reconnecting channels, reloadable sessions). A future memory-resume needs
-   the CHV `net_fds` re-plumbing and is not promised. Unit-tested
-   (pause < disk < resume, resume-on-failure, cold boot after disk copy-back,
-   early refusal). *Still to verify live:* one snapshot → mutate → restore
-   cycle proving the restored guest boots healthy and the mutation is
-   genuinely rewound.
+   *Implemented 2026-07-23 against CHV ≥ 53 (pinned in Nix):* true memory
+   resume. The journey mattered: a v52 memory restore via CLI `--restore`
+   came back catatonic even with a byte-identical disk (`NO-CARRIER` tap,
+   dead vsock, empty console, no CHV error anywhere — the CLI path swallows
+   restore failures), and an interim cold-boot restore worked but broke
+   transparency. The v52/v53 release audit then showed the platform had
+   moved: v52 restores the KVM clock before resuming vCPUs and resets vsock
+   connections across restore; v53 advances the guest clock by the elapsed
+   wall-clock gap, re-syncs vCPU TSC offsets, and announces the restored
+   guest on the network (GARP) instead of waiting out stale ARP. The final
+   design: `snapshot` pauses, dumps memory/device state via `vm.snapshot`,
+   captures the boot disk (`disk.qcow2`, reflink), and resumes — one ~1s
+   quiesced window; `restore` copies the disk back, launches a **bare
+   API-only VMM** (no clap payload requirement), and drives
+   `vm.restore {source_url, resume:true}` over HTTP so contract errors
+   surface through hearthd's error chain, with an explicit `vm.resume`
+   fallback if the VM comes back paused. Snapshots missing their disk or
+   state are refused (`snapshot.no_disk` / `snapshot.no_state`) before the
+   running VM is touched; CHV's own version-binding of snapshots surfaces as
+   the `vm.restore` error. A restored VM's transient unit runs the bare-VMM
+   argv, so `boot_config` reports stale until its next plain reboot — that
+   drift flag is truthful. If live verification still shows an unattached
+   tap, the contingency is `net_fds` + `SCM_RIGHTS` fd-passing on the restore
+   request. Also from the audit: `--disk` now declares `image_type=qcow2`
+   explicitly (v52 deprecates autodetection), and v52's `backing_files=on`
+   is noted as a future thin-disk opportunity. *Still to verify live under
+   v53:* snapshot → mutate → restore with a healthy, reachable guest, the
+   mutation rewound, and cursors rotated.
 
 6. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only

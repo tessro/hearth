@@ -923,23 +923,32 @@ impl<H: Host + 'static> Daemon<H> {
         let dest = self.cfg.snapshot_dir(&id, &tag);
         fs::create_dir_all(&dest).await?;
         let socket = self.cfg.vm_socket(&id);
-        // Pause the vCPUs so the boot disk is quiescent, capture it, resume.
-        // The resume is attempted even when the copy fails — a paused guest
-        // must never be the residue of a failed snapshot. CHV's vm.snapshot
-        // memory dump is deliberately NOT taken: fd-backed devices (tap,
-        // vsock) cannot be resumed from on-disk state without re-plumbing
-        // fresh fds over the API, so a resumed memory image comes back
-        // unreachable (NO-CARRIER tap, dead vsock). `restore` cold-boots the
-        // captured disk instead.
+        // One quiesced window: pause the vCPUs, dump memory/device state,
+        // capture the boot disk, resume (~1s live: the dump is sparse and the
+        // disk copy reflinks where the filesystem can). The resume is
+        // attempted even when a capture step fails — a paused guest must
+        // never be the residue of a failed snapshot.
         self.host
             .chv_put_empty(&socket, "/api/v1/vm.pause")
             .await
             .context("pause VM for snapshot")?;
-        let disk_copy = self
+        let state_dump = self
             .host
-            .copy_disk(&self.cfg.disk_path(&svc), &dest.join(SNAPSHOT_DISK_FILE))
+            .chv_put(
+                &socket,
+                "/api/v1/vm.snapshot",
+                json!({ "destination_url": format!("file://{dest}") }),
+            )
             .await;
+        let disk_copy = if state_dump.is_ok() {
+            self.host
+                .copy_disk(&self.cfg.disk_path(&svc), &dest.join(SNAPSHOT_DISK_FILE))
+                .await
+        } else {
+            Ok(())
+        };
         let resume = self.host.chv_put_empty(&socket, "/api/v1/vm.resume").await;
+        state_dump.context("snapshot paused VM state")?;
         disk_copy.context("copy boot disk into snapshot")?;
         resume.context("resume VM after snapshot")?;
         Ok(json!({ "id": id, "hostname": hostname, "tag": tag, "path": dest }))
@@ -958,8 +967,9 @@ impl<H: Host + 'static> Daemon<H> {
             ));
         }
         // Refuse before touching the running VM: a snapshot without its
-        // captured disk (e.g. taken by a pre-disk-capture daemon) has nothing
-        // restorable in it.
+        // captured disk or VM state has nothing restorable in it. Snapshots
+        // are also CHV-version-bound; a version mismatch surfaces as the
+        // vm.restore API error below.
         let disk_image = src.join(SNAPSHOT_DISK_FILE);
         if !disk_image.exists() {
             return Err(coded(
@@ -970,27 +980,68 @@ impl<H: Host + 'static> Daemon<H> {
                 ),
             ));
         }
+        let state_file = src.join("state.json");
+        if !state_file.exists() {
+            return Err(coded(
+                "snapshot.no_state",
+                format!(
+                    "snapshot {tag} has no captured VM state at {state_file}; \
+                     retake the snapshot with this daemon"
+                ),
+            ));
+        }
         let _ = self.stop_unlocked(hostname).await;
-        let disk_path = {
+        let mut svc = {
             let reg = self.registry().await?;
-            self.cfg.disk_path(reg.get(hostname)?)
+            reg.get(hostname)?.clone()
         };
         self.host
-            .copy_disk(&disk_image, &disk_path)
+            .copy_disk(&disk_image, &self.cfg.disk_path(&svc))
             .await
             .context("restore boot disk from snapshot")?;
         // The restored guest's next boot report gets `restored: true` in its
         // ack, so guestd rotates task incarnations and outstanding cursors go
-        // cleanly stale (§3.4). Marked before the guest can possibly reconnect.
-        // (`start_unlocked`'s `forget` clears guest telemetry, not this mark.)
+        // cleanly stale (§3.4). Marked before the guest can possibly
+        // reconnect; `forget` clears stale telemetry so `wait` blocks on the
+        // restored report, and leaves this mark alone.
+        self.guests.forget(&id);
         self.guests.mark_pending_restore(&id);
-        // Cold boot the captured disk through the ordinary start path. CHV's
-        // memory-image resume is deliberately not used: tap/vsock backends are
-        // fd-based and cannot be revived from on-disk state without re-plumbing
-        // fds over the API, so a resumed image comes back unreachable. Guest
-        // memory state is not restored — the agent plane is built for that
-        // (durable task logs, reconnecting channels, reloadable sessions).
-        self.start_unlocked(hostname).await?;
+        // True memory resume (CHV ≥ 53): launch a bare API-only VMM, then
+        // drive vm.restore over HTTP so contract errors actually surface —
+        // the CLI --restore path swallows them. Named-tap and path-based
+        // (disk, vsock, serial) backends are re-opened by CHV from the
+        // restored config; v53 advances the guest clock across the gap and
+        // announces the network presence post-restore.
+        self.host.systemd_run_vmm(&self.cfg, &svc).await?;
+        let socket = self.cfg.vm_socket(&id);
+        self.host
+            .wait_for_vm_socket(&socket, Duration::from_secs(20))
+            .await?;
+        self.host
+            .chv_put(
+                &socket,
+                "/api/v1/vm.restore",
+                json!({ "source_url": format!("file://{src}"), "resume": true }),
+            )
+            .await
+            .context("restore VM state")?;
+        // Belt and braces: if the restore ignored `resume`, the VM sits
+        // paused — resume it explicitly rather than returning a zombie.
+        if let Ok(info) = self.host.chv_get(&socket, "/api/v1/vm.info").await {
+            if info.get("state").and_then(Value::as_str) == Some("Paused") {
+                self.host
+                    .chv_put_empty(&socket, "/api/v1/vm.resume")
+                    .await
+                    .context("resume restored VM")?;
+            }
+        }
+        self.ensure_guest_channels(&id).await?;
+        svc.enabled = true;
+        Registry::write_service(&self.cfg, &svc).await?;
+        // Re-apply the NAT table (mirror start_unlocked): the restored guest
+        // may resolve to a different lease than it held before the stop.
+        let reg = self.registry().await?;
+        self.rewrite_nat(&reg).await;
         Ok(json!({ "id": id, "hostname": hostname, "tag": tag, "restored": true }))
     }
 
@@ -3787,12 +3838,21 @@ cwd = "/home/exedev"
         assert!(responses[0].ok);
         assert!(cfg.snapshot_dir(&test_id("mail"), "before").is_dir());
         let calls = state.lock().unwrap().calls.clone();
-        // The boot disk is captured with the vCPUs paused, in order — that is
-        // the whole consistency guarantee of a snapshot.
+        // Memory/device state and the boot disk are captured with the vCPUs
+        // paused, in order — that is the consistency guarantee of a snapshot.
         let pause = calls
             .iter()
             .position(|c| c == "chv-put /api/v1/vm.pause (empty)")
             .expect("vm.pause called");
+        let state_dump = calls
+            .iter()
+            .position(|call| {
+                call == &format!(
+                    "chv-put /api/v1/vm.snapshot {{\"destination_url\":\"file://{}\"}}",
+                    cfg.snapshot_dir(&test_id("mail"), "before")
+                )
+            })
+            .expect("vm.snapshot called");
         let disk = calls
             .iter()
             .position(|c| c.starts_with("copy-disk") && c.contains(SNAPSHOT_DISK_FILE))
@@ -3801,10 +3861,7 @@ cwd = "/home/exedev"
             .iter()
             .position(|c| c == "chv-put /api/v1/vm.resume (empty)")
             .expect("vm.resume called");
-        assert!(pause < disk && disk < resume);
-        // The CHV memory dump is deliberately absent: fd-backed devices make a
-        // resumed memory image unreachable, so restore cold-boots the disk.
-        assert!(!calls.iter().any(|c| c.contains("vm.snapshot")));
+        assert!(pause < state_dump && state_dump < disk && disk < resume);
 
         let missing = daemon
             .handle(Request::new(
@@ -3818,6 +3875,40 @@ cwd = "/home/exedev"
             missing[0].error.as_ref().map(|err| err.code.as_str()),
             Some("service.not_found")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_state_dump_still_resumes_the_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", true).await;
+        let cfg = test_config(&root);
+        let host = FakeHost::running();
+        host.state.lock().unwrap().chv_fail = Some("/api/v1/vm.snapshot".into());
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new(
+                "1",
+                Verb::Snapshot,
+                Map::from_iter([("name".into(), json!("mail")), ("tag".into(), json!("bad"))]),
+            ))
+            .await;
+
+        assert!(!responses[0].ok);
+        let calls = state.lock().unwrap().calls.clone();
+        let state_dump = calls
+            .iter()
+            .position(|c| c.starts_with("chv-put /api/v1/vm.snapshot"))
+            .expect("vm.snapshot attempted");
+        let resume = calls
+            .iter()
+            .position(|c| c == "chv-put /api/v1/vm.resume (empty)")
+            .expect("vm.resume still called");
+        assert!(state_dump < resume);
+        // No point capturing a disk for a state dump that failed.
+        assert!(!calls.iter().any(|c| c.starts_with("copy-disk")));
     }
 
     #[tokio::test]
@@ -3881,7 +3972,7 @@ cwd = "/home/exedev"
             Some("snapshot.no_disk")
         );
         // The refusal must come before the VM is touched: no shutdown, no
-        // boot.
+        // VMM launch.
         let calls = state.lock().unwrap().calls.clone();
         assert!(!calls
             .iter()
@@ -3889,7 +3980,45 @@ cwd = "/home/exedev"
     }
 
     #[tokio::test]
-    async fn restore_stops_copies_disk_back_and_cold_boots() {
+    async fn restore_without_captured_state_is_refused_before_stopping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        write_service(&root, "mail", true).await;
+        let cfg = test_config(&root);
+        // Disk captured, but no VM state (e.g. a cold-boot-era snapshot).
+        let snap_dir = cfg.snapshot_dir(&test_id("mail"), "diskonly");
+        tokio::fs::create_dir_all(&snap_dir).await.unwrap();
+        tokio::fs::write(snap_dir.join(SNAPSHOT_DISK_FILE), b"disk")
+            .await
+            .unwrap();
+        let host = FakeHost::running();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new(
+                "1",
+                Verb::Restore,
+                Map::from_iter([
+                    ("name".into(), json!("mail")),
+                    ("tag".into(), json!("diskonly")),
+                ]),
+            ))
+            .await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(
+            responses[0].error.as_ref().map(|err| err.code.as_str()),
+            Some("snapshot.no_state")
+        );
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("vm.shutdown") || c.starts_with("systemd-run")));
+    }
+
+    #[tokio::test]
+    async fn restore_stops_copies_disk_back_and_resumes_state() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         write_service(&root, "mail", false).await;
@@ -3897,6 +4026,9 @@ cwd = "/home/exedev"
         let snap_dir = cfg.snapshot_dir(&test_id("mail"), "before");
         tokio::fs::create_dir_all(&snap_dir).await.unwrap();
         tokio::fs::write(snap_dir.join(SNAPSHOT_DISK_FILE), b"disk")
+            .await
+            .unwrap();
+        tokio::fs::write(snap_dir.join("state.json"), b"{}")
             .await
             .unwrap();
         let host = FakeHost::running();
@@ -3918,24 +4050,30 @@ cwd = "/home/exedev"
         assert!(calls
             .iter()
             .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
-        // Restore is a cold boot of the captured disk through the ordinary
-        // start path — the disk must land before the VM boots from it.
-        let boot_call = format!("systemd-run {}", test_id("mail"));
+        // Restore order: disk lands, a bare API-only VMM launches, then the
+        // state resume is driven over the API.
+        let vmm_call = format!("systemd-run-vmm {}", test_id("mail"));
         let copy_idx = calls
             .iter()
             .position(|call| call.starts_with("copy-disk") && call.contains(SNAPSHOT_DISK_FILE))
             .expect("captured disk copied back");
-        let boot_idx = calls
+        let vmm_idx = calls
             .iter()
-            .position(|call| call == &boot_call)
-            .expect("VM cold-booted");
-        assert!(copy_idx < boot_idx);
+            .position(|call| call == &vmm_call)
+            .expect("bare VMM launched");
+        let restore_idx = calls
+            .iter()
+            .position(|call| call.starts_with("chv-put /api/v1/vm.restore"))
+            .expect("vm.restore driven over the API");
+        assert!(copy_idx < vmm_idx && vmm_idx < restore_idx);
         assert!(calls.iter().any(|call| call.starts_with("wait-socket ")));
+        // The restore request asks for an immediate resume.
+        assert!(calls[restore_idx].contains("\"resume\":true"));
         // Restore must refresh the NAT table *after* bringing the VM back up, in
-        // case the rebooted guest takes a different lease than it held before.
+        // case the restored guest resolves a different lease than before.
         assert!(
-            calls[boot_idx..].iter().any(|call| call == "nft-apply"),
-            "restore must re-apply NAT after booting the VM: {calls:?}"
+            calls[restore_idx..].iter().any(|call| call == "nft-apply"),
+            "restore must re-apply NAT after resuming the VM: {calls:?}"
         );
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(registry.get("mail").unwrap().enabled);
