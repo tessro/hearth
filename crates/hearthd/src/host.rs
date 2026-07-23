@@ -335,7 +335,10 @@ fn image_argv(
     }
     args.extend([
         "--disk".to_string(),
-        format!("path={}", cfg.disk_path(service)),
+        // Explicit image_type: CHV v52 deprecates disk-format autodetection
+        // (slated for removal). All Hearth boot disks are qcow2 (see
+        // DiskFormat).
+        format!("path={},image_type=qcow2", cfg.disk_path(service)),
         "--cmdline".to_string(),
         kernel_cmdline(manifest),
         "--net".to_string(),
