@@ -376,7 +376,38 @@ This command updates only VMs that already run and report a guestd. It does not
 install a unit, retrofit guestd-less images, start stopped VMs, or alter image
 manifests.
 
-## 6. Network setup by host type
+## 6. VM snapshots and restore
+
+`hearthctl snapshot <vm> [--tag <tag>]` captures a running VM into
+`/var/lib/hearth/snapshots/<id>/<tag>`: the vCPUs are paused, Cloud
+Hypervisor dumps memory/device state, the boot disk is copied alongside it
+(`disk.qcow2`, reflinked where the filesystem supports cloning), and the VM
+resumes — a quiesced window of about a second. `hearthctl restore <vm>
+--tag <tag>` stops the VM, copies the captured disk back, relaunches an
+API-only VMM, and resumes the saved state. The restore is transparent to the
+guest: same boot id, continuous uptime, no reboot.
+
+Rules that keep restores sound:
+
+- **Snapshots are Cloud Hypervisor-version-bound.** Restore only under the
+  CHV version that took the snapshot; a mismatch fails the restore with CHV's
+  own error. After a CHV upgrade, retake snapshots.
+- A snapshot missing its captured disk or VM state is refused
+  (`snapshot.no_disk` / `snapshot.no_state`) before the running VM is
+  touched.
+- The guest's wall clock resumes behind by however long the VM was stopped;
+  monotonic time is unaffected. Run an NTP client in the guest if wall-clock
+  accuracy matters after restores.
+- A restored VM's transient unit runs a bare-VMM command line, so `status`
+  reports `boot_config: stale` until the next plain reboot. The flag is
+  truthful: a restart would boot with current flags.
+- Agent-plane clients: outstanding event cursors go `cursor.stale` after a
+  restore (task incarnations rotate); re-sync via `task.status`.
+- Snapshot directories are never garbage-collected; delete stale tags under
+  `/var/lib/hearth/snapshots/<id>/` yourself. A snapshot holds a full memory
+  image plus a disk copy.
+
+## 7. Network setup by host type
 
 The NixOS module can own `hearth0`, dnsmasq, forwarding, and NAT. On a
 NetworkManager host, create a persistent bridge connection with the address in
@@ -386,7 +417,7 @@ masquerade rule for the uplink. On a systemd-networkd host, use a bridge
 and `/var/lib/hearth/dnsmasq.d` config dir. In both cases keep the static and
 dynamic ranges separate.
 
-## 7. Releases
+## 8. Releases
 
 CI reads Nix build results from the public `tessro` Cachix cache. To let
 trusted main-branch and release runs add new results, create a write token for

@@ -105,5 +105,3 @@ devenv shell -- target/release/hearthctl start dev
   rootfs construction.
 - [`docs/agent-plane.md`](docs/agent-plane.md): agent-plane architecture and
   protocols.
-- [`docs/agent-plane-verification.md`](docs/agent-plane-verification.md): test
-  coverage, live verification, and known gaps.

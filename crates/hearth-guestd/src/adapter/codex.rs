@@ -7,7 +7,7 @@
 //! (JSON-RPC, `newThread`/`resumeThread`/`sendUserTurn`, streamed `item`
 //! notifications, an `execApproval` server request) but must be validated
 //! against a real codex binary before shipping — see
-//! docs/agent-plane-verification.md. The adapter refuses (loudly, at boot
+//! ARCHITECTURE.md §Known follow-ups. The adapter refuses (loudly, at boot
 //! report) any app-server whose reported version it does not pin, exactly as
 //! §2.2 requires; that refusal is what makes the pin enforceable rather than
 //! aspirational.

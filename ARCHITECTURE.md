@@ -336,3 +336,24 @@ This is the only systemd config that lives on disk for hearth-related VM managem
   control; guest workload limits belong inside the guest.
 - **Host package surface**: keep libvirt/qemu/virt-manager installed as a debugging escape hatch, or strip to just cloud-hypervisor + virtiofsd? Default to keep for now; revisit after hearth is solid.
 - **Bridge management**: hearth currently *expects* `hearth0` to exist, declared in NixOS alongside dnsmasq + NAT. `hearthctl host check` validates its presence.
+
+## Known follow-ups
+
+Work items retired here from the (removed) agent-plane verification report;
+history for each lives in that file's git log.
+
+- **Codex and Claude adapters are deliberately inactive.** The live audit
+  showed the Codex adapter models an obsolete app-server schema (the current
+  one uses `thread/start`/`turn/start` and same-connection approval
+  responses) and the Claude adapter's version pin predates the audited CLI.
+  Both need a rewrite against a freshly pinned real binary plus provisioned
+  authentication before any image advertises them.
+- **`hearthctl image build --rootless` is broken**: it flattens root-owned
+  guest files to the invoking uid, producing an invalid sudo installation.
+  Workaround: run `hearthctl image build` inside `buildah unshare` without
+  the flag.
+- **Example-image probes await retirement.** `hermes-probe`/`netdiag` (and
+  `scripts/test-hermes-vm.sh`, which depends on them) are functionally
+  superseded by the guestd boot report.
+- **Guest images ship no NTP client**, so a VM restored from a snapshot keeps
+  a wall clock behind by the stopped window until one is added (in progress).

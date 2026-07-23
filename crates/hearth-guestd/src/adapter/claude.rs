@@ -5,7 +5,7 @@
 //!
 //! As with codex, the wire shape below is a *pinned contract* modelled on
 //! claude's stream-json events; it must be validated against a real claude CLI
-//! before shipping — see docs/agent-plane-verification.md. The adapter refuses
+//! before shipping — see ARCHITECTURE.md §Known follow-ups. The adapter refuses
 //! a CLI version it does not pin (§2.2).
 
 use super::{flush_events, Adapter, AdapterEvent, EventSink, RunOutput};
