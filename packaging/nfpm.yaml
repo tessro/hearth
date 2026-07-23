@@ -29,7 +29,10 @@ scripts:
 overrides:
   deb:
     depends:
-      - cloud-hypervisor
+      # Floor = oldest CHV whose HTTP API contract hearthd is verified against
+      # (docs/agent-plane-verification.md); Nix pins newer (nix/cloud-hypervisor.nix).
+      # Raise when the OBS home:cloud-hypervisor repo publishes the pinned version.
+      - cloud-hypervisor (>= 52.0)
       - dnsmasq
       - iproute2
       - nftables
@@ -42,7 +45,8 @@ overrides:
       - umoci
   rpm:
     depends:
-      - cloud-hypervisor
+      # Same floor as the deb dependency above.
+      - cloud-hypervisor >= 52.0
       - dnsmasq
       - iproute
       - nftables

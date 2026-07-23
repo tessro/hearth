@@ -15,7 +15,7 @@ binaries and are called out as such.
 
 | Tool | Provides | apt | dnf |
 | --- | --- | --- | --- |
-| `cloud-hypervisor` | the VMM Hearth launches per VM | `cloud-hypervisor` | `cloud-hypervisor` |
+| `cloud-hypervisor` | the VMM Hearth launches per VM (v52 or newer; the deb/rpm enforce this) | `cloud-hypervisor` | `cloud-hypervisor` |
 | `qemu-img` | per-VM disk create/convert | `qemu-utils` | `qemu-img` |
 | `nft` | the `hearth_nat` publish table | `nftables` | `nftables` |
 | `dnsmasq` | guest DHCP + leases on the bridge | `dnsmasq` | `dnsmasq` |
@@ -111,7 +111,11 @@ start with it.
 ### NixOS
 
 Add the flake input and module. Nix builds Hearth and the pinned guest kernel;
-the module installs Cloud Hypervisor and the other runtime tools.
+the module supplies the Cloud Hypervisor version Hearth is tested against and
+the other runtime tools. Everything stays scoped to the Hearth services: no
+overlay is applied, and `pkgs.cloud-hypervisor` (or any other copy on the
+system) is untouched, so a host already using a different Cloud Hypervisor
+version elsewhere is unaffected.
 
 ```nix
 {
@@ -140,7 +144,9 @@ the module installs Cloud Hypervisor and the other runtime tools.
 
 Set `networking.manage = false` to leave the bridge, dnsmasq, forwarding, and
 NAT unchanged. You can replace `package`, `cloudHypervisorPackage`, and
-`guestKernel` through module options.
+`guestKernel` through module options — for example, set
+`services.hearth.cloudHypervisorPackage = pkgs.cloud-hypervisor;` to run Hearth
+on your own nixpkgs build instead of the pinned one.
 
 For the agent plane, secret options name runtime source paths. Do not use Nix
 path literals, since those copy data to the store:

@@ -4,6 +4,7 @@
   pkgs,
   hearthPackage,
   hearthGuestKernel,
+  hearthCloudHypervisor,
   ...
 }:
 
@@ -38,7 +39,12 @@ in
     };
     cloudHypervisorPackage = mkOption {
       type = types.package;
-      default = pkgs.cloud-hypervisor;
+      default = hearthCloudHypervisor;
+      description = ''
+        cloud-hypervisor used to launch VMs. Defaults to the version Hearth
+        pins and is tested against (see nix/cloud-hypervisor.nix); this does not
+        touch the system-wide pkgs.cloud-hypervisor. Override to supply your own.
+      '';
     };
     guestKernel = mkOption {
       type = types.package;
