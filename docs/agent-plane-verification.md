@@ -426,9 +426,20 @@ access would let a future session prove it.
    tap, the contingency is `net_fds` + `SCM_RIGHTS` fd-passing on the restore
    request. Also from the audit: `--disk` now declares `image_type=qcow2`
    explicitly (v52 deprecates autodetection), and v52's `backing_files=on`
-   is noted as a future thin-disk opportunity. *Still to verify live under
-   v53:* snapshot → mutate → restore with a healthy, reachable guest, the
-   mutation rewound, and cursors rotated.
+   is noted as a future thin-disk opportunity.
+   **Verified live 2026-07-23 on CHV 53.0:** snapshot of the running `demo`
+   in 0.57s; task mutated to seq 45; restore in ~31s (dominated by the clean
+   stop). The restored guest kept its boot id and continuous uptime — no
+   reboot from its own point of view — with the tap carrier up, guestd
+   reconnected and ready, the mutation genuinely rewound (seq 45 → 30, the
+   mutation run gone from history), the pre-restore cursor rejected
+   `cursor.stale`, and replay clean under the rotated incarnation. Two honest
+   residuals: the guest's CLOCK_REALTIME lags by the stopped window (~52s
+   here) and the image ships no NTP client to correct it — enable
+   `systemd-timesyncd` in vm-base (or step the clock from guestd on the
+   restored ack) before relying on guest wall-clock time after restores; and
+   `boot_config` reports stale for a restored VM (bare-VMM argv), truthfully,
+   until its next plain reboot.
 
 6. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only
