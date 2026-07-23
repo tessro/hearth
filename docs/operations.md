@@ -396,8 +396,11 @@ Rules that keep restores sound:
   (`snapshot.no_disk` / `snapshot.no_state`) before the running VM is
   touched.
 - The guest's wall clock resumes behind by however long the VM was stopped;
-  monotonic time is unaffected. Run an NTP client in the guest if wall-clock
-  accuracy matters after restores.
+  monotonic time is unaffected. Images on the current vm-base correct this
+  themselves: guestd steps CLOCK_REALTIME from the restored ack's
+  `host_time_ms` (when hearthd is new enough to send it), and the baked-in
+  `systemd-timesyncd` re-disciplines from NTP either way. Older images need
+  their own NTP client if wall-clock accuracy matters after restores.
 - A restored VM's transient unit runs a bare-VMM command line, so `status`
   reports `boot_config: stale` until the next plain reboot. The flag is
   truthful: a restart would boot with current flags.

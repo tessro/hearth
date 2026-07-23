@@ -89,6 +89,13 @@ pub struct GuestFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportAck {
     pub restored: bool,
+    /// Host CLOCK_REALTIME (unix milliseconds) when the ack was written. A
+    /// restored guest's wall clock lags by the stopped window (CHV advances
+    /// only the monotonic clock across a restore), so guestd steps
+    /// CLOCK_REALTIME from a `restored` ack instead of waiting out an NTP
+    /// poll. Optional so either side can be older than the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_time_ms: Option<u64>,
 }
 
 /// Frames hearthd sends on the boot-report channel.

@@ -4,6 +4,7 @@
 //! wake-ups). A musl-linked static binary so it drops into any image.
 
 pub mod adapter;
+pub mod clock;
 pub mod engine;
 pub mod report;
 pub mod server;

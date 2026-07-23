@@ -355,5 +355,11 @@ history for each lives in that file's git log.
 - **Example-image probes await retirement.** `hermes-probe`/`netdiag` (and
   `scripts/test-hermes-vm.sh`, which depends on them) are functionally
   superseded by the guestd boot report.
-- **Guest images ship no NTP client**, so a VM restored from a snapshot keeps
-  a wall clock behind by the stopped window until one is added (in progress).
+- **The post-restore clock step needs its live proof.** vm-base now ships an
+  enabled `systemd-timesyncd` (verified live: a restored guest's ~2min lag
+  converged within a poll), and guestd steps CLOCK_REALTIME from the restored
+  ack's `host_time_ms` — but the installed hearthd predates that field, so
+  the immediate step has not fired live. Verify after the next hearthd
+  deploy: snapshot/restore a VM and expect `stepped CLOCK_REALTIME` in its
+  `hearth-guestd` journal. Existing images predating the change still need a
+  rebuild (or their own NTP client) to pick up timesyncd.

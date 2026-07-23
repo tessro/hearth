@@ -5,8 +5,11 @@ boilerplate that `hermes-vm` and `agent-vm` used to each copy verbatim (they
 were ~60% identical and drifting): systemd + udev enablement, `systemd-networkd`
 with a DHCP `.network` matching `en*`, the `/usr/local/bin/init` mount shim,
 the `/etc/fstab` root entry with `x-systemd.growfs`, the `serial-getty@ttyS0`
-mask, `STOPSIGNAL SIGRTMIN+3`, `openssh-server`, and a one-shot unit that runs
-`ssh-keygen -A` before sshd when host keys are absent.
+mask, `STOPSIGNAL SIGRTMIN+3`, `openssh-server`, a one-shot unit that runs
+`ssh-keygen -A` before sshd when host keys are absent, and `systemd-timesyncd`
+for wall-clock discipline (a restored VM resumes with `CLOCK_REALTIME` lagging
+by the stopped window — guestd steps it from the restored ack, timesyncd
+re-syncs after the step and owns steady state).
 
 Every line exists because its absence cost a full build+boot cycle to diagnose
 from the serial console during the 2026-07 Hermes bring-up.

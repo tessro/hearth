@@ -79,8 +79,13 @@ async fn report_once(
     let mut line = String::new();
     if reader.read_line(&mut line).await? != 0 {
         if let Ok(host) = serde_json::from_str::<HostFrame>(&line) {
-            if host.ack.map(|a| a.restored).unwrap_or(false) {
+            if let Some(ack) = host.ack.filter(|a| a.restored) {
                 info!("boot follows a restore; rotating task incarnations");
+                // Step the wall clock before touching durable state, so
+                // post-restore records carry corrected timestamps.
+                if let Some(host_time_ms) = ack.host_time_ms {
+                    crate::clock::step_to_host_time(host_time_ms);
+                }
                 if let Err(err) = engine.rotate_incarnation() {
                     warn!(error = %err, "failed to rotate incarnations after restore");
                 }

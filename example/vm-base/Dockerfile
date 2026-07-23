@@ -40,6 +40,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   xz-utils               — the Hermes installer dies mid-build without it
 #                            (inventory, a full boot cycle lost).
 #   procps, sudo           — probes and the passwordless `agent` shell.
+#   systemd-timesyncd      — SNTP client. A restored VM's CLOCK_REALTIME lags
+#                            by the stopped window (CHV ≥53 advances only the
+#                            monotonic clock; ~52s measured live). guestd
+#                            steps the clock from the restored ack; timesyncd
+#                            owns steady-state discipline and re-syncs right
+#                            after any step.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -52,6 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     systemd \
     systemd-sysv \
+    systemd-timesyncd \
     udev \
     util-linux \
     xz-utils \
@@ -113,6 +120,10 @@ RUN chmod 0755 /usr/local/bin/init /usr/local/bin/hearth-usersession-check /usr/
   && ln -sf /lib/systemd/system/dbus.socket /etc/systemd/system/sockets.target.wants/dbus.socket \
   && ln -sf /lib/systemd/system/dbus.service /etc/systemd/system/multi-user.target.wants/dbus.service \
   && ln -sf /lib/systemd/system/systemd-logind.service /etc/systemd/system/multi-user.target.wants/systemd-logind.service \
+  # timesyncd at its native WantedBy (sysinit): wall-clock discipline on every
+  # boot and after guestd's post-restore step. The package postinst can't run
+  # presets here, so wire it by hand like the rest.
+  && ln -sf /lib/systemd/system/systemd-timesyncd.service /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service \
   # Boot-time proof the agent user's session stack is live (one marker on serial).
   && ln -sf /etc/systemd/system/hearth-usersession.service /etc/systemd/system/multi-user.target.wants/hearth-usersession.service \
   # hearth-guestd at boot: the boot report replaces serial-marker readiness.

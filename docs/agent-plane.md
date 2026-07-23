@@ -172,7 +172,12 @@ On boot and on change, guestd connects out to `CID 2 port 1025` (lands on
   heartbeat `last_seen`.
 - The `restored` flag is set when hearthd told guestd (via this channel's
   handshake) that the boot follows a `restore` — used for cursor
-  invalidation (§3.4).
+  invalidation (§3.4). Every ack also carries `host_time_ms`, the host's
+  wall clock: a restored guest resumes with `CLOCK_REALTIME` lagging by the
+  stopped window (CHV advances only the monotonic clock), so on a `restored`
+  ack guestd steps the clock to the host's before rotating incarnations —
+  vm-base's `systemd-timesyncd` notices the set and re-disciplines against
+  real NTP from there.
 
 The boot report replaces the agent-image readiness work once done by
 `hermes-probe` and `netdiag`.

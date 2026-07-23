@@ -140,7 +140,10 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
                 self.guests
                     .update_report(name, frame.hello.as_ref(), report);
                 let ack = HostFrame {
-                    ack: Some(ReportAck { restored }),
+                    ack: Some(ReportAck {
+                        restored,
+                        host_time_ms: host_time_ms(),
+                    }),
                 };
                 stream
                     .write_all((serde_json::to_string(&ack)? + "\n").as_bytes())
@@ -162,4 +165,14 @@ impl<H: crate::host::Host + 'static> Daemon<H> {
             }
         }
     }
+}
+
+/// Host CLOCK_REALTIME as unix milliseconds — the ack's clock reference for
+/// the guest's post-restore step. `None` only if the host clock reads before
+/// the epoch, which is not worth a failure path.
+fn host_time_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
 }
