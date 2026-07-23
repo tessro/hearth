@@ -401,15 +401,26 @@ access would let a future session prove it.
    state only, so resuming it against a rootfs that advanced after the
    snapshot wedged the guest (dead net/vsock; rotation completed on the
    recovery boot, which still carried the pending-restore mark).
-   *Implemented 2026-07-22:* `snapshot` now copies the boot disk into the
-   snapshot directory (`disk.qcow2`, `cp --reflink=auto` so cloning-capable
-   filesystems pay nothing) inside the same paused window as the memory dump,
-   and `restore` copies it back over the live disk before relaunching CHV —
-   refusing disk-less snapshots with `snapshot.no_disk` *before* stopping the
-   running VM. Unit-tested (pause < dump < disk < resume ordering, resume on
-   either failure, early refusal). *Still to verify live:* one
-   snapshot → mutate → restore cycle proving the restored guest comes back
-   healthy and the mutation is genuinely rewound.
+   *Implemented 2026-07-22:* snapshots are disk captures, restores are cold
+   boots. A first cut kept CHV's memory dump and restored it alongside the
+   captured disk, and the live host disproved it: even with a byte-identical
+   disk, the resumed image came back with a `NO-CARRIER` tap — fd-backed
+   devices (tap, vsock) cannot be revived from on-disk state; CHV expects the
+   restorer to pass fresh fds over the API (`net_fds` + `SCM_RIGHTS`).
+   Rather than plumb fds through `systemd-run`, `snapshot` now pauses the
+   vCPUs, captures the boot disk (`disk.qcow2`, `cp --reflink=auto`, ~1.3s
+   observed live), and resumes — no memory dump — and `restore` copies the
+   disk back and boots it through the ordinary start path, with
+   `mark_pending_restore` driving the incarnation rotation exactly as the
+   live pass proved. Disk-less snapshots are refused with `snapshot.no_disk`
+   *before* the running VM is touched. Guest memory state is deliberately not
+   restored: the agent plane is built for cold boots (durable task logs,
+   reconnecting channels, reloadable sessions). A future memory-resume needs
+   the CHV `net_fds` re-plumbing and is not promised. Unit-tested
+   (pause < disk < resume, resume-on-failure, cold boot after disk copy-back,
+   early refusal). *Still to verify live:* one snapshot → mutate → restore
+   cycle proving the restored guest boots healthy and the mutation is
+   genuinely rewound.
 
 6. **Inter-guest bridge isolation.** Explicitly a non-goal of the proposal (§8,
    §14); no code claims to solve it and nothing here depends on it. Listed only

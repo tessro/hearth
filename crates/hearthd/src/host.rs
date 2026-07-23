@@ -46,12 +46,6 @@ pub trait Host: Send + Sync {
         service: &Service,
         image: &ImageManifest,
     ) -> Result<()>;
-    async fn systemd_restore_vm(
-        &self,
-        cfg: &Config,
-        service: &Service,
-        snapshot_dir: &Utf8Path,
-    ) -> Result<()>;
     async fn wait_for_vm_socket(&self, path: &Utf8Path, dur: Duration) -> Result<()>;
     async fn systemctl(&self, args: &[&str]) -> Result<String>;
     async fn qemu_img_create(
@@ -114,25 +108,6 @@ impl Host for RealHost {
         unlink_stale(&cfg.vm_vsock_socket(&service.id)).await?;
         let _ = ensure_tap(&cfg.bridge, &tap_name(&service.id)).await?;
         systemd_run_chv(service, cloud_hypervisor_argv(cfg, service, image)).await
-    }
-
-    async fn systemd_restore_vm(
-        &self,
-        cfg: &Config,
-        service: &Service,
-        snapshot_dir: &Utf8Path,
-    ) -> Result<()> {
-        fs::create_dir_all(cfg.run_dir.join("vms")).await?;
-        fs::create_dir_all(cfg.run_dir.join("vsock")).await?;
-        fs::create_dir_all(&cfg.log_dir).await?;
-        unlink_stale(&cfg.vm_socket(&service.id)).await?;
-        unlink_stale(&cfg.vm_vsock_socket(&service.id)).await?;
-        let _ = ensure_tap(&cfg.bridge, &tap_name(&service.id)).await?;
-        systemd_run_chv(
-            service,
-            cloud_hypervisor_restore_argv(cfg, service, snapshot_dir),
-        )
-        .await
     }
 
     async fn wait_for_vm_socket(&self, path: &Utf8Path, dur: Duration) -> Result<()> {
@@ -398,28 +373,6 @@ fn kernel_cmdline(manifest: &hearth_proto::ImageManifest) -> String {
         "console=ttyS0 root={} rootfstype={} rw init={}",
         manifest.root_device, manifest.root_fstype, manifest.init
     )
-}
-
-pub fn cloud_hypervisor_restore_argv(
-    cfg: &Config,
-    service: &Service,
-    snapshot_dir: &Utf8Path,
-) -> Vec<String> {
-    vec![
-        "cloud-hypervisor".to_string(),
-        "--api-socket".to_string(),
-        cfg.vm_socket(&service.id).to_string(),
-        // CHV requires a boot payload argument even under --restore (the
-        // restored state supplies the actual memory/device contents).
-        "--kernel".to_string(),
-        cfg.guest_kernel.to_string(),
-        "--restore".to_string(),
-        format!("source_url=file://{snapshot_dir},resume=true"),
-        "--serial".to_string(),
-        format!("file={}", cfg.console_path(&service.id)),
-        "--console".to_string(),
-        "off".to_string(),
-    ]
 }
 
 pub async fn wait_for_socket(path: &Utf8Path, dur: Duration) -> Result<()> {
