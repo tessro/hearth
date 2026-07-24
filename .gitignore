@@ -26,3 +26,7 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# Claude Code
+.claude/settings.local.json
+.claude/worktrees
