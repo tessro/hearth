@@ -2,9 +2,12 @@
 Description=Install the Hearth host egress CA
 Documentation=file:/usr/local/share/doc/hearth/operations.md
 # Hearth writes the public CA into the disk before first boot. Run before
-# sysinit so all later system and user services see the combined trust bundle.
+# sysinit so all later system and user services see the combined trust bundle,
+# but after local-fs.target: update-ca-certificates builds the bundle through
+# a temp file in /tmp, and tmp.mount landing a tmpfs over /tmp mid-run makes
+# that file vanish (observed as "cannot open /tmp/ca-certificates.tmp.*").
 DefaultDependencies=no
-After=systemd-remount-fs.service
+After=systemd-remount-fs.service local-fs.target
 Before=sysinit.target hearth-guestd.service
 ConditionPathExists=/usr/local/share/ca-certificates/hearth-egress.crt
 
