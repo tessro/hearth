@@ -36,7 +36,8 @@ Edit `hermes.env`:
 - Set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable random value
   (`openssl rand -hex 32`) so the app's session survives VM restarts.
 - Set at least one model-provider key (e.g. `OPENROUTER_API_KEY`), **or** leave
-  them blank and run `hermes setup --portal` over SSH after first boot.
+  them blank and run `hermes setup --portal` over SSH after first boot, **or**
+  use host-managed egress (below) and set no real key at all.
 
 Put your Mac's SSH public key in `authorized_keys`, or configure the host-wide
 `/etc/hearth/authorized_keys`. Hearth requires at least one effective recovery
@@ -100,6 +101,27 @@ from `hermes.env`.
 Hermes' own docs warn against exposing a password-protected backend to the open
 internet — keep this on a trusted LAN/VPN, or install Tailscale in the guest and
 connect over the tailnet instead.
+
+## Keys via host-managed egress
+
+With `services.hearth.egressProxy` on (see
+[`docs/egress-proxy.md`](../../docs/egress-proxy.md)), the VM needs no real
+provider key. On the host, add the provider to Stalin's policy and set a
+placeholder:
+
+```nix
+services.hearth.egressProxy.placeholderEnvironment.OPENROUTER_API_KEY =
+  "stalin-managed";
+```
+
+Hearth writes that placeholder into the VM's global environment, so both
+`hermes serve` (a system unit, via PID 1's `DefaultEnvironment`) and the
+guestd ACP path (via `HEARTH_EGRESS_PASSTHROUGH` across Hermes's cleared
+environment) see `OPENROUTER_API_KEY` set — which is what makes Hermes offer
+the provider — while Stalin swaps in the real key on the host. Leave the
+provider lines in `hermes.env` unset; a real key there would be sent as-is
+and bypass the point of keeping keys out of VMs. Nothing in this image
+changes: the placeholder arrives at provision time, not build time.
 
 ## Notes
 

@@ -28,7 +28,7 @@ openssl req -x509 -new -nodes \
   -out stalin-ca.pem
 ```
 
-Use an exact Stalin policy. This example covers OpenAI:
+Use an exact Stalin policy. This example covers OpenAI and OpenRouter:
 
 ```toml
 listen = "10.26.8.1:8080"
@@ -44,9 +44,19 @@ host = "api.openai.com"
 port = 443
 tls = "inspect"
 
+[destinations.openrouter]
+scheme = "https"
+host = "openrouter.ai"
+port = 443
+tls = "inspect"
+
 [secrets.openai_api_key]
 source = "systemd_credential"
 name = "openai_api_key"
+
+[secrets.openrouter_api_key]
+source = "systemd_credential"
+name = "openrouter_api_key"
 
 [[rules]]
 name = "openai-auth"
@@ -55,6 +65,15 @@ audit = true
 
 [rules.request_headers.set.authorization]
 secret = "openai_api_key"
+format = "Bearer {value}"
+
+[[rules]]
+name = "openrouter-auth"
+destination = "openrouter"
+audit = true
+
+[rules.request_headers.set.authorization]
+secret = "openrouter_api_key"
 format = "Bearer {value}"
 ```
 
@@ -84,10 +103,15 @@ Then connect the policy and runtime secret paths to Hearth:
       credentials = {
         mitm_ca_key = "/run/agenix/stalin-ca-key";
         openai_api_key = "/run/agenix/openai-api-key";
+        openrouter_api_key = "/run/agenix/openrouter-api-key";
       };
 
-      # Public dummy value for SDKs that check this before making a request.
-      placeholderEnvironment.OPENAI_API_KEY = "stalin-managed";
+      # Public dummy values for SDKs that check these before making a request.
+      # Hermes, for example, only offers a provider whose variable is set.
+      placeholderEnvironment = {
+        OPENAI_API_KEY = "stalin-managed";
+        OPENROUTER_API_KEY = "stalin-managed";
+      };
 
       # Block direct guest port-443 traffic so HTTPS cannot bypass Stalin.
       blockDirectHttps = true;
