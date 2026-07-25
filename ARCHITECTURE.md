@@ -355,11 +355,11 @@ history for each lives in that file's git log.
   budget in step 6 and accepting the loss of its on-failure
   `journalctl -u hermes.service` dump — best done with the rest of the
   serial-marker retirement (`HEARTH_AGENT_PROBE`, `HEARTH_USERSESSION`).
-- **The post-restore clock step needs its live proof.** vm-base now ships an
-  enabled `systemd-timesyncd` (verified live: a restored guest's ~2min lag
-  converged within a poll), and guestd steps CLOCK_REALTIME from the restored
-  ack's `host_time_ms` — but the installed hearthd predates that field, so
-  the immediate step has not fired live. Verify after the next hearthd
-  deploy: snapshot/restore a VM and expect `stepped CLOCK_REALTIME` in its
-  `hearth-guestd` journal. Existing images predating the change still need a
-  rebuild (or their own NTP client) to pick up timesyncd.
+- **Example images need a rebuild for the post-restore clock step.** The step
+  itself is proven: verified live 2026-07-24 on `demo` (hearthd and guestd both
+  at 4027d84) — a 121s stopped window logged `stepped CLOCK_REALTIME to the
+  host clock delta_ms=121525`, after which host and guest agreed to ~130ms
+  with `NTPSynchronized=yes`. What remains is the workload images: those built
+  before this change carry neither the new guestd nor `systemd-timesyncd`, so
+  they need a rebuild on the current vm-base (or `hearthctl upgrade` per VM,
+  which only covers guestd) before freshly spawned VMs get the behaviour.
