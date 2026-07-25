@@ -359,7 +359,6 @@ pub async fn run(socket: &Utf8Path, opts: SpawnOptions) -> Result<()> {
                 dockerfile,
                 context: opts.context.clone(),
                 disk_gib: opts.build_disk_gib,
-                rootless: false,
                 network: opts.build_network,
                 build_args: opts.build_args.clone(),
                 skip_lint: false,

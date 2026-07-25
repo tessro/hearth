@@ -348,10 +348,6 @@ history for each lives in that file's git log.
   responses) and the Claude adapter's version pin predates the audited CLI.
   Both need a rewrite against a freshly pinned real binary plus provisioned
   authentication before any image advertises them.
-- **`hearthctl image build --rootless` is broken**: it flattens root-owned
-  guest files to the invoking uid, producing an invalid sudo installation.
-  Workaround: run `hearthctl image build` inside `buildah unshare` without
-  the flag.
 - **Example-image probes await retirement.** `hermes-probe`/`netdiag` (and
   `scripts/test-hermes-vm.sh`, which depends on them) are functionally
   superseded by the guestd boot report.

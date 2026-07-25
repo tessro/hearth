@@ -183,7 +183,12 @@ clean destroy. Use `CLEAN=1` to replace a previous test service and image:
 sudo CLEAN=1 scripts/test-agent-vm.sh
 ```
 
-`hearthctl image build` defaults to a rootful `umoci unpack` for this path so
-ownership and filesystem metadata have a chance to survive into the VM root
-disk. The `--rootless` flag remains available for lightweight smoke builds, but
-it is not suitable for proving an agent-ready VM rootfs.
+`hearthctl image build` needs no sudo: run unprivileged, it re-executes itself
+under `buildah unshare`, where uid 0 plus the subuid range are mapped (the same
+`/etc/subuid` setup rootless buildah already requires) — so `umoci unpack`
+records real ownership and setuid bits, and `mkfs.ext4 -d` carries them into
+the VM root disk byte-for-byte. Run as actual root it unpacks directly. The
+linter rejects any build whose ownership came out flattened (agent home not
+uid 1000, sudo not setuid root), so a broken-permission image fails at build
+time instead of after a boot cycle. There is no `--rootless` flatten mode: it
+produced images that booted but had a silently broken sudo.

@@ -12,6 +12,7 @@ clap.workspace = true
 comfy-table.workspace = true
 hearth-agent-proto = { path = "../hearth-agent-proto" }
 hearth-proto = { path = "../hearth-proto" }
+libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

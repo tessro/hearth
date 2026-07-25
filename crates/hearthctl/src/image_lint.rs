@@ -46,6 +46,7 @@ const CHECKS: &[Check] = &[
     check_udevd_enabled,
     check_network_matches_en,
     check_agent_account,
+    check_ownership_preserved,
     check_sshd_enabled,
     check_sshd_pubkey_enabled,
     check_no_baked_authorized_keys,
@@ -243,6 +244,69 @@ fn check_agent_account(ctx: &LintCtx) -> Option<Finding> {
             "agent must exist with uid=1000 gid=1000 and a real /home/agent directory for managed SSH access".to_string(),
         ))
     }
+}
+
+/// Guard against ownership-flattening regressions in the build pipeline. The
+/// retired `--rootless` flatten mode produced images that *booted* fine and
+/// only failed when something touched sudo or shadow — a full boot cycle to
+/// diagnose. These canaries make that failure a build-time reject: the agent
+/// home must keep uid 1000, and (when present) sudo must stay setuid root
+/// and shadow root-owned.
+fn check_ownership_preserved(ctx: &LintCtx) -> Option<Finding> {
+    // Ownership is judged only where it could have been preserved at all —
+    // as real root or as uid 0 inside the build's user namespace, where stat
+    // reports the ids the guest will see. (This also keeps the linter's
+    // unit tests root-free: the check is inert unprivileged.)
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    use std::os::unix::fs::MetadataExt;
+    const CANARIES: &[(&str, u32, bool)] = &[
+        ("/home/agent", 1000, false),
+        ("/usr/bin/sudo", 0, true),
+        ("/etc/shadow", 0, false),
+    ];
+    let violations: Vec<String> = CANARIES
+        .iter()
+        .filter_map(|(path, want_uid, want_setuid)| {
+            let observed = fs::symlink_metadata(under(ctx, path))
+                .ok()
+                .map(|md| (md.uid(), md.mode()));
+            ownership_violation(path, observed, *want_uid, *want_setuid)
+        })
+        .collect();
+    if violations.is_empty() {
+        None
+    } else {
+        Some(reject(
+            "ownership",
+            format!(
+                "rootfs ownership was not preserved ({}) — the guest would boot with a broken \
+                 sudo/permission layout; build as root or let hearthctl re-exec under `buildah unshare`",
+                violations.join("; ")
+            ),
+        ))
+    }
+}
+
+/// Judge one canary's observed `(uid, mode)`. `None` observed means the file
+/// is absent, which is not this check's business (other checks own presence).
+fn ownership_violation(
+    label: &str,
+    observed: Option<(u32, u32)>,
+    want_uid: u32,
+    want_setuid: bool,
+) -> Option<String> {
+    let (uid, mode) = observed?;
+    if uid != want_uid {
+        return Some(format!(
+            "{label} is owned by uid {uid}, expected {want_uid}"
+        ));
+    }
+    if want_setuid && mode & 0o4000 == 0 {
+        return Some(format!("{label} lost its setuid bit (mode {mode:o})"));
+    }
+    None
 }
 
 fn check_sshd_pubkey_enabled(ctx: &LintCtx) -> Option<Finding> {
@@ -748,6 +812,23 @@ mod tests {
         .unwrap();
         fs::remove_dir(root.join("home/agent")).unwrap();
         assert!(check_agent_account(&ctx(&root)).is_some());
+    }
+
+    #[test]
+    fn ownership_violations_catch_flattened_ids_and_lost_setuid() {
+        // Correct root-owned setuid sudo passes.
+        assert!(ownership_violation("/usr/bin/sudo", Some((0, 0o104_755)), 0, true).is_none());
+        // Flattened to the build uid — exactly what umoci --rootless produced.
+        let flat = ownership_violation("/usr/bin/sudo", Some((1000, 0o104_755)), 0, true).unwrap();
+        assert!(flat.contains("owned by uid 1000"));
+        // Setuid stripped is caught even with correct ownership.
+        let stripped = ownership_violation("/usr/bin/sudo", Some((0, 0o100_755)), 0, true).unwrap();
+        assert!(stripped.contains("setuid"));
+        // The agent home must keep uid 1000 in the other direction.
+        assert!(ownership_violation("/home/agent", Some((0, 0o40_755)), 1000, false).is_some());
+        assert!(ownership_violation("/home/agent", Some((1000, 0o40_755)), 1000, false).is_none());
+        // An absent canary is another check's business, never a violation.
+        assert!(ownership_violation("/etc/shadow", None, 0, false).is_none());
     }
 
     #[test]

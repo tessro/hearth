@@ -3,8 +3,8 @@ use crate::{
     image_lint::{self, LintCtx},
     oci::{
         buildah_bud_args, buildah_push_args, command, data_dir, parent, read_oci_process,
-        remove_dir_if_exists, remove_file_if_exists, run_status, umoci_unpack_args_with_rootless,
-        BuildNetwork,
+        reexec_under_userns_if_unprivileged, remove_dir_if_exists, remove_file_if_exists,
+        run_status, umoci_unpack_args, BuildNetwork,
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -32,7 +32,6 @@ pub struct BuildOptions {
     pub dockerfile: Utf8PathBuf,
     pub context: Utf8PathBuf,
     pub disk_gib: u64,
-    pub rootless: bool,
     pub network: BuildNetwork,
     pub build_args: Vec<String>,
     /// Skip the §2.2 rootfs linter. Documented for images that boot something
@@ -54,6 +53,10 @@ struct BuildPaths {
 
 pub async fn build(opts: BuildOptions) -> Result<()> {
     preflight_tools()?;
+    // Unprivileged builds run inside `buildah unshare` so ownership and
+    // setuid bits survive umoci unpack → mkfs.ext4 -d. Replaces the process;
+    // everything below runs as (namespace-)root either way.
+    reexec_under_userns_if_unprivileged()?;
     validate_image_name(&opts.name)?;
     for build_arg in &opts.build_args {
         validate_build_arg(build_arg)?;
@@ -107,7 +110,7 @@ pub async fn build(opts: BuildOptions) -> Result<()> {
     run_status(
         command(
             "umoci",
-            umoci_unpack_args_with_rootless(&paths.image_layout, &paths.bundle, opts.rootless),
+            umoci_unpack_args(&paths.image_layout, &paths.bundle),
         ),
         "umoci unpack",
     )

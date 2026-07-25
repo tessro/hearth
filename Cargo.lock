@@ -509,6 +509,7 @@ dependencies = [
  "comfy-table",
  "hearth-agent-proto",
  "hearth-proto",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

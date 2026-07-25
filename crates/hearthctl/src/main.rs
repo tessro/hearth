@@ -261,8 +261,6 @@ enum ImageCommand {
         context: Utf8PathBuf,
         #[arg(long = "disk", default_value_t = 20)]
         disk_gib: u64,
-        #[arg(long)]
-        rootless: bool,
         /// Network namespace for RUN steps. Defaults to `host`: netavark races
         /// its own iptables chains between consecutive RUN steps ("Chain
         /// already exists") on this host config as of buildah 1.43, so `host`
@@ -313,7 +311,6 @@ async fn main() -> Result<()> {
                 dockerfile,
                 context,
                 disk_gib,
-                rootless,
                 build_network,
                 build_arg,
                 skip_lint,
@@ -325,7 +322,6 @@ async fn main() -> Result<()> {
             dockerfile: dockerfile.clone(),
             context: context.clone(),
             disk_gib: *disk_gib,
-            rootless: *rootless,
             network: *build_network,
             build_args: build_arg.clone(),
             skip_lint: *skip_lint,
@@ -884,7 +880,6 @@ mod tests {
                 dockerfile: Utf8PathBuf::from("./Dockerfile"),
                 context: Utf8PathBuf::from("."),
                 disk_gib: 40,
-                rootless: false,
                 build_network: oci::BuildNetwork::Host,
                 build_arg: vec![],
                 skip_lint: false,
@@ -1057,7 +1052,6 @@ mod tests {
                         dockerfile,
                         context,
                         disk_gib,
-                        rootless,
                         build_network,
                         build_arg,
                         skip_lint,
@@ -1067,7 +1061,6 @@ mod tests {
                 assert_eq!(dockerfile, Utf8PathBuf::from("./Dockerfile"));
                 assert_eq!(context, Utf8PathBuf::from("."));
                 assert_eq!(disk_gib, 40);
-                assert!(!rootless);
                 // Defaults: host network, no build args, lint on.
                 assert_eq!(build_network, oci::BuildNetwork::Host);
                 assert!(build_arg.is_empty());

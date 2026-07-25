@@ -88,21 +88,53 @@ pub fn buildah_push_args(name: &str, image_layout: &Utf8Path) -> Vec<String> {
     ]
 }
 
-pub fn umoci_unpack_args_with_rootless(
-    image_layout: &Utf8Path,
-    bundle: &Utf8Path,
-    rootless: bool,
-) -> Vec<String> {
-    let mut args = vec!["unpack".to_string()];
-    if rootless {
-        args.push("--rootless".to_string());
-    }
-    args.extend([
+pub fn umoci_unpack_args(image_layout: &Utf8Path, bundle: &Utf8Path) -> Vec<String> {
+    vec![
+        "unpack".to_string(),
         "--image".to_string(),
         format!("{image_layout}:latest"),
         bundle.to_string(),
-    ]);
-    args
+    ]
+}
+
+/// Set by buildah in every process it re-executes inside the rootless user
+/// namespace (`buildah unshare` and buildah's own auto-unshare) — its
+/// presence means uid 0 plus the subuid range are already mapped.
+const USERNS_CONFIGURED_ENV: &str = "_CONTAINERS_USERNS_CONFIGURED";
+
+/// Re-exec the whole CLI under `buildah unshare` when building unprivileged.
+///
+/// The unpack must chown files to many uids (root-owned system files, the
+/// uid-1000 agent home) and the setuid bits must survive into `mkfs.ext4 -d`
+/// — none of which needs real privilege, only a uid 0 with subuids mapped,
+/// which is exactly what `buildah unshare` provides (from the same
+/// /etc/subuid setup rootless `buildah bud` already requires). umoci's own
+/// `--rootless` flatten mode is deliberately not offered: it records the
+/// wrong ownership into the image and strips setuid, producing a rootfs that
+/// boots but has a broken sudo — invisible until something needs it.
+///
+/// Returns only in the already-mapped cases (real root, or inside the
+/// namespace after the re-exec); otherwise the process is replaced.
+pub fn reexec_under_userns_if_unprivileged() -> Result<()> {
+    let euid_is_root = unsafe { libc::geteuid() } == 0;
+    if !needs_userns_reexec(euid_is_root, env::var_os(USERNS_CONFIGURED_ENV).is_some()) {
+        return Ok(());
+    }
+    let exe = env::current_exe().context("resolve current executable for buildah unshare")?;
+    eprintln!("hearthctl: unprivileged build; re-executing under `buildah unshare`");
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new("buildah")
+        .arg("unshare")
+        .arg("--")
+        .arg(exe)
+        .args(env::args_os().skip(1))
+        .exec();
+    Err(err).context("re-exec under buildah unshare")
+}
+
+/// Pure re-exec decision: unprivileged and not yet inside the namespace.
+fn needs_userns_reexec(euid_is_root: bool, userns_configured: bool) -> bool {
+    !euid_is_root && !userns_configured
 }
 
 pub fn read_oci_process(bundle: &Utf8Path) -> Result<OciProcess> {
@@ -253,21 +285,31 @@ mod tests {
     }
 
     #[test]
-    fn umoci_unpack_uses_rootless_bundle() {
+    fn umoci_unpack_preserves_ownership_no_rootless_flatten() {
         assert_eq!(
-            umoci_unpack_args_with_rootless(
+            umoci_unpack_args(
                 Utf8Path::new("/home/tess/.local/share/hearth/images/hearth-test"),
                 Utf8Path::new("/home/tess/.local/share/hearth/bundles/hearth-test"),
-                true
             ),
             vec![
                 "unpack",
-                "--rootless",
                 "--image",
                 "/home/tess/.local/share/hearth/images/hearth-test:latest",
                 "/home/tess/.local/share/hearth/bundles/hearth-test"
             ]
         );
+    }
+
+    #[test]
+    fn userns_reexec_only_when_unprivileged_and_unmapped() {
+        // Unprivileged outside the namespace: re-exec under buildah unshare.
+        assert!(needs_userns_reexec(false, false));
+        // Already inside `buildah unshare` (env marker set): run in place —
+        // anything else would re-exec forever.
+        assert!(!needs_userns_reexec(false, true));
+        // Real root unpacks with full ownership directly.
+        assert!(!needs_userns_reexec(true, false));
+        assert!(!needs_userns_reexec(true, true));
     }
 
     #[test]
