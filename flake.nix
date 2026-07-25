@@ -2,9 +2,17 @@
   description = "Hearth VM manager";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/b3da656039dc7a6240f27b2ef8cc6a3ef3bccae7";
+  inputs.stalin = {
+    url = "github:tessro/stalin";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      stalin,
+    }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
@@ -35,10 +43,14 @@
       };
 
       nixosModules.default = { pkgs, ... }: {
-        imports = [ ./nix/module.nix ];
+        imports = [
+          ./nix/module.nix
+          stalin.nixosModules.default
+        ];
         _module.args.hearthPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.hearth;
         _module.args.hearthGuestKernel = self.packages.${pkgs.stdenv.hostPlatform.system}.guest-kernel;
         _module.args.hearthCloudHypervisor = self.packages.${pkgs.stdenv.hostPlatform.system}.cloud-hypervisor;
+        _module.args.hearthStalinPackage = stalin.packages.${pkgs.stdenv.hostPlatform.system}.default;
       };
 
       checks.${system} = moduleChecks // {

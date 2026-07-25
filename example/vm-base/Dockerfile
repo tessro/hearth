@@ -88,6 +88,7 @@ COPY 20-dhcp.network /etc/systemd/network/20-dhcp.network
 COPY ssh-hostkeys.service /etc/systemd/system/ssh-hostkeys.service
 COPY hearth-usersession.service /etc/systemd/system/hearth-usersession.service
 COPY hearth-usersession-check /usr/local/bin/hearth-usersession-check
+COPY hearth-egress-ca.service /etc/systemd/system/hearth-egress-ca.service
 COPY init /usr/local/bin/init
 # hearth-guestd: the in-guest agent-plane daemon (docs/agent-plane.md §2). Built
 # by `make guest-bin` and staged into this build context beforehand; every image
@@ -124,6 +125,9 @@ RUN chmod 0755 /usr/local/bin/init /usr/local/bin/hearth-usersession-check /usr/
   # boot and after guestd's post-restore step. The package postinst can't run
   # presets here, so wire it by hand like the rest.
   && ln -sf /lib/systemd/system/systemd-timesyncd.service /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service \
+  # Install a host-provisioned public proxy CA before any normal service starts.
+  # With no egress config the ConditionPathExists check makes this a no-op.
+  && ln -sf /etc/systemd/system/hearth-egress-ca.service /etc/systemd/system/sysinit.target.wants/hearth-egress-ca.service \
   # Boot-time proof the agent user's session stack is live (one marker on serial).
   && ln -sf /etc/systemd/system/hearth-usersession.service /etc/systemd/system/multi-user.target.wants/hearth-usersession.service \
   # hearth-guestd at boot: the boot report replaces serial-marker readiness.

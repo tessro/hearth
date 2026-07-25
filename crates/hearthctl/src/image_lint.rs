@@ -503,6 +503,24 @@ pub fn rootfs_has_guestd(rootfs: &Utf8Path) -> bool {
     binary && unit && enabled
 }
 
+/// Whether the rootfs can install a host-provisioned proxy CA before network
+/// clients start. The config itself remains per-host and is never baked in.
+pub fn rootfs_supports_egress_proxy(rootfs: &Utf8Path) -> bool {
+    let unit = rootfs
+        .join("etc/systemd/system/hearth-egress-ca.service")
+        .exists()
+        || rootfs
+            .join("usr/lib/systemd/system/hearth-egress-ca.service")
+            .exists();
+    let enabled = fs::symlink_metadata(
+        rootfs
+            .join("etc/systemd/system/sysinit.target.wants/hearth-egress-ca.service")
+            .as_std_path(),
+    )
+    .is_ok();
+    unit && enabled
+}
+
 // --- helpers -------------------------------------------------------------
 
 /// Resolve an absolute guest path against the unpacked rootfs. The leading `/`
@@ -662,6 +680,14 @@ mod tests {
             sys.join("multi-user.target.wants/hearth-guestd.service"),
         )
         .unwrap();
+
+        // Host-managed egress capability in the current vm-base.
+        fs::write(sys.join("hearth-egress-ca.service"), b"").unwrap();
+        symlink(
+            "/etc/systemd/system/hearth-egress-ca.service",
+            sys.join("sysinit.target.wants/hearth-egress-ca.service"),
+        )
+        .unwrap();
     }
 
     fn tmp() -> (tempfile::TempDir, Utf8PathBuf) {
@@ -693,6 +719,17 @@ mod tests {
         assert!(!rootfs_has_guestd(&root));
         // The build stays green: a WARN never fails enforce.
         assert!(enforce(&lint(&ctx(&root))).is_ok());
+    }
+
+    #[test]
+    fn egress_proxy_support_requires_unit_and_enablement() {
+        let (_dir, root) = tmp();
+        assert!(rootfs_supports_egress_proxy(&root));
+        fs::remove_file(
+            root.join("etc/systemd/system/sysinit.target.wants/hearth-egress-ca.service"),
+        )
+        .unwrap();
+        assert!(!rootfs_supports_egress_proxy(&root));
     }
 
     #[test]

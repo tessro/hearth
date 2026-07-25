@@ -101,6 +101,8 @@ devenv shell -- target/release/hearthctl start dev
 
 - [`docs/operations.md`](docs/operations.md): host prerequisites, installation,
   networking, development, and upgrades.
+- [`docs/egress-proxy.md`](docs/egress-proxy.md): one host proxy, keys outside
+  VMs, global guest setup, and optional direct-HTTPS blocking.
 - [`docs/dockerfile-images.md`](docs/dockerfile-images.md): image contracts and
   rootfs construction.
 - [`docs/agent-plane.md`](docs/agent-plane.md): agent-plane architecture and

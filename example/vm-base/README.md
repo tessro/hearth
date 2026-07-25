@@ -72,6 +72,11 @@ session must work for that user — both over SSH and at boot, before any login.
   `HEARTH_USERSESSION ok` when the manager is active, `/run/user/1000` exists, and
   the agent's session bus answers — or `HEARTH_USERSESSION fail <reason>`. The
   acceptance tests gate on that marker with `hearthctl wait`.
+- **Host-managed egress.** `hearth-egress-ca.service` installs a public CA
+  written by Hearth before normal services start. It is a no-op when the host
+  egress feature is off. Hearth also writes system, user, login-shell, and
+  guestd proxy settings into each new disk; the image contains no proxy address
+  or provider key.
 
 ## What a workload image still owns
 
@@ -81,6 +86,9 @@ session must work for that user — both over SSH and at boot, before any login.
   `spawn --provision-file` / the service TOML `[provision]` block (§3), not
   `COPY`. That keeps credentials out of the shared image and gives each VM its
   own machine-id and SSH host keys.
+- **Proxy policy or provider keys.** The host owns Stalin's policy, CA private
+  key, and provider credentials. The VM receives only the public CA, proxy
+  address, and optional public placeholders.
 - **SSH authorized keys.** Hearth installs its host recovery keyring plus any
   per-VM `--ssh-key` / `--authorized-keys-file` values during disk provisioning.
   Workload images must not bake `/home/agent/.ssh/authorized_keys`.

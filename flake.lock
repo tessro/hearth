@@ -18,7 +18,28 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "stalin": "stalin"
+      }
+    },
+    "stalin": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1785005308,
+        "narHash": "sha256-i6CEy1AN4B/8ZCdHBpcKnn+SNTw4vO29AHd6U0qyx3U=",
+        "owner": "tessro",
+        "repo": "stalin",
+        "rev": "4f9e333d81a7b6f1bba7207f44d5234ba01485f0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tessro",
+        "repo": "stalin",
+        "type": "github"
       }
     }
   },

@@ -25,6 +25,19 @@ const LINE_CAP: usize = 4 * 1024 * 1024;
 const OUTPUT_CAP: u64 = 4 * 1024 * 1024;
 const REASONING_ID: &str = "hermes-reasoning";
 const DEFAULT_MCP_COMMAND: &str = "/usr/local/bin/hearth-guestd";
+const EGRESS_ENVIRONMENT: &[&str] = &[
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+];
 
 /// Optional process identity for a CLI installed and authenticated as the
 /// image's unprivileged workload user. Tests leave this unset.
@@ -86,6 +99,7 @@ impl HermesAdapter {
                      /usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 )
                 .env("XDG_RUNTIME_DIR", format!("/run/user/{}", identity.uid));
+            copy_egress_environment(&mut cmd);
         }
         cmd
     }
@@ -337,6 +351,32 @@ impl HermesAdapter {
             .map(|identity| identity.home.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/tmp".to_string())
     }
+}
+
+/// Preserve the small host-managed egress set across Hermes's `env_clear`.
+/// `HEARTH_EGRESS_PASSTHROUGH` names public placeholder variables written by
+/// hearthd; it never carries a provider secret itself.
+fn copy_egress_environment(command: &mut Command) {
+    for name in EGRESS_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    if let Ok(names) = std::env::var("HEARTH_EGRESS_PASSTHROUGH") {
+        for name in names.split(',').filter(|name| valid_environment_name(name)) {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 #[async_trait]
@@ -1065,5 +1105,15 @@ mod tests {
     fn validates_only_the_external_acp_session_boundary() {
         assert!(validate_session_id("fe9e3089-ccac-4609-b717-47f82bf41f81").is_ok());
         assert!(validate_session_id("--config=/tmp/other").is_err());
+    }
+
+    #[test]
+    fn egress_passthrough_accepts_only_variable_names() {
+        assert!(valid_environment_name("OPENAI_API_KEY"));
+        assert!(valid_environment_name("_PROVIDER_TOKEN"));
+        assert!(!valid_environment_name(""));
+        assert!(!valid_environment_name("9TOKEN"));
+        assert!(!valid_environment_name("KEY=value"));
+        assert!(!valid_environment_name("../KEY"));
     }
 }

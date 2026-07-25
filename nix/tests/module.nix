@@ -11,6 +11,22 @@ let
     if [ "''${1:-}" = --version ]; then echo "cloud-hypervisor test"; exit 0; fi
     exit 1
   '';
+  fakeStalin = pkgs.writeShellScriptBin "stalin" ''
+    if [ "''${1:-}" = health ]; then exit 0; fi
+    if [ "''${!#}" = serve ]; then
+      exec ${pkgs.socat}/bin/socat TCP-LISTEN:8080,bind=10.26.8.1,reuseaddr,fork EXEC:${pkgs.coreutils}/bin/true
+    fi
+    exit 1
+  '';
+  fakeStalinConfig = pkgs.writeText "stalin.toml" ''
+    listen = "10.26.8.1:8080"
+  '';
+  fakeCa = pkgs.writeText "stalin-ca.pem" ''
+    -----BEGIN CERTIFICATE-----
+    nix-module-test
+    -----END CERTIFICATE-----
+  '';
+  fakeProviderKey = pkgs.writeText "provider-key" "not-a-real-key";
   common = { ... }: {
     imports = [ hearthModule ];
     services.hearth = {
@@ -84,6 +100,44 @@ in
       machine.succeed("systemctl show dnsmasq -p After --value | grep network-online.target")
       machine.succeed("systemctl show hearth -p After --value | grep dnsmasq.service")
       machine.succeed("nft list table ip hearth-host | grep masquerade")
+    '';
+  };
+
+  module-egress-proxy = pkgs.testers.runNixOSTest {
+    name = "hearth-module-egress-proxy";
+    nodes.machine = { ... }: {
+      imports = [ common ];
+      services.hearth = {
+        networking = {
+          manage = true;
+          uplinkInterface = "eth1";
+        };
+        egressProxy = {
+          enable = true;
+          package = fakeStalin;
+          stalinConfigFile = toString fakeStalinConfig;
+          caCertificateFile = toString fakeCa;
+          credentials.openai_api_key = toString fakeProviderKey;
+          placeholderEnvironment.OPENAI_API_KEY = "stalin-managed";
+          blockDirectHttps = true;
+        };
+      };
+    };
+    testScript = ''
+      machine.wait_for_unit("stalin.service")
+      machine.wait_for_unit("hearth.service")
+      machine.succeed("systemctl show hearth -p Requires --value | grep stalin.service")
+      machine.succeed("systemctl show hearth -p After --value | grep stalin.service")
+      machine.succeed("systemctl cat stalin | grep 'LoadCredential=openai_api_key:'")
+      machine.succeed("systemctl show hearth -p Environment --value | grep HEARTH_EGRESS_CONFIG")
+      machine.succeed("grep -R 'proxy_url = \"http://10.26.8.1:8080\"' /nix/store/*-hearth-egress.toml")
+      machine.succeed("grep -R 'OPENAI_API_KEY = \"stalin-managed\"' /nix/store/*-hearth-egress.toml")
+      machine.succeed("nft list table ip hearth-host | grep 'tcp dport 443 reject'")
+      machine.succeed("nft list table ip hearth-host | grep 'udp dport 443 reject'")
+      # Only direct 443 is blocked; other guest traffic (DNS, NTP, SSH) is not.
+      machine.fail("nft list table ip hearth-host | grep 'chain input'")
+      machine.fail("nft list table ip hearth-host | grep -v 443 | grep reject")
+      machine.succeed("hearthctl host check | grep egress_proxy")
     '';
   };
 }

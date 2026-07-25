@@ -298,6 +298,11 @@ pub struct ImageManifest {
     /// `oci` so it serializes as a top-level scalar.
     #[serde(default)]
     pub guestd: bool,
+    /// Whether the image runs the early CA setup needed by Hearth's optional
+    /// host-managed outbound proxy. Images built on the current vm-base set
+    /// this from their rootfs contents.
+    #[serde(default)]
+    pub egress_proxy: bool,
     pub oci: OciProcess,
 }
 
@@ -312,6 +317,7 @@ impl ImageManifest {
             init: process.args[0].clone(),
             min_kernel_contract: default_min_kernel_contract(),
             guestd: false,
+            egress_proxy: false,
             oci: process,
         })
     }
@@ -434,6 +440,7 @@ mod tests {
         assert_eq!(manifest.init, "/usr/local/bin/init");
         assert_eq!(manifest.root_device, "/dev/vda");
         assert_eq!(manifest.root_fstype, "ext4");
+        assert!(!manifest.egress_proxy);
     }
 
     #[test]
@@ -461,6 +468,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.min_kernel_contract, 1);
+        assert!(!manifest.egress_proxy);
     }
 
     #[test]

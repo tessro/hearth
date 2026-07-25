@@ -235,6 +235,7 @@ install:
 	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/sysusers.d/hearth.conf $(DESTDIR)$(LIBDIR)/sysusers.d/hearth.conf
 	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/lib/tmpfiles.d/hearth.conf $(DESTDIR)$(LIBDIR)/tmpfiles.d/hearth.conf
 	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/share/doc/hearth/operations.md $(DESTDIR)$(DOCDIR)/operations.md
+	$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/share/doc/hearth/egress-proxy.md $(DESTDIR)$(DOCDIR)/egress-proxy.md
 	@if [ ! -e "$(DESTDIR)$(CONFDIR)/verb-policy.toml" ]; then \
 		$(INSTALL) -D -m 0644 $(RELEASE_STAGE)/etc/hearth/verb-policy.toml "$(DESTDIR)$(CONFDIR)/verb-policy.toml"; \
 	fi
@@ -248,7 +249,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/hearthd $(DESTDIR)$(BINDIR)/hearthctl $(DESTDIR)$(BINDIR)/hearth-agentd
 	rm -f $(DESTDIR)$(GUESTPAYLOADDIR)/hearth-guestd
 	rm -f $(DESTDIR)$(UNITDIR)/hearth.service $(DESTDIR)$(UNITDIR)/hearth-agentd.service
-	rm -f $(DESTDIR)$(DOCDIR)/operations.md
+	rm -f $(DESTDIR)$(DOCDIR)/operations.md $(DESTDIR)$(DOCDIR)/egress-proxy.md
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
 		systemctl daemon-reload; \
 	fi

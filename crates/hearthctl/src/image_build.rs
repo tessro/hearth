@@ -124,6 +124,7 @@ pub async fn build(opts: BuildOptions) -> Result<()> {
     // built on the current vm-base. Only a guestd-declaring image may back an
     // `agent = true` service; the linter warns when it is absent.
     manifest.guestd = image_lint::rootfs_has_guestd(&paths.rootfs);
+    manifest.egress_proxy = image_lint::rootfs_supports_egress_proxy(&paths.rootfs);
 
     // Validate the unpacked tree before we spend minutes turning it into a disk
     // (§2.2). Runs after umoci unpack, before mkfs.

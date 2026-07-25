@@ -5,6 +5,7 @@
   hearthPackage,
   hearthGuestKernel,
   hearthCloudHypervisor,
+  hearthStalinPackage,
   ...
 }:
 
@@ -28,6 +29,13 @@ let
   staticStart = lib.elemAt staticParts 0;
   staticEnd = lib.elemAt staticParts 1;
   staticCount = octetsToInt staticEnd - octetsToInt staticStart + 1;
+  egressToml = pkgs.formats.toml { };
+  egressConfig = egressToml.generate "hearth-egress.toml" {
+    proxy_url = "http://${cfg.egressProxy.guestAddress}:${toString cfg.egressProxy.port}";
+    ca_cert = cfg.egressProxy.caCertificateFile;
+    no_proxy = lib.concatStringsSep "," cfg.egressProxy.noProxy;
+    environment = cfg.egressProxy.placeholderEnvironment;
+  };
 in
 {
   options.services.hearth = {
@@ -71,6 +79,74 @@ in
         description = "Runtime source path for the ref key; never copied to the Nix store.";
       };
     };
+    egressProxy = {
+      enable = mkEnableOption "one host-wide Stalin egress proxy for all Hearth VMs";
+      package = mkOption {
+        type = types.package;
+        default = hearthStalinPackage;
+        description = "Stalin package used by the host-wide egress service.";
+      };
+      stalinConfigFile = mkOption {
+        type = types.str;
+        default = "/etc/stalin/config.toml";
+        description = "Runtime Stalin policy path. It may refer to systemd credentials.";
+      };
+      credentials = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = "Stalin systemd credential names mapped to runtime source paths.";
+      };
+      caCertificateFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Public Stalin CA certificate path. Hearth copies this certificate,
+          but never the CA key or provider keys, into each new VM.
+        '';
+      };
+      guestAddress = mkOption {
+        type = types.str;
+        default = "10.26.8.1";
+        description = "Host bridge address that guests use to reach Stalin.";
+      };
+      port = mkOption {
+        type = types.port;
+        default = 8080;
+        description = "Stalin HTTP proxy port reachable from Hearth guests.";
+      };
+      noProxy = mkOption {
+        type = types.listOf types.str;
+        default = [
+          "localhost"
+          "127.0.0.1"
+          "::1"
+          "10.26.8.0/24"
+        ];
+        description = "Addresses that guest HTTP clients must not send through Stalin.";
+      };
+      placeholderEnvironment = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        example = {
+          OPENAI_API_KEY = "stalin-managed";
+          ANTHROPIC_API_KEY = "stalin-managed";
+        };
+        description = ''
+          Public placeholder values for clients that require a provider
+          variable before they send a request. Never put a real key here: Nix
+          stores these values and Hearth writes them into VM disks.
+        '';
+      };
+      blockDirectHttps = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Reject direct guest traffic to port 443 (TCP and UDP) so HTTPS
+          cannot bypass Stalin. All other guest traffic is unaffected. This
+          requires networking.manage.
+        '';
+      };
+    };
     networking = {
       manage = mkOption {
         type = types.bool;
@@ -111,6 +187,29 @@ in
         {
           assertion = !cfg.networking.manage || cfg.networking.uplinkInterface != null;
           message = "services.hearth.networking.manage requires uplinkInterface";
+        }
+        {
+          assertion = !cfg.egressProxy.enable || cfg.egressProxy.caCertificateFile != null;
+          message = "services.hearth.egressProxy requires caCertificateFile";
+        }
+        {
+          assertion =
+            !cfg.egressProxy.enable
+            || (cfg.egressProxy.caCertificateFile != null
+              && lib.hasPrefix "/" cfg.egressProxy.stalinConfigFile
+              && lib.hasPrefix "/" cfg.egressProxy.caCertificateFile);
+          message = "services.hearth.egressProxy config and CA paths must be absolute";
+        }
+        {
+          assertion = !cfg.egressProxy.blockDirectHttps || cfg.networking.manage;
+          message = "services.hearth.egressProxy.blockDirectHttps requires networking.manage";
+        }
+        {
+          assertion =
+            lib.all
+              (name: builtins.match "[A-Za-z_][A-Za-z0-9_]*" name != null)
+              (builtins.attrNames cfg.egressProxy.placeholderEnvironment);
+          message = "services.hearth.egressProxy.placeholderEnvironment keys must be valid variable names";
         }
       ];
 
@@ -183,10 +282,24 @@ in
             "HEARTH_DHCP_STATIC_START=${staticStart}"
             "HEARTH_DHCP_STATIC_COUNT=${toString staticCount}"
             "HEARTH_DNSMASQ_DROPIN_DIR=/var/lib/hearth/dnsmasq.d"
-          ];
+          ] ++ lib.optional cfg.egressProxy.enable "HEARTH_EGRESS_CONFIG=${egressConfig}";
         };
       };
     }
+
+    (mkIf cfg.egressProxy.enable {
+      services.stalin = {
+        enable = true;
+        package = cfg.egressProxy.package;
+        configFile = cfg.egressProxy.stalinConfigFile;
+        credentials = cfg.egressProxy.credentials;
+        healthAddress = "${cfg.egressProxy.guestAddress}:${toString cfg.egressProxy.port}";
+      };
+      systemd.services.hearth = {
+        after = [ "stalin.service" ];
+        requires = [ "stalin.service" ];
+      };
+    })
 
     (mkIf cfg.agentPlane.enable {
       systemd.services.hearth-agentd = {
@@ -271,6 +384,18 @@ in
               type nat hook postrouting priority srcnat; policy accept;
               iifname "${cfg.networking.bridge}" oifname "${cfg.networking.uplinkInterface}" masquerade
             }
+            ${lib.optionalString cfg.egressProxy.blockDirectHttps ''
+              chain forward {
+                type filter hook forward priority filter; policy accept;
+                # Direct 443 from guests would bypass Stalin. UDP 443 covers
+                # QUIC/HTTP-3, which an HTTP proxy cannot carry; blocking it
+                # makes those clients fall back to TCP through the proxy.
+                # Inbound connections published to a guest's port 443 arrive
+                # from the uplink and are unaffected.
+                iifname "${cfg.networking.bridge}" tcp dport 443 reject with icmp type admin-prohibited
+                iifname "${cfg.networking.bridge}" udp dport 443 reject with icmp type admin-prohibited
+              }
+            ''}
           '';
         };
       };

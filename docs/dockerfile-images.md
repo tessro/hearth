@@ -45,6 +45,11 @@ hearthctl logs dev --follow
 Every image requires a `.hearth.toml` sidecar. A qcow2 without a valid manifest
 is not a Hearth image and cannot be listed, created, or started.
 
+Images built on the current `example/vm-base` also declare
+`egress_proxy = true`. This means they run the early public-CA setup used by
+host-managed egress. If the host feature is on, `create` rejects an older image
+without this flag and asks you to rebuild it before any disk work starts.
+
 ## Spawning multiple VMs from one template
 
 `hearthctl spawn` collapses build (if the image is missing) → create → start

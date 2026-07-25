@@ -102,6 +102,11 @@ pub struct Config {
         default_value = "/etc/hearth/verb-policy.toml"
     )]
     pub verb_policy: Utf8PathBuf,
+    /// Optional host-wide outbound proxy policy installed into each new VM.
+    /// This file must contain only a public CA path, proxy address, and public
+    /// placeholder values. Provider secrets stay in the host proxy.
+    #[arg(long, env = "HEARTH_EGRESS_CONFIG")]
+    pub egress_config: Option<Utf8PathBuf>,
 }
 
 impl Config {
@@ -175,5 +180,6 @@ mod tests {
         }
         assert!(cfg.authorized_keys_file.starts_with("/etc/hearth"));
         assert!(cfg.verb_policy.starts_with("/etc/hearth"));
+        assert!(cfg.egress_config.is_none());
     }
 }

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod egress;
 pub mod error;
 pub mod guests;
 pub mod host;
@@ -549,6 +550,15 @@ impl<H: Host + 'static> Daemon<H> {
                 ),
             ));
         }
+        if self.cfg.egress_config.is_some() && !manifest.egress_proxy {
+            return Err(coded(
+                "egress.image_unsupported",
+                format!(
+                    "image {image} does not support host-managed egress; rebuild it on the current \
+                     vm-base so its CA setup runs before network clients"
+                ),
+            ));
+        }
 
         // Provisioning args mirror the [provision] TOML shape; the CLI has
         // already resolved any client-side files into `from_literal` content.
@@ -594,6 +604,11 @@ impl<H: Host + 'static> Daemon<H> {
             provisioning.allow_no_ssh = false;
         }
         provisioning.hostname = hostname.to_string();
+        if let Some(path) = &self.cfg.egress_config {
+            crate::egress::augment_provision(path, &mut provisioning)
+                .await
+                .map_err(|e| coded("egress.invalid", format!("{e:#}")))?;
+        }
         // Build (and validate) the plan before any disk work so bad provision
         // args fail with no side effects.
         let plan = ProvisionPlan::from_provision(&provisioning)
@@ -1431,7 +1446,7 @@ impl<H: Host + 'static> Daemon<H> {
     }
 
     async fn host_check(&self) -> Result<Value> {
-        let checks = vec![
+        let mut checks = vec![
             check_path("services_dir", &self.cfg.services_dir, true),
             check_path("images_dir", &self.cfg.images_dir, true),
             check_path("disks_dir", &self.cfg.disks_dir, true),
@@ -1452,6 +1467,9 @@ impl<H: Host + 'static> Daemon<H> {
             check_kernel_module("kvm").await?,
             check_kernel_module("vhost_vsock").await?,
         ];
+        if let Some(path) = &self.cfg.egress_config {
+            checks.extend(crate::egress::checks(path).await);
+        }
         Ok(json!({ "checks": checks }))
     }
 
@@ -2519,6 +2537,84 @@ mod tests {
         assert_eq!(dev.provision.hostname, "dev");
         assert_eq!(dev.provision.ssh_access_state(), "configured");
         assert_eq!(dev.provision.authorized_keys, vec![TEST_AUTHORIZED_KEY]);
+    }
+
+    #[tokio::test]
+    async fn create_installs_host_egress_policy_in_supported_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let mut cfg = test_config(&root);
+        let egress_config = write_egress_config(&root).await;
+        cfg.egress_config = Some(egress_config);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("base"), b"base")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            cfg.image_manifest_path("base"),
+            egress_image_manifest_toml(),
+        )
+        .await
+        .unwrap();
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Create, create_args("proxied")))
+            .await;
+
+        assert!(responses[0].ok, "create failed: {:?}", responses[0].error);
+        let registry = Registry::load(&cfg).await.unwrap();
+        let provision = &registry.get("proxied").unwrap().provision;
+        assert!(provision
+            .files
+            .iter()
+            .any(|file| file.dest == Utf8Path::new(crate::egress::GUEST_CA_CERT)));
+        assert!(provision.files.iter().any(|file| {
+            file.dest == Utf8Path::new("/etc/hearth/egress.env")
+                && file
+                    .from_literal
+                    .contains("http_proxy=\"http://10.26.8.1:8080\"")
+                && file
+                    .from_literal
+                    .contains("OPENAI_API_KEY=\"stalin-managed\"")
+        }));
+        let calls = state.lock().unwrap().calls.clone();
+        let disk_call = calls
+            .iter()
+            .find(|call| call.starts_with("build-vm-disk "))
+            .unwrap();
+        assert!(disk_call.contains("/etc/systemd/system.conf.d/20-hearth-egress.conf"));
+        assert!(!disk_call.contains("stalin-managed"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_old_image_when_host_egress_is_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let mut cfg = test_config(&root);
+        cfg.egress_config = Some(write_egress_config(&root).await);
+        write_test_image(&cfg, "base").await;
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg, host);
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::Create, create_args("old-image")))
+            .await;
+
+        assert!(!responses[0].ok);
+        assert_eq!(
+            responses[0].error.as_ref().unwrap().code,
+            "egress.image_unsupported"
+        );
+        assert!(!state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| call.starts_with("build-vm-disk ")));
     }
 
     #[tokio::test]
@@ -4313,6 +4409,36 @@ args = ["/usr/local/bin/init"]
 env = ["EXEUNTU=1"]
 cwd = "/home/exedev"
 "#
+    }
+
+    fn egress_image_manifest_toml() -> String {
+        image_manifest_toml().replacen(
+            "init = \"/usr/local/bin/init\"",
+            "init = \"/usr/local/bin/init\"\negress_proxy = true",
+            1,
+        )
+    }
+
+    async fn write_egress_config(root: &Utf8Path) -> Utf8PathBuf {
+        let ca = root.join("egress-ca.pem");
+        tokio::fs::write(
+            &ca,
+            "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n",
+        )
+        .await
+        .unwrap();
+        let path = root.join("egress.toml");
+        tokio::fs::write(
+            &path,
+            format!(
+                "proxy_url = \"http://10.26.8.1:8080\"\nca_cert = \"{ca}\"\n\
+                 no_proxy = \"localhost,127.0.0.1\"\n\n\
+                 [environment]\nOPENAI_API_KEY = \"stalin-managed\"\n"
+            ),
+        )
+        .await
+        .unwrap();
+        path
     }
 
     fn service_toml(name: &str, enabled: bool, cid: u32, mac: &str) -> String {

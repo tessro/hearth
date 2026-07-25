@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
-use hearthd::{config::Config, ensure_dirs, host::RealHost, reconcile, Daemon};
+use hearthd::{config::Config, egress, ensure_dirs, host::RealHost, reconcile, Daemon};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Config::parse();
     init_tracing();
+    egress::validate_startup(cfg.egress_config.as_deref()).await?;
     ensure_dirs(&cfg).await?;
     let host = RealHost;
     reconcile(&cfg, &host).await?;

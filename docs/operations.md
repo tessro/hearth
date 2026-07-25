@@ -106,6 +106,12 @@ drop-ins. The host layer provides:
 dynamically handed-out lease. If you move the bridge subnet, move the static
 start with it.
 
+To keep provider keys out of guests, run one host-wide Stalin service and turn
+on `services.hearth.egressProxy`. Hearth then installs the public CA and global
+HTTP proxy environment into every new VM. See
+[`egress-proxy.md`](egress-proxy.md) for the full policy, secret, firewall, and
+image setup.
+
 ## 3. Install
 
 ### NixOS
@@ -264,6 +270,8 @@ means `create`/`start` will not fail on a missing prerequisite. `hearthctl image
 build` and `scripts/build-guest-kernel.sh` additionally preflight their own build
 tools, so a missing `mkfs.ext4` or `libelf-dev` fails up front with an install
 hint rather than mid-build.
+When host-managed egress is on, it also checks the egress config, public CA, and
+proxy socket.
 
 `make uninstall` removes the binaries, unit, and doc (and daemon-reloads).
 

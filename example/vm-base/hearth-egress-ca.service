@@ -1,0 +1,17 @@
+[Unit]
+Description=Install the Hearth host egress CA
+Documentation=file:/usr/local/share/doc/hearth/operations.md
+# Hearth writes the public CA into the disk before first boot. Run before
+# sysinit so all later system and user services see the combined trust bundle.
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target hearth-guestd.service
+ConditionPathExists=/usr/local/share/ca-certificates/hearth-egress.crt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/update-ca-certificates
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

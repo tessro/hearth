@@ -83,6 +83,7 @@ runCommand "hearth-${version}" { meta.mainProgram = "hearthctl"; } ''
   cp ${host}/bin/* $out/bin/
   cp ${guest}/bin/hearth-guestd $out/lib/hearth/guest/
   cp ${../systemd/hearth-agentd-verb-policy.toml} $out/share/hearth/verb-policy.toml
-  cp ${../README.md} ${../docs/operations.md} ${../docs/agent-plane.md} $out/share/doc/hearth/
+  cp ${../README.md} ${../docs/operations.md} ${../docs/agent-plane.md} \
+    ${../docs/egress-proxy.md} $out/share/doc/hearth/
   cp ${../LICENSE} $out/share/licenses/hearth/LICENSE
 ''
