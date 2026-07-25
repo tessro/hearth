@@ -180,7 +180,7 @@ On boot and on change, guestd connects out to `CID 2 port 1025` (lands on
   real NTP from there.
 
 The boot report replaces the agent-image readiness work once done by
-`hermes-probe` and `netdiag`.
+`hermes-probe`. (`netdiag`, the boot-time serial network dump, is gone.)
 
 ### 2.2 Agent adapters
 

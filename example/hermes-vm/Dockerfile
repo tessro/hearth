@@ -39,14 +39,11 @@ RUN mkdir -p /etc/systemd/system/hearth-guestd.service.d
 COPY hermes.service /etc/systemd/system/hermes.service
 COPY hermes-probe.service /etc/systemd/system/hermes-probe.service
 COPY hermes-probe /usr/local/bin/hermes-probe
-COPY netdiag.service /etc/systemd/system/netdiag.service
-COPY netdiag /usr/local/bin/netdiag
 COPY hearth-guestd-hermes.conf /etc/systemd/system/hearth-guestd.service.d/10-hermes.conf
 
-RUN chmod 0755 /usr/local/bin/hermes-probe /usr/local/bin/netdiag \
+RUN chmod 0755 /usr/local/bin/hermes-probe \
   && ln -sf /etc/systemd/system/hermes.service /etc/systemd/system/multi-user.target.wants/hermes.service \
-  && ln -sf /etc/systemd/system/hermes-probe.service /etc/systemd/system/multi-user.target.wants/hermes-probe.service \
-  && ln -sf /etc/systemd/system/netdiag.service /etc/systemd/system/multi-user.target.wants/netdiag.service
+  && ln -sf /etc/systemd/system/hermes-probe.service /etc/systemd/system/multi-user.target.wants/hermes-probe.service
 
 # §8 verification: fail the build here if the launcher moved off ~/.local/bin,
 # instead of discovering it from the serial console on first boot.

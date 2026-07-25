@@ -93,7 +93,7 @@ COPY init /usr/local/bin/init
 # by `make guest-bin` and staged into this build context beforehand; every image
 # on the new vm-base carries it, so its manifest declares guestd = true and it
 # can back agent-plane services. Its boot report also replaces the old
-# hermes-probe/netdiag readiness checks.
+# hermes-probe readiness check.
 COPY hearth-guestd /usr/local/bin/hearth-guestd
 COPY hearth-guestd.service /etc/systemd/system/hearth-guestd.service
 

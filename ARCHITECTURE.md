@@ -348,9 +348,13 @@ history for each lives in that file's git log.
   responses) and the Claude adapter's version pin predates the audited CLI.
   Both need a rewrite against a freshly pinned real binary plus provisioned
   authentication before any image advertises them.
-- **Example-image probes await retirement.** `hermes-probe`/`netdiag` (and
-  `scripts/test-hermes-vm.sh`, which depends on them) are functionally
-  superseded by the guestd boot report.
+- **`hermes-probe` awaits retirement.** `netdiag` is gone. `hermes-probe`
+  remains because it gates `scripts/test-hermes-vm.sh` on Hermes actually
+  serving `:9119`, which the boot report's `ready` (true as soon as guestd
+  dials out) does not attest. Retiring it means widening the host-side curl
+  budget in step 6 and accepting the loss of its on-failure
+  `journalctl -u hermes.service` dump — best done with the rest of the
+  serial-marker retirement (`HEARTH_AGENT_PROBE`, `HEARTH_USERSESSION`).
 - **The post-restore clock step needs its live proof.** vm-base now ships an
   enabled `systemd-timesyncd` (verified live: a restored guest's ~2min lag
   converged within a poll), and guestd steps CLOCK_REALTIME from the restored
