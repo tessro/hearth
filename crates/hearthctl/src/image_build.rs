@@ -138,6 +138,16 @@ pub async fn build(opts: BuildOptions) -> Result<()> {
     }
 
     materialize_rootfs(&paths, opts.disk_gib).await?;
+    // Identity and provenance travel in the sidecar so nothing downstream ever
+    // re-derives them: the digest makes `image ls` read-free, the timestamp
+    // orders builds (digests cannot), and the revision pins the recipe.
+    manifest.sha256 = Some(sha256_file_streamed(&paths.qcow2)?);
+    manifest.created = Some(
+        chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            .to_string(),
+    );
+    manifest.revision = git_revision(&opts.dockerfile);
     fs::write(&paths.manifest, toml::to_string_pretty(&manifest)?)?;
 
     let result = import_image(&opts, &paths).await?;
@@ -201,6 +211,52 @@ async fn import_image(opts: &BuildOptions, paths: &BuildPaths) -> Result<Value> 
         ]),
     )
     .await
+}
+
+/// Hash in fixed chunks: image qcow2s are multi-GiB and must never be pulled
+/// into memory whole.
+fn sha256_file_streamed(path: &Utf8Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {path} for hashing"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {path} for hashing"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Best-effort recipe provenance: the git revision of the Dockerfile's
+/// directory, `-dirty` suffixed when the tree has uncommitted changes. `None`
+/// outside a repository — provenance is recorded, never required.
+fn git_revision(dockerfile: &Utf8Path) -> Option<String> {
+    let dir = dockerfile.parent()?;
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.as_str())
+            .args(args)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let revision = git(&["rev-parse", "--short=12", "HEAD"])?;
+    let dirty = git(&["status", "--porcelain"]).is_none_or(|status| !status.is_empty());
+    Some(if dirty {
+        format!("{revision}-dirty")
+    } else {
+        revision
+    })
 }
 
 fn qemu_img_create_raw_args(raw_disk: &Utf8Path, disk_gib: u64) -> Vec<String> {

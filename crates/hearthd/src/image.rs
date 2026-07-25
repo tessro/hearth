@@ -84,10 +84,28 @@ mod tests {
         })
         .unwrap();
         manifest.min_kernel_contract = 2;
+        manifest.sha256 = Some("ab".repeat(32));
+        manifest.created = Some("2026-07-25T21:00:00Z".to_string());
+        manifest.revision = Some("abf6acb12345-dirty".to_string());
         let text = toml::to_string_pretty(&manifest).unwrap();
         assert!(text.contains("min_kernel_contract = 2"));
         let mut parsed: ImageManifest = toml::from_str(&text).unwrap();
         parsed.validate().unwrap();
         assert_eq!(parsed.min_kernel_contract, 2);
+        assert_eq!(parsed.sha256, manifest.sha256);
+        assert_eq!(parsed.created, manifest.created);
+        assert_eq!(parsed.revision, manifest.revision);
+    }
+
+    #[test]
+    fn manifest_rejects_a_malformed_digest() {
+        let mut manifest = ImageManifest::from_oci_process(hearth_proto::OciProcess {
+            args: vec!["/usr/local/bin/init".to_string()],
+            env: Vec::new(),
+            cwd: "/".to_string(),
+        })
+        .unwrap();
+        manifest.sha256 = Some("not-a-digest".to_string());
+        assert!(manifest.validate().is_err());
     }
 }

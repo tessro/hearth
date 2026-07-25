@@ -505,6 +505,7 @@ version = "0.0.2"
 dependencies = [
  "anyhow",
  "camino",
+ "chrono",
  "clap",
  "comfy-table",
  "hearth-agent-proto",

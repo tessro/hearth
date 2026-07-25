@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 camino.workspace = true
+chrono.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
 hearth-agent-proto = { path = "../hearth-agent-proto" }

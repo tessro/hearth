@@ -650,7 +650,7 @@ fn render_ls(result: Option<&Value>) -> Result<()> {
             cell(svc, "running"),
             guestd_cell(svc),
             cell(svc, "ssh_access"),
-            cell(svc, "image"),
+            image_cell(svc),
             cell(svc, "cpu"),
             cell(svc, "memory_mib"),
             cell(svc, "vsock_cid"),
@@ -668,12 +668,14 @@ fn render_images(result: Option<&Value>) -> Result<()> {
         .ok_or_else(|| anyhow!("malformed image ls response"))?;
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(["NAME", "BYTES", "SHA256"]);
+    table.set_header(["NAME", "CREATED", "REVISION", "BYTES", "SHA256"]);
     for image in images {
         table.add_row([
             cell(image, "name"),
+            cell_or_dash(image, "created"),
+            cell_or_dash(image, "revision"),
             cell(image, "bytes"),
-            cell(image, "sha256"),
+            short_digest(image.get("sha256").and_then(Value::as_str)),
         ]);
     }
     println!("{table}");
@@ -782,6 +784,39 @@ fn cell(value: &Value, key: &str) -> String {
                 .unwrap_or_else(|| v.to_string())
         })
         .unwrap_or_default()
+}
+
+/// Like `cell`, but absent or JSON-null values render as "-" instead of
+/// "null" — provenance fields are optional on pre-digest sidecars.
+fn cell_or_dash(value: &Value, key: &str) -> String {
+    match value.get(key) {
+        Some(Value::Null) | None => "-".to_string(),
+        Some(_) => cell(value, key),
+    }
+}
+
+/// First 12 hex characters — enough to disambiguate an image store, short
+/// enough to keep the table narrow. JSON output keeps the full digest.
+fn short_digest(digest: Option<&str>) -> String {
+    match digest {
+        Some(digest) => digest.chars().take(12).collect(),
+        None => "-".to_string(),
+    }
+}
+
+/// A service's image identity: `name@digest12` when the create-time digest is
+/// known, with an explicit `(stale)` marker when the store now offers a
+/// different build under that name.
+fn image_cell(svc: &Value) -> String {
+    let name = cell(svc, "image");
+    let Some(digest) = svc.get("image_digest").and_then(Value::as_str) else {
+        return name;
+    };
+    let short = short_digest(Some(digest));
+    match svc.get("image_state").and_then(Value::as_str) {
+        Some("stale") => format!("{name}@{short} (stale)"),
+        _ => format!("{name}@{short}"),
+    }
 }
 
 /// Render a service's `address`, which is JSON null until a lease or static

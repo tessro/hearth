@@ -50,6 +50,24 @@ Images built on the current `example/vm-base` also declare
 host-managed egress. If the host feature is on, `create` rejects an older image
 without this flag and asks you to rebuild it before any disk work starts.
 
+## Image identity: names are pointers, digests are builds
+
+`image build` records the qcow2's sha256, the build time, and the git revision
+of the Dockerfile's directory in the sidecar; import verifies (or backfills)
+the digest. `create` freezes the whole manifest into the service record —
+alongside the full disk copy it already takes — so a service never reads the
+image store again.
+
+That makes an image name a mutable pointer to its latest build:
+
+- Rebuilding a name **replaces** it. No version-suffixed sibling names needed;
+  `image ls` shows each name's created time, revision, and digest.
+- `hearthctl ls` shows each service as `name@digest12`, with `(stale)` when
+  the store has a newer build under that name — the signal to recreate.
+- `image rm` succeeds even while services created from that image run; their
+  boot config is frozen. Only a service created before manifest freezing still
+  boots through the store, and it blocks replace and remove until recreated.
+
 ## Spawning multiple VMs from one template
 
 `hearthctl spawn` collapses build (if the image is missing) → create → start

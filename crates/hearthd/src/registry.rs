@@ -1,6 +1,7 @@
 use crate::{config::Config, error::coded};
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use hearth_proto::ImageManifest;
 use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,15 @@ pub struct Service {
     pub provision: Provision,
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// The image manifest this VM was created from, frozen at create time (the
+    /// same move as resolving provision args into this record): every later
+    /// boot decision reads this copy, so the image name can be rebuilt or
+    /// removed without changing what an existing service means. Services
+    /// created before this field existed have none and keep reading the image
+    /// store. Declared last: a table, after every scalar, for
+    /// `toml::to_string_pretty`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_manifest: Option<ImageManifest>,
 }
 
 /// A managed host->guest port forward. The registry owns this VM forwarding;

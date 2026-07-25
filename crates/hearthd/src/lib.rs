@@ -27,7 +27,7 @@ use crate::{
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use chrono::Utc;
 #[cfg(test)]
 use hearth_agent_proto::PORT_REPORT;
@@ -64,6 +64,10 @@ const LEASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// paused window as the memory dump; required by `restore`.
 const SNAPSHOT_DISK_FILE: &str = "disk.qcow2";
 
+/// A remembered file digest and the (size, mtime) identity of the bytes it
+/// covers; a mismatch on lookup means the file changed and must re-hash.
+type CachedDigest = (u64, std::time::SystemTime, String);
+
 pub struct Daemon<H> {
     cfg: Config,
     host: Arc<H>,
@@ -73,6 +77,10 @@ pub struct Daemon<H> {
     pub(crate) guests: Arc<GuestTable>,
     /// Per-service hybrid vsock listener tasks (agent plane §6).
     pub(crate) channels: Arc<Mutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+    /// Digests of pre-digest image sidecars. Current sidecars carry their
+    /// digest; this exists only so legacy images cost one hash per daemon
+    /// lifetime instead of one per `image ls`.
+    image_digests: Arc<Mutex<HashMap<Utf8PathBuf, CachedDigest>>>,
 }
 
 impl<H> Clone for Daemon<H> {
@@ -84,6 +92,7 @@ impl<H> Clone for Daemon<H> {
             service_locks: Arc::clone(&self.service_locks),
             guests: Arc::clone(&self.guests),
             channels: Arc::clone(&self.channels),
+            image_digests: Arc::clone(&self.image_digests),
         }
     }
 }
@@ -97,6 +106,7 @@ impl<H: Host + 'static> Daemon<H> {
             service_locks: Arc::new(Mutex::new(HashMap::new())),
             guests: Arc::new(GuestTable::default()),
             channels: Arc::new(Mutex::new(HashMap::new())),
+            image_digests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -404,10 +414,35 @@ impl<H: Host + 'static> Daemon<H> {
         let leases = self.load_leases().await;
         let mut services = Vec::new();
         let mut probes = Vec::new();
+        // Store-side digests, one sidecar read per distinct image name, so
+        // every service row can say whether its frozen build is still what
+        // the store offers under that name.
+        let mut store_digests: HashMap<String, Option<String>> = HashMap::new();
         for svc in reg.services.values() {
             let running = self.is_running(&svc.id).await;
             let address = resolved_address(&reg, &leases, svc);
             let mut summary = service_summary(svc, running, address.map(|(ip, _)| ip));
+            if let Some(frozen_sha) = svc
+                .image_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sha256.as_ref())
+            {
+                summary["image_digest"] = json!(frozen_sha);
+                if !store_digests.contains_key(&svc.image) {
+                    let store_sha = image::load(&self.cfg, &svc.image)
+                        .await
+                        .ok()
+                        .and_then(|manifest| manifest.sha256);
+                    store_digests.insert(svc.image.clone(), store_sha);
+                }
+                if let Some(Some(store_sha)) = store_digests.get(&svc.image) {
+                    summary["image_state"] = json!(if store_sha == frozen_sha {
+                        "current"
+                    } else {
+                        "stale"
+                    });
+                }
+            }
             if let Some(guest) = self.guests.get(&svc.id) {
                 summary["guestd"] = guest.summary();
             } else if running {
@@ -451,6 +486,29 @@ impl<H: Host + 'static> Daemon<H> {
         value["provision"] = svc.provision.redacted_summary();
         value["ssh_access"] = json!(svc.provision.ssh_access_state());
         value["ssh_key_fingerprints"] = json!(svc.provision.ssh_key_fingerprints());
+        // Which build this VM actually is, and whether the store still offers
+        // that build under the same name — the question version-suffixed image
+        // names used to answer by hand.
+        if let Some(frozen) = &svc.image_manifest {
+            value["image_provenance"] = json!({
+                "sha256": frozen.sha256,
+                "created": frozen.created,
+                "revision": frozen.revision,
+            });
+            if let (Some(frozen_sha), Some(store_sha)) = (
+                &frozen.sha256,
+                image::load(&self.cfg, &svc.image)
+                    .await
+                    .ok()
+                    .and_then(|manifest| manifest.sha256),
+            ) {
+                value["image_state"] = json!(if *frozen_sha == store_sha {
+                    "current"
+                } else {
+                    "stale"
+                });
+            }
+        }
         // Always surface publishes (even when empty) and the guest address.
         value["publish"] = json!(svc.publish);
         let leases = self.load_leases().await;
@@ -646,6 +704,10 @@ impl<H: Host + 'static> Daemon<H> {
             publish,
             provision: provisioning,
             restart: RestartPolicy::default(),
+            // Frozen here, resolved never again: the disk below is a full
+            // copy, and with the manifest copied too the image store entry
+            // becomes a pure create-time template.
+            image_manifest: Some(manifest.clone()),
         };
         let disk_path = self.cfg.disks_dir.join(&disk_filename);
         let scratch = self.cfg.disk_path_ext(&id, "raw");
@@ -810,7 +872,7 @@ impl<H: Host + 'static> Daemon<H> {
             );
         }
         if !self.is_running(&svc.id).await {
-            let image_metadata = image::load(&self.cfg, &svc.image).await?;
+            let image_metadata = service_manifest(&self.cfg, &svc).await?;
             validate_boot_prerequisites(&self.cfg, &image_metadata).await?;
             // A fresh boot invalidates any previous guestd report; `wait` must
             // block on this boot's report, not the last one's.
@@ -1153,15 +1215,50 @@ impl<H: Host + 'static> Daemon<H> {
                 format!("manifest import source not found: {manifest_path}"),
             ));
         }
-        let _manifest = image::read_manifest(&manifest_path).await?;
+        let mut manifest = image::read_manifest(&manifest_path).await?;
+        // The digest is the image's identity from here on: services freeze it
+        // at create and `ls` compares against it. Verify a declared digest
+        // (a mismatch means the qcow2 and sidecar drifted apart) and backfill
+        // an absent one so every installed sidecar carries it.
+        let source_sha256 = sha256_file(&qcow2_path).await?;
+        match &manifest.sha256 {
+            Some(declared) if *declared != source_sha256 => {
+                return Err(coded(
+                    "image.digest_mismatch",
+                    format!(
+                        "manifest declares sha256 {declared} but {qcow2_path} hashes to \
+                         {source_sha256}"
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => manifest.sha256 = Some(source_sha256),
+        }
         fs::create_dir_all(&self.cfg.images_dir).await?;
+        // Serialize with create: a name is a mutable pointer, and the swap
+        // below must not race a create that is freezing the old manifest.
+        let _registry_guard = self.registry_lock.lock().await;
         let dest = self.cfg.image_path(name);
         let manifest_dest = self.cfg.image_manifest_path(name);
         if dest.exists() || manifest_dest.exists() {
-            return Err(coded(
-                "image.exists",
-                format!("image {name} already exists"),
-            ));
+            // Replacing a name is safe for services that froze their manifest
+            // at create; a pre-freeze service still boots from the store copy,
+            // so replacing it out from under one would change its next boot.
+            let reg = self.registry().await?;
+            if let Some(svc) = reg
+                .services
+                .values()
+                .find(|svc| images_match(&svc.image, name) && svc.image_manifest.is_none())
+            {
+                return Err(coded(
+                    "image.in_use",
+                    format!(
+                        "image {name} backs pre-digest service {}; recreate that service \
+                         before replacing the image",
+                        svc.hostname
+                    ),
+                ));
+            }
         }
         let qcow2_tmp = self.import_tmp_path(name, "qcow2");
         let manifest_tmp = self.import_tmp_path(name, "manifest");
@@ -1172,11 +1269,19 @@ impl<H: Host + 'static> Daemon<H> {
             return Err(err)
                 .with_context(|| format!("copy imported qcow2 {qcow2_path} into image store"));
         }
-        if let Err(err) = fs::copy(&manifest_path, &manifest_tmp).await {
+        let manifest_toml = match toml::to_string_pretty(&manifest) {
+            Ok(toml) => toml,
+            Err(err) => {
+                let _ = remove_path_file(qcow2_tmp).await;
+                return Err(err)
+                    .with_context(|| format!("serialize imported manifest {manifest_path}"));
+            }
+        };
+        if let Err(err) = fs::write(&manifest_tmp, manifest_toml).await {
             let _ = remove_path_file(qcow2_tmp).await;
             let _ = remove_path_file(manifest_tmp).await;
             return Err(err).with_context(|| {
-                format!("copy imported manifest {manifest_path} into image store")
+                format!("write imported manifest {manifest_path} into image store")
             });
         }
         if let Err(err) = fs::rename(&qcow2_tmp, &dest).await {
@@ -1195,14 +1300,21 @@ impl<H: Host + 'static> Daemon<H> {
     async fn image_rm(&self, name: &str) -> Result<Value> {
         validate_name(image_base_name(name)?)?;
         let reg = self.registry().await?;
+        // Services with a frozen manifest never read the store again (their
+        // disk is a full copy), so only a pre-freeze service — which start and
+        // reconcile still resolve through the store — pins an image in place.
         if let Some(svc) = reg
             .services
             .values()
-            .find(|svc| images_match(&svc.image, name))
+            .find(|svc| images_match(&svc.image, name) && svc.image_manifest.is_none())
         {
             return Err(coded(
                 "image.in_use",
-                format!("image {name} is still used by service {}", svc.hostname),
+                format!(
+                    "image {name} backs pre-digest service {}; that service cannot boot \
+                     without it",
+                    svc.hostname
+                ),
             ));
         }
         let path = self.cfg.image_path(name);
@@ -1217,14 +1329,45 @@ impl<H: Host + 'static> Daemon<H> {
     async fn image_info(&self, name: &str) -> Result<Value> {
         let path = self.cfg.image_path(name);
         let metadata = fs::metadata(&path).await?;
-        let sha256 = sha256_file(&path).await?;
-        image::load(&self.cfg, name).await?;
+        let manifest = image::load(&self.cfg, name).await?;
+        // The sidecar carries the digest since import started backfilling it;
+        // only a pre-digest sidecar costs a (cached) hash of the file.
+        let sha256 = match &manifest.sha256 {
+            Some(sha256) => sha256.clone(),
+            None => self.legacy_image_digest(&path, &metadata).await?,
+        };
         Ok(json!({
             "name": name,
             "path": path,
             "bytes": metadata.len(),
             "sha256": sha256,
+            "created": manifest.created,
+            "revision": manifest.revision,
         }))
+    }
+
+    async fn legacy_image_digest(
+        &self,
+        path: &Utf8Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<String> {
+        let size = metadata.len();
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("stat mtime of {path}"))?;
+        if let Some((cached_size, cached_modified, sha256)) =
+            self.image_digests.lock().await.get(path)
+        {
+            if *cached_size == size && *cached_modified == modified {
+                return Ok(sha256.clone());
+            }
+        }
+        let sha256 = sha256_file(path).await?;
+        self.image_digests
+            .lock()
+            .await
+            .insert(path.to_owned(), (size, modified, sha256.clone()));
+        Ok(sha256)
     }
 
     fn import_tmp_path(&self, name: &str, label: &str) -> Utf8PathBuf {
@@ -1295,7 +1438,7 @@ impl<H: Host + 'static> Daemon<H> {
         let timeout_secs = optional_u64(&args, "timeout").unwrap_or(300);
         let reg = self.registry().await?;
         let svc = reg.get(name)?;
-        let manifest = image::load(&self.cfg, &svc.image).await?;
+        let manifest = service_manifest(&self.cfg, svc).await?;
         if !manifest.guestd {
             return Err(coded(
                 "wait.requires_marker",
@@ -1631,6 +1774,16 @@ async fn read_success_response<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// The manifest governing a service's boot: the copy frozen at create, or —
+/// for services created before freezing existed — the live image store entry
+/// that service still depends on (and which `image rm`/import must protect).
+async fn service_manifest(cfg: &Config, svc: &Service) -> Result<ImageManifest> {
+    match &svc.image_manifest {
+        Some(manifest) => Ok(manifest.clone()),
+        None => image::load(cfg, &svc.image).await,
+    }
+}
+
 fn service_summary(svc: &Service, running: bool, address: Option<String>) -> Value {
     json!({
         "id": svc.id,
@@ -1805,9 +1958,26 @@ async fn read_optional_string(path: Utf8PathBuf) -> Result<String> {
     }
 }
 
-async fn sha256_file(path: &Utf8PathBuf) -> Result<String> {
-    let bytes = fs::read(path).await?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+/// Hash in fixed chunks: image qcow2s are multi-GiB, and reading one whole
+/// into the daemon's memory to hash it is both slow and a resident-set spike.
+async fn sha256_file(path: &Utf8Path) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("open {path} for hashing"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("read {path} for hashing"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn check_path(name: &str, path: &Utf8PathBuf, should_be_dir: bool) -> Value {
@@ -2038,7 +2208,7 @@ async fn read_kernel_contract(kernel: &Utf8PathBuf) -> Result<u32> {
 /// (→ omitted from status; not warned in reconcile) when the image or ExecStart
 /// can't be resolved. Free function so `status` and `reconcile` share it.
 async fn boot_config_state<H: Host>(cfg: &Config, host: &H, svc: &Service) -> Option<&'static str> {
-    let image = image::load(cfg, &svc.image).await.ok()?;
+    let image = service_manifest(cfg, svc).await.ok()?;
     let expected = cloud_hypervisor_argv(cfg, svc, &image);
     let unit = unit_name(&svc.id);
     let execstart = host
@@ -2156,7 +2326,7 @@ async fn rewrite_missing_dropins<H: Host>(cfg: &Config, host: &H, reg: &Registry
 /// Fallible so the reconcile loop can warn-and-continue instead of aborting the
 /// whole daemon on a single service whose boot cannot proceed.
 async fn start_enabled_service<H: Host>(cfg: &Config, host: &H, svc: &Service) -> Result<()> {
-    let image_metadata = image::load(cfg, &svc.image).await?;
+    let image_metadata = service_manifest(cfg, svc).await?;
     validate_boot_prerequisites(cfg, &image_metadata).await?;
     host.systemd_run_vm(cfg, svc, &image_metadata).await?;
     Ok(())
@@ -2277,6 +2447,7 @@ mod tests {
             publish: Vec::new(),
             provision: Provision::default(),
             restart: RestartPolicy::default(),
+            image_manifest: None,
         };
         let manifest = hearth_proto::ImageManifest::from_oci_process(hearth_proto::OciProcess {
             args: vec!["/usr/local/bin/init".to_string()],
@@ -4299,7 +4470,7 @@ cwd = "/home/exedev"
     }
 
     #[tokio::test]
-    async fn image_import_copies_qcow2_and_manifest_without_overwrite() {
+    async fn image_import_backfills_the_digest_and_replaces_names() {
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let cfg = test_config(&root);
@@ -4328,26 +4499,243 @@ cwd = "/home/exedev"
         assert!(imported[0].ok);
         assert!(cfg.image_path("exeuntu").exists());
         assert!(cfg.image_manifest_path("exeuntu").exists());
+        // A pre-digest sidecar gains the qcow2's actual hash at install, so
+        // every image in the store carries its identity.
+        let installed = image::read_manifest(&cfg.image_manifest_path("exeuntu"))
+            .await
+            .unwrap();
+        assert_eq!(installed.sha256, Some(hex::encode(Sha256::digest(b"disk"))));
 
-        let duplicate = daemon
+        // A name is a mutable pointer: re-importing it replaces the store
+        // entry, and the sidecar follows the new bytes.
+        tokio::fs::write(&source_qcow2, b"disk-v2").await.unwrap();
+        let replaced = daemon
             .handle(Request::new(
                 "2",
                 Verb::ImageImport,
                 Map::from_iter([
                     ("name".into(), json!("exeuntu")),
-                    ("qcow2_path".into(), json!(cfg.image_path("exeuntu"))),
-                    (
-                        "manifest_path".into(),
-                        json!(cfg.image_manifest_path("exeuntu")),
-                    ),
+                    ("qcow2_path".into(), json!(source_qcow2)),
+                    ("manifest_path".into(), json!(source_manifest)),
                 ]),
             ))
             .await;
-        assert!(!duplicate[0].ok);
+        assert!(replaced[0].ok, "replace failed: {:?}", replaced[0].error);
+        let installed = image::read_manifest(&cfg.image_manifest_path("exeuntu"))
+            .await
+            .unwrap();
         assert_eq!(
-            duplicate[0].error.as_ref().map(|err| err.code.as_str()),
-            Some("image.exists")
+            installed.sha256,
+            Some(hex::encode(Sha256::digest(b"disk-v2")))
         );
+    }
+
+    #[tokio::test]
+    async fn image_import_rejects_a_sidecar_digest_that_mismatches_the_qcow2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        let source_qcow2 = root.join("exeuntu.qcow2");
+        let source_manifest = root.join("exeuntu.hearth.toml");
+        tokio::fs::write(&source_qcow2, b"disk").await.unwrap();
+        let wrong_digest = "a".repeat(64);
+        tokio::fs::write(
+            &source_manifest,
+            image_manifest_toml().replacen(
+                "init = \"/usr/local/bin/init\"",
+                &format!("init = \"/usr/local/bin/init\"\nsha256 = \"{wrong_digest}\""),
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let imported = daemon
+            .handle(Request::new(
+                "1",
+                Verb::ImageImport,
+                Map::from_iter([
+                    ("name".into(), json!("exeuntu")),
+                    ("qcow2_path".into(), json!(source_qcow2)),
+                    ("manifest_path".into(), json!(source_manifest)),
+                ]),
+            ))
+            .await;
+
+        assert!(!imported[0].ok);
+        assert_eq!(
+            imported[0].error.as_ref().map(|err| err.code.as_str()),
+            Some("image.digest_mismatch")
+        );
+        assert!(!cfg.image_path("exeuntu").exists());
+    }
+
+    #[tokio::test]
+    async fn image_import_refuses_to_replace_a_pre_digest_service_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        // write_service's TOML has no [image_manifest]: a pre-freeze service
+        // whose every start still resolves image "base" through the store.
+        write_service(&root, "mail", false).await;
+        let cfg = test_config(&root);
+        let source_qcow2 = root.join("new.qcow2");
+        let source_manifest = root.join("new.hearth.toml");
+        tokio::fs::write(&source_qcow2, b"new-disk").await.unwrap();
+        tokio::fs::write(&source_manifest, image_manifest_toml())
+            .await
+            .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let imported = daemon
+            .handle(Request::new(
+                "1",
+                Verb::ImageImport,
+                Map::from_iter([
+                    ("name".into(), json!("base")),
+                    ("qcow2_path".into(), json!(source_qcow2)),
+                    ("manifest_path".into(), json!(source_manifest)),
+                ]),
+            ))
+            .await;
+
+        assert!(!imported[0].ok);
+        assert_eq!(
+            imported[0].error.as_ref().map(|err| err.code.as_str()),
+            Some("image.in_use")
+        );
+        assert_eq!(
+            tokio::fs::read(cfg.image_path("base")).await.unwrap(),
+            b"base"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_service_survives_image_replacement_and_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        write_test_image(&cfg, "base").await;
+        write_guest_kernel(&root, "1").await;
+        let host = FakeHost::default();
+        let state = host.state.clone();
+        let daemon = Daemon::new(cfg.clone(), host);
+
+        let created = daemon
+            .handle(Request::new("1", Verb::Create, create_args("dev")))
+            .await;
+        assert!(created[0].ok, "create failed: {:?}", created[0].error);
+        let registry = Registry::load(&cfg).await.unwrap();
+        let frozen = registry.get("dev").unwrap().image_manifest.clone();
+        assert!(
+            frozen.is_some(),
+            "create must freeze the image manifest into the service record"
+        );
+
+        // The frozen service does not pin the store: the name can be removed…
+        let removed = daemon
+            .handle(Request::new(
+                "2",
+                Verb::ImageRm,
+                Map::from_iter([("name".into(), json!("base"))]),
+            ))
+            .await;
+        assert!(removed[0].ok, "rm failed: {:?}", removed[0].error);
+        assert!(!cfg.image_path("base").exists());
+
+        // …and the service still starts, from the manifest frozen at create.
+        let started = daemon
+            .handle(Request::new(
+                "3",
+                Verb::Start,
+                Map::from_iter([("name".into(), json!("dev"))]),
+            ))
+            .await;
+        assert!(started[0].ok, "start failed: {:?}", started[0].error);
+        assert!(state.lock().unwrap().running);
+    }
+
+    #[tokio::test]
+    async fn ls_flags_a_service_whose_image_name_moved_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        let created_digest = "a".repeat(64);
+        let manifest_with = |digest: &str| {
+            image_manifest_toml().replacen(
+                "init = \"/usr/local/bin/init\"",
+                &format!("init = \"/usr/local/bin/init\"\nsha256 = \"{digest}\""),
+                1,
+            )
+        };
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("base"), b"base")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            cfg.image_manifest_path("base"),
+            manifest_with(&created_digest),
+        )
+        .await
+        .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+        let created = daemon
+            .handle(Request::new("1", Verb::Create, create_args("dev")))
+            .await;
+        assert!(created[0].ok, "create failed: {:?}", created[0].error);
+
+        let service =
+            |responses: Vec<Response>| responses[0].result.as_ref().unwrap()["services"][0].clone();
+        let row = service(daemon.handle(Request::new("2", Verb::Ls, Map::new())).await);
+        assert_eq!(row["image_digest"], json!(created_digest));
+        assert_eq!(row["image_state"], json!("current"));
+
+        // The store moves on under the same name; the service's row says so.
+        tokio::fs::write(
+            cfg.image_manifest_path("base"),
+            manifest_with(&"b".repeat(64)),
+        )
+        .await
+        .unwrap();
+        let row = service(daemon.handle(Request::new("3", Verb::Ls, Map::new())).await);
+        assert_eq!(row["image_state"], json!("stale"));
+    }
+
+    #[tokio::test]
+    async fn image_ls_prefers_the_sidecar_digest_over_hashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cfg = test_config(&root);
+        tokio::fs::create_dir_all(&cfg.images_dir).await.unwrap();
+        tokio::fs::write(cfg.image_path("fast"), b"payload")
+            .await
+            .unwrap();
+        // A declared digest that is deliberately NOT the file's hash: image ls
+        // returning it proves the multi-GiB read never happened.
+        let declared = "c".repeat(64);
+        tokio::fs::write(
+            cfg.image_manifest_path("fast"),
+            image_manifest_toml().replacen(
+                "init = \"/usr/local/bin/init\"",
+                &format!(
+                    "init = \"/usr/local/bin/init\"\nsha256 = \"{declared}\"\n\
+                     created = \"2026-07-25T21:00:00Z\"\nrevision = \"abf6acb12345\""
+                ),
+                1,
+            ),
+        )
+        .await
+        .unwrap();
+        let daemon = Daemon::new(cfg.clone(), FakeHost::default());
+
+        let responses = daemon
+            .handle(Request::new("1", Verb::ImageLs, Map::new()))
+            .await;
+
+        let image = &responses[0].result.as_ref().unwrap()["images"][0];
+        assert_eq!(image["sha256"], json!(declared));
+        assert_eq!(image["created"], json!("2026-07-25T21:00:00Z"));
+        assert_eq!(image["revision"], json!("abf6acb12345"));
     }
 
     #[tokio::test]

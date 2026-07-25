@@ -303,6 +303,19 @@ pub struct ImageManifest {
     /// this from their rootfs contents.
     #[serde(default)]
     pub egress_proxy: bool,
+    /// SHA-256 of the qcow2 this sidecar describes. Written by `image build`
+    /// and verified (or backfilled) at import, so `image ls` never has to
+    /// hash multi-GiB files on read. Absent only in pre-digest sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Build wall-clock time (RFC 3339). Digests do not order; this does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    /// Git revision of the build's Dockerfile directory (`-dirty` suffixed
+    /// when the tree was not clean). One commit pins the whole recipe when
+    /// the Dockerfile, base image, and guestd live in the same repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub oci: OciProcess,
 }
 
@@ -318,6 +331,9 @@ impl ImageManifest {
             min_kernel_contract: default_min_kernel_contract(),
             guestd: false,
             egress_proxy: false,
+            sha256: None,
+            created: None,
+            revision: None,
             oci: process,
         })
     }
@@ -332,6 +348,11 @@ impl ImageManifest {
         validate_kernel_cmdline_path("root_device", &self.root_device)?;
         validate_kernel_cmdline_token("root_fstype", &self.root_fstype)?;
         validate_kernel_cmdline_path("init", &self.init)?;
+        if let Some(sha256) = &self.sha256 {
+            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("manifest sha256 is not a hex digest: {sha256:?}"));
+            }
+        }
         self.oci.validate_init_only()?;
         if self.oci.args[0] != self.init {
             return Err("manifest init must match oci.args[0]".to_string());
