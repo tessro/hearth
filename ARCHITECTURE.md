@@ -69,7 +69,7 @@ Long-running Rust daemon. Itself a systemd unit (`hearth.service`). Responsibili
   running VM's boot-report channel.
 - Accepts line-delimited JSON requests; validates against a verb allowlist; dispatches to:
   - `systemd-run` for VM process lifecycle (start/stop the CHV process itself).
-  - The per-VM Cloud Hypervisor HTTP API over its unix socket for runtime ops (`vm.boot`, `vm.shutdown`, `vm.reboot`, `vm.info`, `vm.snapshot`, `vm.restore`, `vm.resize`).
+  - The per-VM Cloud Hypervisor HTTP API over its unix socket for runtime ops (`vm.boot`, `vm.power-button`, `vm.shutdown`, `vm.reboot`, `vm.info`, `vm.snapshot`, `vm.restore`, `vm.resize`).
   - The host filesystem for image import and per-VM disk provisioning.
 - Writes a structured audit log to journald: every request, who, when, args, result.
 - On startup, reconciles desired state (services marked `enabled = true`) with runtime state (which CHV processes are running).
@@ -203,10 +203,12 @@ the source of truth for what VMs exist; runtime state is derived.
 
 ### Stop
 
-1. `PUT /api/v1/vm.shutdown` on the per-VM API socket (ACPI signal to guest).
+1. `PUT /api/v1/vm.power-button` on the per-VM API socket — the ACPI power
+   button, which is the signal the guest can act on. CHV's action PUTs take no
+   request body; a `{}` body is rejected with HTTP 400.
 2. Wait up to `TimeoutStopSec` for the systemd unit to go inactive (i.e., CHV process to exit).
-3. If timeout, escalate: `PUT /api/v1/vm.power-off` (hard stop), then
-   `systemctl stop hearth-vm-<id>` if still up.
+3. If timeout, escalate: `PUT /api/v1/vm.shutdown` (hard stop, no guest
+   involvement), then `systemctl stop hearth-vm-<id>` if still up.
 4. Mark `enabled = false` in registry.
 
 ### Reboot
@@ -319,7 +321,7 @@ This is the only systemd config that lives on disk for hearth-related VM managem
 | Failure | Detection | Recovery |
 |---|---|---|
 | CHV process crashes | systemd transient unit exits non-zero | `Restart=on-failure` brings it back per policy; hearthd notes in audit log |
-| CHV API socket unresponsive | `vm.shutdown` request times out | hearthd escalates to `systemctl stop hearth-vm-<name>`; on next start, treat as cold boot |
+| CHV API socket unresponsive | `vm.power-button` request times out | hearthd escalates to `systemctl stop hearth-vm-<name>`; on next start, treat as cold boot |
 | hearthd crashes | systemd restarts `hearth.service` | On restart, reconcile: each `enabled = true` service that has no live unit is started; each live unit not in registry is logged but left alone |
 | Host reboot | normal systemd boot sequence | hearthd starts, reconciles, all `enabled = true` VMs come up |
 | Agent VM compromised | agentd records denied task and MCP calls | Revoke its fixed id from the delegator allowlist; rebuild or restore the VM |

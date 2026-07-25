@@ -831,13 +831,13 @@ impl<H: Host + 'static> Daemon<H> {
             let unit = unit_name(&svc.id);
             let graceful_timeout = Duration::from_secs(30);
             let started = Instant::now();
-            info!(hostname = %hostname, id = %svc.id, "sending vm.shutdown (ACPI)");
+            info!(hostname = %hostname, id = %svc.id, "pressing the ACPI power button");
             if let Err(err) = self
                 .host
-                .chv_put(&socket, "/api/v1/vm.shutdown", json!({}))
+                .chv_put_empty(&socket, "/api/v1/vm.power-button")
                 .await
             {
-                warn!(hostname = %hostname, id = %svc.id, error = %err, "vm.shutdown request failed; waiting for unit to exit anyway");
+                warn!(hostname = %hostname, id = %svc.id, error = %err, "vm.power-button request failed; waiting for unit to exit anyway");
             }
             if wait_for_inactive(self.host.as_ref(), &unit, graceful_timeout).await? {
                 info!(
@@ -852,14 +852,14 @@ impl<H: Host + 'static> Daemon<H> {
                     id = %svc.id,
                     waited_ms = started.elapsed().as_millis() as u64,
                     timeout_s = graceful_timeout.as_secs(),
-                    "graceful shutdown timed out; escalating to vm.power-off"
+                    "graceful shutdown timed out; escalating to vm.shutdown"
                 );
                 if let Err(err) = self
                     .host
-                    .chv_put(&socket, "/api/v1/vm.power-off", json!({}))
+                    .chv_put_empty(&socket, "/api/v1/vm.shutdown")
                     .await
                 {
-                    warn!(hostname = %hostname, id = %svc.id, error = %err, "vm.power-off request failed");
+                    warn!(hostname = %hostname, id = %svc.id, error = %err, "vm.shutdown request failed");
                 }
                 if let Err(err) = self.host.systemctl(&["stop", &unit]).await {
                     warn!(hostname = %hostname, id = %svc.id, error = %err, "systemctl stop failed");
@@ -879,7 +879,7 @@ impl<H: Host + 'static> Daemon<H> {
         let svc = reg.get(hostname)?;
         let _guard = self.service_guard(&svc.id).await;
         self.host
-            .chv_put(&self.cfg.vm_socket(&svc.id), "/api/v1/vm.reboot", json!({}))
+            .chv_put_empty(&self.cfg.vm_socket(&svc.id), "/api/v1/vm.reboot")
             .await?;
         self.status(hostname).await
     }
@@ -2427,7 +2427,7 @@ mod tests {
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls
             .iter()
-            .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
+            .any(|call| call == "chv-put /api/v1/vm.power-button (empty)"));
         let registry = Registry::load(&cfg).await.unwrap();
         assert!(!registry.get("mail").unwrap().enabled);
         assert!(!cfg.vm_vsock_port_socket(&id, PORT_REPORT).exists());
@@ -3804,7 +3804,7 @@ cwd = "/home/exedev"
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls
             .iter()
-            .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
+            .any(|call| call == "chv-put /api/v1/vm.power-button (empty)"));
         assert!(!cfg.disk_path_ext(&id, "qcow2").exists());
         assert!(!cfg.console_path(&id).exists());
         assert!(!cfg.snapshots_dir.join(&id).exists());
@@ -3974,9 +3974,9 @@ cwd = "/home/exedev"
         // The refusal must come before the VM is touched: no shutdown, no
         // VMM launch.
         let calls = state.lock().unwrap().calls.clone();
-        assert!(!calls
-            .iter()
-            .any(|c| c.contains("vm.shutdown") || c.starts_with("systemd-run")));
+        assert!(!calls.iter().any(|c| c.contains("vm.power-button")
+            || c.contains("vm.shutdown")
+            || c.starts_with("systemd-run")));
     }
 
     #[tokio::test]
@@ -4012,9 +4012,9 @@ cwd = "/home/exedev"
             Some("snapshot.no_state")
         );
         let calls = state.lock().unwrap().calls.clone();
-        assert!(!calls
-            .iter()
-            .any(|c| c.contains("vm.shutdown") || c.starts_with("systemd-run")));
+        assert!(!calls.iter().any(|c| c.contains("vm.power-button")
+            || c.contains("vm.shutdown")
+            || c.starts_with("systemd-run")));
     }
 
     #[tokio::test]
@@ -4049,7 +4049,7 @@ cwd = "/home/exedev"
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls
             .iter()
-            .any(|call| call == "chv-put /api/v1/vm.shutdown {}"));
+            .any(|call| call == "chv-put /api/v1/vm.power-button (empty)"));
         // Restore order: disk lands, a bare API-only VMM launches, then the
         // state resume is driven over the API.
         let vmm_call = format!("systemd-run-vmm {}", test_id("mail"));
@@ -4096,7 +4096,7 @@ cwd = "/home/exedev"
         let calls = state.lock().unwrap().calls.clone();
         assert!(calls
             .iter()
-            .any(|call| call == "chv-put /api/v1/vm.reboot {}"));
+            .any(|call| call == "chv-put /api/v1/vm.reboot (empty)"));
     }
 
     #[tokio::test]

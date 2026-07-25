@@ -149,9 +149,6 @@ impl Host for FakeHost {
         if state.chv_fail.as_deref() == Some(path) {
             return Err(anyhow::anyhow!("injected chv failure for {path}"));
         }
-        if path == "/api/v1/vm.shutdown" || path == "/api/v1/vm.power-off" {
-            state.running = false;
-        }
         Ok(json!({}))
     }
 
@@ -160,6 +157,11 @@ impl Host for FakeHost {
         state.calls.push(format!("chv-put {path} (empty)"));
         if state.chv_fail.as_deref() == Some(path) {
             return Err(anyhow::anyhow!("injected chv failure for {path}"));
+        }
+        // The ACPI button and the hard shutdown both end with the guest down
+        // and cloud-hypervisor exited, so the transient unit goes inactive.
+        if path == "/api/v1/vm.power-button" || path == "/api/v1/vm.shutdown" {
+            state.running = false;
         }
         Ok(json!({}))
     }
