@@ -1,7 +1,7 @@
 {
   description = "Hearth VM manager";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/b3da656039dc7a6240f27b2ef8cc6a3ef3bccae7";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.stalin = {
     url = "github:tessro/stalin";
     inputs.nixpkgs.follows = "nixpkgs";
